@@ -184,10 +184,16 @@ def render_backtest_module():
         if "indicators" in strat:
             st.session_state.indicators = dict(strat["indicators"])
             for ik, wk in IND_TOGGLE_KEYS:
-                st.session_state[wk] = st.session_state.indicators.get(ik, True)
-            st.session_state["select_all_ind"] = all(
-                st.session_state.get(w, False) for _, w in IND_TOGGLE_KEYS
-            )
+                try:
+                    st.session_state[wk] = st.session_state.indicators.get(ik, True)
+                except Exception:
+                    pass
+            try:
+                st.session_state["select_all_ind"] = all(
+                    st.session_state.get(w, False) for _, w in IND_TOGGLE_KEYS
+                )
+            except Exception:
+                pass
         if "risk" in strat:
             r = dict(strat["risk"])
             for k in ["entry_start", "entry_end", "square_off_time"]:
@@ -1428,7 +1434,6 @@ def render_backtest_module():
 
         if b_col1.button("💾 Save Strategy", use_container_width=True):
             save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
-            load_strategy_into_session(strat_save_name)
             st.session_state.selected_strategy_name = strat_save_name
             st.session_state.strategy_name_input = strat_save_name
             try:
@@ -1447,7 +1452,6 @@ def render_backtest_module():
 
         if b_col2.button("💾 Save & Proceed to Instrument Selection ➡️", type="primary", use_container_width=True):
             save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
-            load_strategy_into_session(strat_save_name)
             st.session_state.selected_strategy_name = strat_save_name
             st.session_state.strategy_name_input = strat_save_name
             try:
