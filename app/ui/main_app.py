@@ -96,7 +96,11 @@ def render_unified_suite():
     # Master Sidebar Navigation
     st.sidebar.markdown("### 🧭 Trading Suite Navigator")
 
-    if "unified_suite_selector" not in st.session_state or st.session_state.unified_suite_selector not in SUITE_MODES:
+    if (
+        st.session_state.pop("reset_suite_on_login", False)
+        or "unified_suite_selector" not in st.session_state
+        or st.session_state.unified_suite_selector not in SUITE_MODES
+    ):
         st.session_state.unified_suite_selector = SUITE_MODES[0]
 
     def on_suite_change():
@@ -123,8 +127,7 @@ def render_unified_suite():
         log_audit_event("USER_LOGOUT", details={"username": username})
         st.session_state.authenticated = False
         st.session_state.current_user = None
-        st.session_state.unified_suite_selector = SUITE_MODES[0]
-        st.success("Successfully logged out.")
+        st.session_state.reset_suite_on_login = True
         st.rerun()
 
     st.sidebar.markdown("---")
