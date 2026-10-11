@@ -31,6 +31,7 @@ from app.config.cost_config import CostConfig
 from app.config.risk_config import RiskConfig
 from app.data.historical_data import load_csv
 from app.data.instrument_loader import (
+    NIFTY_STANDARD_INSTRUMENTS,
     find_equity_by_isin,
     find_equity_by_symbol,
     load_nse_equities,
@@ -1598,8 +1599,21 @@ def render_backtest_module():
                         key="backtest_sel_expiry"
                     )
                 else:
-                    sel_expiry = None
-                    st.warning("Kotak expiries not available. Check connection.")
+                    fallback_expiries = [
+                        "27-OCT-2026",
+                        "13-OCT-2026",
+                        "29-SEP-2026",
+                        "28-AUG-2026",
+                        "30-JUL-2026",
+                    ]
+                    sel_expiry = st.selectbox(
+                        "Rolling Expiry Date",
+                        fallback_expiries,
+                        index=0,
+                        help="Standard rolling and monthly expiry dates for backtesting.",
+                        key="backtest_sel_expiry"
+                    )
+                    st.caption("ℹ️ *Using standard backtest expiries (Kotak live session not connected).*")
 
             col_typ, col_strk = st.columns(2)
             with col_typ:
@@ -1607,9 +1621,9 @@ def render_backtest_module():
                 clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
 
             with col_strk:
-                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if sel_expiry else {}
+                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if (sel_expiry and live_expiries) else {}
                 spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
-                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", 65))
+                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", 65 if underlying_choice == "NIFTY" else 15))
 
                 oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
                 strikes = []
@@ -1621,25 +1635,63 @@ def render_backtest_module():
                         strikes.append(strk)
                         strike_to_inst[strk] = inst
 
-                if strikes:
-                    try:
-                        strikes = sorted(list(set(strikes)), key=lambda x: float(x))
-                    except Exception:
-                        strikes = sorted(list(set(strikes)))
-                    mid_idx = len(strikes) // 2
-                    chosen_strike = st.selectbox(f"Strike Price (Spot: ~{spot_val})", strikes, index=mid_idx, key="backtest_chosen_strike")
-                    selected_inst = strike_to_inst.get(chosen_strike, {})
-                    if selected_inst:
-                        st.session_state.symbol = selected_inst.get("symbol", f"{underlying_choice}{chosen_strike}{clean_opt_type}")
-                        st.session_state.isin = selected_inst.get("neoSymbol", "").split("|")[-1]
-                        st.session_state.instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
+                if not strikes:
+                    if underlying_choice == "BANKNIFTY":
+                        strikes = [str(x) for x in range(48000, 53500, 500)]
+                        spot_val = "51000"
+                    elif underlying_choice == "FINNIFTY":
+                        strikes = [str(x) for x in range(22000, 25500, 100)]
+                        spot_val = "23500"
+                    elif underlying_choice == "MIDCPNIFTY":
+                        strikes = [str(x) for x in range(11000, 14000, 100)]
+                        spot_val = "12500"
+                    else:  # NIFTY
+                        strikes = [str(x) for x in range(21500, 24600, 100)]
+                        spot_val = "22500"
+
+                try:
+                    strikes = sorted(list(set(strikes)), key=lambda x: float(x))
+                except Exception:
+                    strikes = sorted(list(set(strikes)))
+
+                default_idx = strikes.index("22500") if "22500" in strikes else len(strikes) // 2
+                chosen_strike = st.selectbox(
+                    f"Strike Price (Spot: ~{spot_val})",
+                    strikes,
+                    index=default_idx,
+                    key="backtest_chosen_strike"
+                )
+                selected_inst = strike_to_inst.get(chosen_strike, {})
+                if selected_inst:
+                    st.session_state.symbol = selected_inst.get("symbol", f"{underlying_choice}{chosen_strike}{clean_opt_type}")
+                    st.session_state.isin = selected_inst.get("neoSymbol", "").split("|")[-1]
+                    st.session_state.instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
+                    st.session_state.equity_name = f"{underlying_choice} {sel_expiry} {chosen_strike} {clean_opt_type}"
+                    st.session_state.risk["lot_size"] = mkt_lot
+                else:
+                    found_std = None
+                    for s_inst in NIFTY_STANDARD_INSTRUMENTS:
+                        sym = s_inst["tradingsymbol"]
+                        if chosen_strike in sym and clean_opt_type in sym:
+                            if "13" in str(sel_expiry) and "13" in sym:
+                                found_std = s_inst
+                                break
+                            elif "13" not in str(sel_expiry) and "26OCT" in sym:
+                                found_std = s_inst
+                                break
+                    if found_std:
+                        st.session_state.symbol = found_std["tradingsymbol"]
+                        st.session_state.isin = found_std["isin"]
+                        st.session_state.instrument_key = found_std["instrument_key"]
+                        st.session_state.equity_name = found_std["name"]
+                        st.session_state.risk["lot_size"] = int(found_std.get("lot_size", 65))
+                    else:
+                        exp_code = "26OCT" if "26" in str(sel_expiry) or "27" in str(sel_expiry) else "26O13"
+                        st.session_state.symbol = f"{underlying_choice}{exp_code}{chosen_strike}{clean_opt_type}"
+                        st.session_state.isin = f"INF00{chosen_strike}1"
+                        st.session_state.instrument_key = f"NSE_FO|{chosen_strike}"
                         st.session_state.equity_name = f"{underlying_choice} {sel_expiry} {chosen_strike} {clean_opt_type}"
                         st.session_state.risk["lot_size"] = mkt_lot
-                else:
-                    chosen_strike = st.text_input("Strike Price", value="22500", key="backtest_chosen_strike_txt")
-                    st.session_state.symbol = f"{underlying_choice}26OCT{chosen_strike}{clean_opt_type}"
-                    st.session_state.equity_name = f"{underlying_choice} {chosen_strike} {clean_opt_type}"
-                    st.session_state.risk["lot_size"] = 65
 
             st.caption(f"🎯 **Active Selection:** `{st.session_state.symbol}` | Key: `{st.session_state.instrument_key}` | Lot: `{st.session_state.risk.get('lot_size', 65)}`")
 
