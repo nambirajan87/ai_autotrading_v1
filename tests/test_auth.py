@@ -71,3 +71,15 @@ def test_register_invalid_inputs():
     # Invalid characters in username
     ok, msg = auth_manager.register_user("bad user!", "password123")
     assert ok is False
+
+
+def test_full_access_users():
+    assert auth_manager.is_full_access_user("admin") is True
+    assert auth_manager.is_full_access_user("nambirajan") is True
+    assert auth_manager.is_full_access_user("seetharaman") is True
+    assert auth_manager.is_full_access_user("Nambirajan") is True
+    assert auth_manager.is_full_access_user("SEETHARAMAN") is True
+    assert auth_manager.is_full_access_user("trader_bob") is False
+    assert auth_manager.is_full_access_user("new_user") is False
+    assert auth_manager.is_full_access_user(None) is False
+

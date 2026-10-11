@@ -23,8 +23,18 @@ def get_db_connection() -> sqlite3.Connection:
     return conn
 
 
+FULL_ACCESS_USERS = {"admin", "nambirajan", "seetharaman"}
+
+
+def is_full_access_user(username: Optional[str]) -> bool:
+    """Returns True if username has full access to all 3 workspace modules."""
+    if not username or not isinstance(username, str):
+        return False
+    return username.strip().lower() in FULL_ACCESS_USERS
+
+
 def init_user_db():
-    """Initializes the users table and seeds a default admin user if empty."""
+    """Initializes the users table and ensures privileged full-access accounts exist."""
     conn = get_db_connection()
     try:
         with conn:
@@ -42,19 +52,27 @@ def init_user_db():
                 );
             """)
 
-            # Check if any user exists; if none, seed default admin
-            cursor = conn.execute("SELECT COUNT(*) as count FROM users")
-            count = cursor.fetchone()["count"]
-            if count == 0:
-                _create_user_internal(
-                    conn,
-                    username="admin",
-                    password="admin123",
-                    full_name="Master Trader",
-                    email="admin@autotrading.ai",
-                    role="admin",
-                )
-                logger.info("Initialized default user: admin / admin123")
+            # Ensure the 3 privileged full-access accounts exist with admin role
+            privileged_defaults = [
+                ("admin", "admin123", "Master Administrator", "admin@autotrading.ai"),
+                ("nambirajan", "admin123", "Nambirajan", "nambirajan@autotrading.ai"),
+                ("seetharaman", "admin123", "Seetharaman", "seetharaman@autotrading.ai"),
+            ]
+            for u_name, u_pass, u_full, u_email in privileged_defaults:
+                cursor = conn.execute("SELECT id, role FROM users WHERE username = ?", (u_name,))
+                row = cursor.fetchone()
+                if row is None:
+                    _create_user_internal(
+                        conn,
+                        username=u_name,
+                        password=u_pass,
+                        full_name=u_full,
+                        email=u_email,
+                        role="admin",
+                    )
+                    logger.info("Initialized privileged account: %s", u_name)
+                elif row["role"] != "admin":
+                    conn.execute("UPDATE users SET role = 'admin' WHERE id = ?", (row["id"],))
     finally:
         conn.close()
 

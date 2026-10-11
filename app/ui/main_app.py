@@ -29,7 +29,7 @@ try:
 except Exception:
     pass
 
-from app.auth.auth_manager import init_user_db
+from app.auth.auth_manager import init_user_db, is_full_access_user
 from app.monitoring.audit_logger import log_audit_event, record_session_visit
 from app.ui.auth_ui import render_auth_page
 from app.ui.backtest_app import render_backtest_module
@@ -108,15 +108,23 @@ def render_unified_suite():
     full_name = current_user.get("full_name") or username
     role = current_user.get("role", "Trader").capitalize()
 
+    is_full_access = is_full_access_user(username)
+
+    BACKTEST_MODE = "🧪 Strategy Backtesting Studio"
+    if is_full_access:
+        available_modes = SUITE_MODES
+    else:
+        available_modes = [BACKTEST_MODE]
+
     # Master Sidebar Navigation
     st.sidebar.markdown("### 🧭 Trading Suite Navigator")
 
     if (
         st.session_state.pop("reset_suite_on_login", False)
         or "unified_suite_selector" not in st.session_state
-        or st.session_state.unified_suite_selector not in SUITE_MODES
+        or st.session_state.unified_suite_selector not in available_modes
     ):
-        st.session_state.unified_suite_selector = SUITE_MODES[0]
+        st.session_state.unified_suite_selector = available_modes[0]
 
     def on_suite_change():
         new_module = st.session_state.get("unified_suite_selector")
@@ -124,17 +132,29 @@ def render_unified_suite():
 
     chosen_suite = st.sidebar.radio(
         "Active Workspace Module",
-        SUITE_MODES,
+        available_modes,
         key="unified_suite_selector",
         on_change=on_suite_change,
-        help="Switch between Live Execution Cockpit, Candle Replay Paper Trading, and Historical Backtest Lab.",
+        help="Switch between Live Execution Cockpit, Candle Replay Paper Trading, and Historical Backtest Lab." if is_full_access else "Strategy Backtesting Studio (Standard User Tier).",
     )
 
+    if not is_full_access:
+        st.sidebar.markdown("""
+        <div style="background: rgba(255, 255, 255, 0.02); border: 1px dashed rgba(255, 255, 255, 0.15); border-radius: 8px; padding: 10px; margin-top: 8px; margin-bottom: 12px;">
+            <div style="font-size: 0.78rem; font-weight: 600; color: #ffb74d; margin-bottom: 6px;">🔒 Restricted Modules:</div>
+            <div style="font-size: 0.75rem; color: #777; margin-bottom: 3px;">🚫 ⚡ Live Trading Terminal</div>
+            <div style="font-size: 0.75rem; color: #777;">🚫 📈 AI Paper Trading Studio</div>
+            <div style="font-size: 0.70rem; color: #999; margin-top: 6px; font-style: italic;">Enabled only for authorized accounts (@admin, @nambirajan, @seetharaman).</div>
+        </div>
+        """, unsafe_allow_html=True)
+
     # User status & logout card in sidebar
+    access_badge = "🛡️ Full Access" if is_full_access else "🔒 Backtest Only"
+    badge_color = "#00e676" if is_full_access else "#ffb74d"
     st.sidebar.markdown(f"""
     <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px; margin-top: 10px; margin-bottom: 10px;">
         <div style="font-size: 0.85rem; font-weight: 700; color: #fff;">👤 {full_name}</div>
-        <div style="font-size: 0.75rem; color: #888;">@{username} &bull; <span style="color:#00e676;">{role}</span></div>
+        <div style="font-size: 0.75rem; color: #888;">@{username} &bull; <span style="color:{badge_color};">{access_badge}</span></div>
     </div>
     """, unsafe_allow_html=True)
 
@@ -152,17 +172,26 @@ def render_unified_suite():
     with head_c1:
         st.caption(f"🚀 **Enterprise Suite** &bull; Active Workspace: **{chosen_suite}**")
     with head_c2:
+        pill_style = f"color:{badge_color}; border-color:{badge_color}40; background:{badge_color}1a;"
         st.markdown(
-            f"<div style='text-align: right;'><span class='user-pill'>🟢 {username} ({role})</span></div>",
+            f"<div style='text-align: right;'><span class='user-pill' style='{pill_style}'>{access_badge} &bull; {username}</span></div>",
             unsafe_allow_html=True,
         )
 
     # ---------------- Workspace Module Dispatcher ----------------
     try:
         if chosen_suite == "⚡ Live Trading Terminal":
-            render_live_trade_module()
+            if not is_full_access:
+                st.error("⛔ Access Denied: Live Trading Terminal is restricted to authorized accounts (@admin, @nambirajan, @seetharaman).")
+                render_backtest_module()
+            else:
+                render_live_trade_module()
         elif chosen_suite == "📈 AI Paper Trading Studio":
-            render_paper_trade_module()
+            if not is_full_access:
+                st.error("⛔ Access Denied: AI Paper Trading Studio is restricted to authorized accounts (@admin, @nambirajan, @seetharaman).")
+                render_backtest_module()
+            else:
+                render_paper_trade_module()
         elif chosen_suite == "🧪 Strategy Backtesting Studio":
             render_backtest_module()
         else:
