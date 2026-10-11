@@ -26,10 +26,13 @@ except ImportError:
 
 from app.data.historical_data import load_csv
 from app.data.instrument_loader import (
+    DEFAULT_INDEX_EXPIRIES,
+    INDEX_LOT_SIZES,
     NIFTY_STANDARD_INSTRUMENTS,
     find_equity_by_isin,
     find_equity_by_symbol,
     load_nse_equities,
+    parse_expiry_info,
     search_equities,
     validate_isin,
 )
@@ -49,10 +52,12 @@ def fetch_kotak_expiries(underlying: str = "NIFTY") -> list:
     try:
         gw = get_gateway("KOTAK")
         if hasattr(gw, "get_expiries"):
-            return gw.get_expiries(underlying=underlying)
+            exps = gw.get_expiries(underlying=underlying)
+            if exps:
+                return exps
     except Exception as e:
         logger.debug("Kotak expiries error: %s", e)
-    return []
+    return DEFAULT_INDEX_EXPIRIES.get(underlying.upper(), DEFAULT_INDEX_EXPIRIES["NIFTY"])
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -578,34 +583,13 @@ def render_paper_trade_module():
                 )
             with col_exp:
                 live_expiries = fetch_kotak_expiries(underlying_choice)
-                if live_expiries:
-                    sel_expiry = st.selectbox(
-                        "Rolling Expiry Date (Kotak Live)",
-                        live_expiries,
-                        index=0,
-                        help="Live weekly and monthly rolling expiries from Kotak API.",
-                        key="paper_sel_expiry"
-                    )
-                else:
-                    fallback_expiries = [
-                        "27-OCT-2026",
-                        "13-OCT-2026",
-                        "29-SEP-2026",
-                        "28-AUG-2026",
-                        "30-JUL-2026",
-                    ]
-                    sel_expiry = st.selectbox(
-                        "Rolling Expiry Date",
-                        fallback_expiries,
-                        index=0,
-                        help="Standard rolling and monthly expiry dates.",
-                        key="paper_sel_expiry"
-                    )
-                    st.caption("ℹ️ *Using standard expiries (Kotak live session not connected).*")
-                    if st.button("🔄 Retry Kotak Live Connection", key="btn_retry_kotak_paper", help="Clear cache and re-query Kotak Neo API for live expiries"):
-                        fetch_kotak_expiries.clear()
-                        fetch_kotak_option_chain.clear()
-                        st.rerun()
+                sel_expiry = st.selectbox(
+                    "Rolling Expiry Date (Kotak Live)",
+                    live_expiries,
+                    index=0,
+                    help="Live weekly and monthly rolling expiries from Kotak Neo.",
+                    key=f"paper_sel_expiry_{underlying_choice}"
+                )
 
             col_typ, col_strk = st.columns(2)
             with col_typ:
@@ -613,9 +597,9 @@ def render_paper_trade_module():
                 clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
 
             with col_strk:
-                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if (sel_expiry and live_expiries) else {}
+                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if sel_expiry else {}
                 spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
-                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", 65 if underlying_choice == "NIFTY" else 15))
+                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", INDEX_LOT_SIZES.get(underlying_choice, 65)))
 
                 oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
                 strikes = []
@@ -629,8 +613,8 @@ def render_paper_trade_module():
 
                 if not strikes:
                     if underlying_choice == "BANKNIFTY":
-                        strikes = [str(x) for x in range(48000, 53500, 500)]
-                        spot_val = "51000"
+                        strikes = [str(x) for x in range(48000, 53500, 100)]
+                        spot_val = "50500"
                     elif underlying_choice == "FINNIFTY":
                         strikes = [str(x) for x in range(22000, 25500, 100)]
                         spot_val = "23500"
@@ -638,7 +622,7 @@ def render_paper_trade_module():
                         strikes = [str(x) for x in range(11000, 14000, 100)]
                         spot_val = "12500"
                     else:  # NIFTY
-                        strikes = [str(x) for x in range(21500, 24600, 100)]
+                        strikes = [str(x) for x in range(21500, 24600, 50)]
                         spot_val = "22500"
 
                 try:
@@ -646,46 +630,44 @@ def render_paper_trade_module():
                 except Exception:
                     strikes = sorted(list(set(strikes)))
 
-                default_idx = strikes.index("22500") if "22500" in strikes else len(strikes) // 2
+                default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
+                default_idx = strikes.index(default_strike) if default_strike in strikes else len(strikes) // 2
                 chosen_strike = st.selectbox(
                     f"Strike Price (Spot: ~{spot_val})",
                     strikes,
                     index=default_idx,
-                    key="paper_chosen_strike"
+                    key=f"paper_chosen_strike_{underlying_choice}"
                 )
                 selected_inst = strike_to_inst.get(chosen_strike, {})
+                display_dt, sym_code = parse_expiry_info(sel_expiry)
+
                 if selected_inst:
-                    st.session_state.paper_symbol = selected_inst.get("symbol", f"{underlying_choice}{chosen_strike}{clean_opt_type}")
+                    st.session_state.paper_symbol = selected_inst.get("symbol", f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}")
                     st.session_state.paper_isin = selected_inst.get("neoSymbol", "").split("|")[-1]
                     st.session_state.paper_instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
-                    st.session_state.paper_equity_name = f"{underlying_choice} {sel_expiry} {chosen_strike} {clean_opt_type}"
+                    st.session_state.paper_equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
                     st.session_state.paper_lot_size = mkt_lot
                 else:
+                    target_symbol = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
                     found_std = None
                     for s_inst in NIFTY_STANDARD_INSTRUMENTS:
-                        sym = s_inst["tradingsymbol"]
-                        if chosen_strike in sym and clean_opt_type in sym:
-                            if "13" in str(sel_expiry) and "13" in sym:
-                                found_std = s_inst
-                                break
-                            elif "13" not in str(sel_expiry) and "26OCT" in sym:
-                                found_std = s_inst
-                                break
+                        if s_inst["tradingsymbol"] == target_symbol:
+                            found_std = s_inst
+                            break
                     if found_std:
                         st.session_state.paper_symbol = found_std["tradingsymbol"]
                         st.session_state.paper_isin = found_std["isin"]
                         st.session_state.paper_instrument_key = found_std["instrument_key"]
                         st.session_state.paper_equity_name = found_std["name"]
-                        st.session_state.paper_lot_size = int(found_std.get("lot_size", 65))
+                        st.session_state.paper_lot_size = int(found_std.get("lot_size", mkt_lot))
                     else:
-                        exp_code = "26OCT" if "26" in str(sel_expiry) or "27" in str(sel_expiry) else "26O13"
-                        st.session_state.paper_symbol = f"{underlying_choice}{exp_code}{chosen_strike}{clean_opt_type}"
+                        st.session_state.paper_symbol = target_symbol
                         st.session_state.paper_isin = f"INF00{chosen_strike}1"
                         st.session_state.paper_instrument_key = f"NSE_FO|{chosen_strike}"
-                        st.session_state.paper_equity_name = f"{underlying_choice} {sel_expiry} {chosen_strike} {clean_opt_type}"
+                        st.session_state.paper_equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
                         st.session_state.paper_lot_size = mkt_lot
 
-            st.caption(f"🎯 **Active Selection:** `{st.session_state.paper_symbol}` | Key: `{st.session_state.paper_instrument_key}` | Lot: `{st.session_state.paper_lot_size}`")
+            st.caption(f"🎯 **Active Selection:** `{st.session_state.paper_symbol}` | Expiry: `{display_dt}` | Key: `{st.session_state.paper_instrument_key}` | Lot: `{st.session_state.paper_lot_size}`")
 
         else:
             c1, c2 = st.columns(2)

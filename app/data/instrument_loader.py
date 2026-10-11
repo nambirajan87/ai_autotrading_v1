@@ -57,6 +57,82 @@ def validate_isin(isin: str) -> bool:
     return total % 10 == 0
 
 
+DEFAULT_INDEX_EXPIRIES = {
+    "NIFTY": [
+        "2026-10-13",
+        "2026-10-19",
+        "2026-10-27",
+        "2026-11-03",
+        "2026-11-09",
+        "2026-11-23",
+        "2026-12-29",
+        "2027-03-30",
+        "2027-06-29",
+        "2027-09-28",
+    ],
+    "BANKNIFTY": [
+        "2026-10-27",
+        "2026-11-23",
+        "2026-12-29",
+        "2027-03-30",
+        "2027-06-29",
+        "2027-09-28",
+    ],
+    "FINNIFTY": [
+        "2026-10-27",
+        "2026-11-23",
+        "2026-12-29",
+    ],
+    "MIDCPNIFTY": [
+        "2026-10-27",
+        "2026-11-23",
+        "2026-12-29",
+    ],
+}
+
+INDEX_LOT_SIZES = {
+    "NIFTY": 65,
+    "BANKNIFTY": 15,
+    "FINNIFTY": 40,
+    "MIDCPNIFTY": 75,
+}
+
+
+def parse_expiry_info(exp_str: str) -> tuple[str, str]:
+    """
+    Parses expiry string into:
+    1. display_dt: human-readable date, e.g. '27-OCT-2026', '23-NOV-2026'
+    2. sym_code: compact NSE FO symbol expiry code, e.g. '26OCT', '26NOV', '26O13'
+    """
+    if not exp_str:
+        return "27-OCT-2026", "26OCT"
+    from datetime import datetime
+    exp_str_clean = str(exp_str).strip()
+    dt = None
+    for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%B-%Y", "%d-%m-%Y"):
+        try:
+            dt = datetime.strptime(exp_str_clean, fmt)
+            break
+        except Exception:
+            pass
+    if not dt:
+        clean = exp_str_clean.replace("-", "").upper()
+        return exp_str_clean, clean[:5] if len(clean) >= 5 else clean
+
+    display_dt = dt.strftime("%d-%b-%Y").upper()
+    yy = dt.strftime("%y")
+    mmm = dt.strftime("%b").upper()
+    month_codes = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+    # If date >= 23, treat as monthly contract code (e.g. 26OCT, 26NOV, 26DEC, 27MAR)
+    if dt.day >= 23:
+        sym_code = f"{yy}{mmm}"
+    else:
+        # Weekly contract format: e.g. 26O13, 26O19
+        m_code = month_codes.get(dt.month, str(dt.month))
+        sym_code = f"{yy}{m_code}{dt.day:02d}"
+    return display_dt, sym_code
+
+
 NIFTY_STANDARD_INSTRUMENTS = [
     {
         "instrument_key": "NSE_EQ|INF204KB14I2",

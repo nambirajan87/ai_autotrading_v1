@@ -795,7 +795,7 @@
     "name": "ADX",
     "description": "User strategy: ADX",
     "created_at": "2026-10-11 02:56:38",
-    "updated_at": "2026-10-11 02:59:30",
+    "updated_at": "2026-10-11 22:36:04",
     "indicators": {
       "ema_enabled": false,
       "ema_fast": 20,

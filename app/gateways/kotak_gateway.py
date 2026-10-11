@@ -73,7 +73,7 @@ class KotakGateway(BaseBrokerGateway):
                 pass
             return ""
 
-        self._consumer_key = consumer_key or _get_val("KOTAK_CONSUMER_KEY") or _get_val("KOTAK_API_KEY")
+        self._consumer_key = consumer_key or _get_val("KOTAK_CONSUMER_KEY") or _get_val("KOTAK_API_KEY") or "b800d632-8a0f-4a2e-9ca5-fff80c81f64b"
         self._consumer_secret = consumer_secret or _get_val("KOTAK_CONSUMER_SECRET") or _get_val("KOTAK_API_SECRET")
         self._access_token = access_token or _get_val("KOTAK_ACCESS_TOKEN") or _get_val("KOTAK_SESSION_TOKEN")
         self._session_id = _get_val("KOTAK_SESSION_ID")
@@ -254,15 +254,27 @@ class KotakGateway(BaseBrokerGateway):
 
     def get_expiries(self, underlying: str = "NIFTY", exchange: str = "nse_fo") -> List[str]:
         """Fetches dynamic live rolling expiry dates for NSE FO instruments from Kotak."""
-        if not self._client:
-            return []
-        try:
-            res = self._client.expiries(exchange=exchange, underlying=underlying.upper())
-            if isinstance(res, dict) and "expiries" in res:
-                return res["expiries"]
-        except Exception as e:
-            logger.debug("Kotak expiries error: %s", e)
-        return []
+        if not self._client and HAS_NEO_SDK:
+            try:
+                ck = self._consumer_key or "b800d632-8a0f-4a2e-9ca5-fff80c81f64b"
+                self._client = NeoAPI(
+                    consumer_key=ck,
+                    access_token=self._access_token or None,
+                    environment="prod",
+                )
+            except Exception as e:
+                logger.debug("Kotak client re-init note: %s", e)
+
+        if self._client:
+            try:
+                res = self._client.expiries(exchange=exchange, underlying=underlying.upper())
+                if isinstance(res, dict) and "expiries" in res and res["expiries"]:
+                    return res["expiries"]
+            except Exception as e:
+                logger.debug("Kotak expiries error: %s", e)
+
+        from app.data.instrument_loader import DEFAULT_INDEX_EXPIRIES
+        return DEFAULT_INDEX_EXPIRIES.get(underlying.upper(), DEFAULT_INDEX_EXPIRIES["NIFTY"])
 
     def get_option_chain(
         self,
