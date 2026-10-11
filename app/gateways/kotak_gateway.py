@@ -50,19 +50,59 @@ class KotakGateway(BaseBrokerGateway):
         mpin: Optional[str] = None,
         totp_secret: Optional[str] = None,
     ):
-        self._consumer_key = consumer_key or os.getenv("KOTAK_CONSUMER_KEY", "") or os.getenv("KOTAK_API_KEY", "")
-        self._consumer_secret = consumer_secret or os.getenv("KOTAK_CONSUMER_SECRET", "") or os.getenv("KOTAK_API_SECRET", "")
-        self._access_token = access_token or os.getenv("KOTAK_ACCESS_TOKEN", "") or os.getenv("KOTAK_SESSION_TOKEN", "")
-        self._mobile_number = mobile_number or os.getenv("KOTAK_MOBILE_NUMBER", "")
-        self._ucc = ucc or os.getenv("KOTAK_UCC", "")
-        self._mpin = mpin or os.getenv("KOTAK_MPIN", "")
-        self._totp_secret = totp_secret or os.getenv("KOTAK_TOTP_SECRET", "")
-        self._authenticated = False
+        def _get_val(k: str) -> str:
+            val = os.getenv(k, "")
+            if val:
+                return str(val).strip()
+            try:
+                import streamlit as st
+                if hasattr(st, "secrets"):
+                    if k in st.secrets:
+                        return str(st.secrets[k]).strip()
+                    if k.lower() in st.secrets:
+                        return str(st.secrets[k.lower()]).strip()
+                    if k.upper() in st.secrets:
+                        return str(st.secrets[k.upper()]).strip()
+                    for sec in ["kotak", "KOTAK", "general", "env"]:
+                        if sec in st.secrets and isinstance(st.secrets[sec], dict):
+                            if k in st.secrets[sec]:
+                                return str(st.secrets[sec][k]).strip()
+                            if k.lower() in st.secrets[sec]:
+                                return str(st.secrets[sec][k.lower()]).strip()
+            except Exception:
+                pass
+            return ""
+
+        self._consumer_key = consumer_key or _get_val("KOTAK_CONSUMER_KEY") or _get_val("KOTAK_API_KEY")
+        self._consumer_secret = consumer_secret or _get_val("KOTAK_CONSUMER_SECRET") or _get_val("KOTAK_API_SECRET")
+        self._access_token = access_token or _get_val("KOTAK_ACCESS_TOKEN") or _get_val("KOTAK_SESSION_TOKEN")
+        self._session_id = _get_val("KOTAK_SESSION_ID")
+        self._mobile_number = mobile_number or _get_val("KOTAK_MOBILE_NUMBER")
+        self._ucc = ucc or _get_val("KOTAK_UCC")
+        self._mpin = mpin or _get_val("KOTAK_MPIN")
+        self._totp_secret = totp_secret or _get_val("KOTAK_TOTP_SECRET")
+        self._authenticated = bool(self._access_token and len(self._access_token) > 10)
 
         self._client: Optional[Any] = None
-        if HAS_NEO_SDK and self._consumer_key:
+        if HAS_NEO_SDK and (self._consumer_key or self._access_token):
             try:
-                self._client = NeoAPI(consumer_key=self._consumer_key, environment="prod")
+                self._client = NeoAPI(
+                    consumer_key=self._consumer_key or None,
+                    access_token=self._access_token or None,
+                    environment="prod",
+                )
+                if self._client and hasattr(self._client, "configuration"):
+                    if self._access_token:
+                        self._client.configuration.bearer_token = self._access_token
+                        self._client.configuration.edit_token = self._access_token
+                        self._client.configuration.view_token = self._access_token
+                    if self._session_id:
+                        self._client.configuration.sid = self._session_id
+                        self._client.configuration.edit_sid = self._session_id
+                    if self._ucc:
+                        self._client.configuration.ucc = self._ucc
+                    if self._consumer_key:
+                        self._client.configuration.consumer_key = self._consumer_key
             except Exception as e:
                 logger.debug("Kotak NeoAPI client init note: %s", e)
 

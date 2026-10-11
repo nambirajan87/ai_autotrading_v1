@@ -14,6 +14,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Synchronize Streamlit Cloud secrets to os.environ
+try:
+    if hasattr(st, "secrets"):
+        for k, v in st.secrets.items():
+            if isinstance(v, (str, int, float, bool)):
+                os.environ[str(k)] = str(v)
+                os.environ[str(k).upper()] = str(v)
+            elif isinstance(v, dict):
+                for sub_k, sub_v in v.items():
+                    os.environ[f"{str(k).upper()}_{str(sub_k).upper()}"] = str(sub_v)
+                    os.environ[str(sub_k)] = str(sub_v)
+                    os.environ[str(sub_k).upper()] = str(sub_v)
+except Exception:
+    pass
+
 from app.auth.auth_manager import init_user_db
 from app.monitoring.audit_logger import log_audit_event, record_session_visit
 from app.ui.auth_ui import render_auth_page

@@ -44,7 +44,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_kotak_expiries(underlying: str = "NIFTY") -> list:
     try:
         gw = get_gateway("KOTAK")
@@ -602,6 +602,10 @@ def render_paper_trade_module():
                         key="paper_sel_expiry"
                     )
                     st.caption("ℹ️ *Using standard expiries (Kotak live session not connected).*")
+                    if st.button("🔄 Retry Kotak Live Connection", key="btn_retry_kotak_paper", help="Clear cache and re-query Kotak Neo API for live expiries"):
+                        fetch_kotak_expiries.clear()
+                        fetch_kotak_option_chain.clear()
+                        st.rerun()
 
             col_typ, col_strk = st.columns(2)
             with col_typ:
