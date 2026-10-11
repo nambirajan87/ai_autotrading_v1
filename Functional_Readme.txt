@@ -312,3 +312,6 @@ TRADE AUDIT TRAIL & TRADE AUDIT TRAIL-2:
 - Exportable to CSV via "Export Trail-2 CSV" button.
 ===============================================================
 
+Repository URL: https://github.com/nambirajan87/ai_autotrading_v1
+
+===============================================================
