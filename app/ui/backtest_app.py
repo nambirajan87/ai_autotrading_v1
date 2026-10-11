@@ -1,0 +1,2356 @@
+import json
+import logging
+import os
+import sys
+from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+# Ensure project root is in sys.path when executed via 'streamlit run'
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from dotenv import load_dotenv
+
+import importlib
+import app.config.risk_config
+import app.strategy.custom_strategy
+import app.backtest.engine
+importlib.reload(app.config.risk_config)
+importlib.reload(app.strategy.custom_strategy)
+importlib.reload(app.backtest.engine)
+
+from app.backtest.engine import BacktestConfig, run_backtest
+from app.backtest.metrics import compute_metrics
+from app.backtest.runner import split_by_days, trading_days
+from app.config.cost_config import CostConfig
+from app.config.risk_config import RiskConfig
+from app.data.historical_data import load_csv
+from app.data.instrument_loader import (
+    find_equity_by_isin,
+    find_equity_by_symbol,
+    load_nse_equities,
+    search_equities,
+    validate_isin,
+)
+from app.data.upstox_loader import fetch_range
+from app.database.backtest_database import BacktestDatabase
+from app.strategy.custom_strategy import (
+    CustomStrategyConfig,
+    calculate_custom_indicators,
+    score_custom_row,
+)
+from app.strategy.strategy_store import (
+    auto_suggest_strategy_name,
+    delete_strategy,
+    get_strategy,
+    list_strategy_names,
+    load_all_strategies,
+    save_strategy,
+)
+
+from app.gateways.gateway_factory import get_gateway
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_kotak_expiries(underlying: str = "NIFTY") -> list:
+    try:
+        gw = get_gateway("KOTAK")
+        if hasattr(gw, "get_expiries"):
+            return gw.get_expiries(underlying=underlying)
+    except Exception as e:
+        logger.debug("Kotak expiries error: %s", e)
+    return []
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_kotak_option_chain(underlying: str = "NIFTY", expiry: Optional[str] = None) -> dict:
+    try:
+        gw = get_gateway("KOTAK")
+        if hasattr(gw, "get_option_chain"):
+            return gw.get_option_chain(underlying=underlying, expiry=expiry)
+    except Exception as e:
+        logger.debug("Kotak option_chain error: %s", e)
+    return {}
+
+
+def render_backtest_module():
+    # Audit log session tracking for localhost and public URL traffic
+    from app.monitoring.audit_logger import (
+        get_recent_audit_logs,
+        log_audit_event,
+        record_session_visit,
+    )
+    client_info = record_session_visit()
+
+
+    # Custom styling to make KPI metric values compact and elegant (~double the label size)
+    st.markdown("""
+    <style>
+    div[data-testid="stMetricValue"], 
+    div[data-testid="stMetricValue"] * {
+        font-size: 1.35rem !important;
+        font-weight: 600 !important;
+        line-height: 1.3 !important;
+    }
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] * {
+        font-size: 0.82rem !important;
+    }
+    div[data-testid="stMetricDelta"],
+    div[data-testid="stMetricDelta"] * {
+        font-size: 0.80rem !important;
+    }
+    div[data-testid="stMetric"] {
+        background-color: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        padding: 8px 12px;
+        border-radius: 8px;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    db = BacktestDatabase()
+    DOCS_PATH = PROJECT_ROOT / "docs" / "strategy_scoring_guide.html"
+
+
+    def load_guide_html() -> str:
+        if DOCS_PATH.exists():
+            try:
+                with open(DOCS_PATH, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                return f"<h3>Error reading documentation: {e}</h3>"
+        return "<h3>Documentation file not found at docs/strategy_scoring_guide.html</h3>"
+
+
+    @st.dialog("📖 Strategy Scoring & Signal Thresholds Guide", width="large")
+    def show_guide_dialog():
+        html_content = load_guide_html()
+        col_d1, col_d2 = st.columns([3, 1])
+        col_d1.caption("Interactive guide explaining indicator weights, consensus scoring, and threshold gates.")
+        col_d2.download_button(
+            "⬇️ Save HTML File",
+            data=html_content,
+            file_name="strategy_scoring_guide.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+        st.components.v1.html(html_content, height=650, scrolling=True)
+
+
+    IND_TOGGLE_KEYS = [
+        ("ema_enabled", "c_ema"),
+        ("rsi_enabled", "c_rsi"),
+        ("macd_enabled", "c_macd"),
+        ("vwap_enabled", "c_vwap"),
+        ("atr_enabled", "c_atr"),
+        ("adx_enabled", "c_adx"),
+        ("volume_enabled", "c_vol"),
+        ("bollinger_enabled", "c_bb"),
+        ("stoch_enabled", "c_stoch"),
+        ("obv_enabled", "c_obv"),
+        ("higher_high_enabled", "c_hh"),
+        ("lower_low_enabled", "c_ll"),
+    ]
+
+
+    def load_strategy_into_session(strat_name: str):
+        """Loads a named strategy configuration from strategy_store into session state."""
+        strat = get_strategy(strat_name)
+        if not strat:
+            return
+        st.session_state.selected_strategy_name = strat_name
+        st.session_state.strategy_name_input = strat_name
+        try:
+            st.session_state["step1_strat_name_input_field"] = strat_name
+        except Exception:
+            pass
+        try:
+            st.session_state["step1_load_strat_select"] = strat_name
+        except Exception:
+            pass
+        try:
+            st.session_state["step2_strat_selector"] = strat_name
+        except Exception:
+            pass
+        if "indicators" in strat:
+            st.session_state.indicators = dict(strat["indicators"])
+            for ik, wk in IND_TOGGLE_KEYS:
+                st.session_state[wk] = st.session_state.indicators.get(ik, True)
+            st.session_state["select_all_ind"] = all(
+                st.session_state.get(w, False) for _, w in IND_TOGGLE_KEYS
+            )
+        if "risk" in strat:
+            r = dict(strat["risk"])
+            for k in ["entry_start", "entry_end", "square_off_time"]:
+                if k in r and isinstance(r[k], str):
+                    parts = [int(p) for p in r[k].split(":")]
+                    r[k] = time(*parts)
+            st.session_state.risk = r
+        if "cost" in strat:
+            st.session_state.cost = dict(strat["cost"])
+
+    def reset_to_default_strategy():
+        """Resets to standard clean configuration with auto-suggested name."""
+        clean_strat = get_strategy("EMA_RSI_MACD_Balanced")
+        if clean_strat:
+            load_strategy_into_session("EMA_RSI_MACD_Balanced")
+        auto_name = auto_suggest_strategy_name(st.session_state.indicators)
+        st.session_state.strategy_name_input = auto_name
+        st.session_state.selected_strategy_name = auto_name
+        try:
+            st.session_state["step1_strat_name_input_field"] = auto_name
+        except Exception:
+            pass
+        try:
+            st.session_state["step2_strat_selector"] = auto_name
+        except Exception:
+            pass
+
+
+    # ---------------- Session State Helpers ----------------
+    def init_session_state():
+        if "step" not in st.session_state:
+            st.session_state.step = 1
+
+        saved_strats = list_strategy_names()
+        if "selected_strategy_name" not in st.session_state:
+            st.session_state.selected_strategy_name = saved_strats[0] if saved_strats else "EMA_RSI_MACD_Balanced"
+        if "strategy_name_input" not in st.session_state:
+            st.session_state.strategy_name_input = st.session_state.selected_strategy_name
+        if "step1_strat_name_input_field" not in st.session_state:
+            st.session_state["step1_strat_name_input_field"] = st.session_state.strategy_name_input
+        if "step2_strat_selector" not in st.session_state:
+            st.session_state["step2_strat_selector"] = st.session_state.selected_strategy_name
+
+        if "symbol" not in st.session_state:
+            st.session_state.symbol = "RELIANCE"
+        if "isin" not in st.session_state:
+            st.session_state.isin = "INE002A01018"
+        if "equity_name" not in st.session_state:
+            st.session_state.equity_name = "RELIANCE INDUSTRIES LTD"
+        if "instrument_key" not in st.session_state:
+            st.session_state.instrument_key = "NSE_EQ|INE002A01018"
+        if "market_segment" not in st.session_state:
+            st.session_state.market_segment = "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]"
+
+
+        if "start_date" not in st.session_state:
+            st.session_state.start_date = date(2026, 9, 1)
+        if "end_date" not in st.session_state:
+            st.session_state.end_date = date(2026, 9, 30)
+        if "timeframe" not in st.session_state:
+            st.session_state.timeframe = 5
+        if "allow_short" not in st.session_state:
+            st.session_state.allow_short = True
+        if "holdout_pct" not in st.session_state:
+            st.session_state.holdout_pct = 0
+
+        # Indicator defaults
+        if "indicators" not in st.session_state:
+            strat = get_strategy(st.session_state.selected_strategy_name)
+            if strat and "indicators" in strat:
+                st.session_state.indicators = dict(strat["indicators"])
+            else:
+                st.session_state.indicators = {
+                    "ema_enabled": True, "ema_fast": 20, "ema_slow": 50, "ema_weight": 2,
+                    "rsi_enabled": True, "rsi_period": 14, "rsi_bull_low": 55.0, "rsi_bull_high": 70.0,
+                    "rsi_bear_low": 30.0, "rsi_bear_high": 45.0, "rsi_weight": 1,
+                    "macd_enabled": True, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "macd_weight": 2,
+                    "vwap_enabled": True, "vwap_weight": 1,
+                    "atr_enabled": True, "atr_period": 14, "atr_stop_multiplier": 1.5, "atr_reward_risk_ratio": 2.0,
+                    "adx_enabled": True, "adx_period": 14, "adx_min": 20.0, "adx_weight": 1,
+                    "volume_enabled": True, "volume_period": 20, "volume_ratio_min": 1.2, "volume_consecutive": 3, "volume_weight": 1,
+                    "bollinger_enabled": True, "bollinger_period": 20, "bollinger_std_dev": 2.0, "bollinger_weight": 1,
+                    "stoch_enabled": True, "stoch_k": 14, "stoch_d": 3, "stoch_low": 20.0, "stoch_high": 80.0, "stoch_weight": 1,
+                    "obv_enabled": True, "obv_ma_period": 20, "obv_weight": 1,
+                    "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
+                    "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+                    "long_threshold": 5, "short_threshold": -5,
+                    "fixed_target_pct": 3, "fixed_stoploss_pct": 2,
+                    "trailing_sl_enabled": False, "trail_beyond_target": False,
+                    "trade_side": "BOTH", "short_lot_size": 1,
+                    "snooze_period_str": "5 min", "snooze_minutes": 5,
+                }
+        else:
+            if "volume_consecutive" not in st.session_state.indicators:
+                st.session_state.indicators["volume_consecutive"] = 3
+            if "fixed_target_pct" not in st.session_state.indicators:
+                st.session_state.indicators["fixed_target_pct"] = 3
+            if "fixed_stoploss_pct" not in st.session_state.indicators:
+                st.session_state.indicators["fixed_stoploss_pct"] = 2
+            if "trailing_sl_enabled" not in st.session_state.indicators:
+                st.session_state.indicators["trailing_sl_enabled"] = False
+            if "trail_beyond_target" not in st.session_state.indicators:
+                st.session_state.indicators["trail_beyond_target"] = False
+            if "higher_high_enabled" not in st.session_state.indicators:
+                st.session_state.indicators["higher_high_enabled"] = False
+            if "higher_high_period" not in st.session_state.indicators:
+                st.session_state.indicators["higher_high_period"] = 5
+            if "higher_high_weight" not in st.session_state.indicators:
+                st.session_state.indicators["higher_high_weight"] = 1
+            if "lower_low_enabled" not in st.session_state.indicators:
+                st.session_state.indicators["lower_low_enabled"] = False
+            if "lower_low_period" not in st.session_state.indicators:
+                st.session_state.indicators["lower_low_period"] = 5
+            if "lower_low_weight" not in st.session_state.indicators:
+                st.session_state.indicators["lower_low_weight"] = 1
+            if "trade_side" not in st.session_state.indicators:
+                st.session_state.indicators["trade_side"] = "BOTH"
+            if "short_lot_size" not in st.session_state.indicators:
+                st.session_state.indicators["short_lot_size"] = 1
+            if "snooze_period_str" not in st.session_state.indicators:
+                st.session_state.indicators["snooze_period_str"] = "5 min"
+            if "snooze_minutes" not in st.session_state.indicators:
+                st.session_state.indicators["snooze_minutes"] = 5
+
+        # Risk defaults (from RiskConfig)
+        if "risk" not in st.session_state:
+            strat = get_strategy(st.session_state.selected_strategy_name)
+            if strat and "risk" in strat:
+                r = dict(strat["risk"])
+                for k in ["entry_start", "entry_end", "square_off_time"]:
+                    if k in r and isinstance(r[k], str):
+                        parts = [int(p) for p in r[k].split(":")]
+                        r[k] = time(*parts)
+                st.session_state.risk = r
+            else:
+                st.session_state.risk = {
+                    "capital": 100_000.0,
+                    "risk_per_trade_pct": 0.01,
+                    "max_daily_loss": 2_000.0,
+                    "max_open_positions": 3,
+                    "max_exposure_pct": 1.0,
+                    "max_quantity": 5_000,
+                    "max_consecutive_losses": 3,
+                    "lot_size": 1,
+                    "tick_size": 0.05,
+                    "trade_side": "BOTH",
+                    "short_lot_size": 1,
+                    "snooze_period_str": "5 min",
+                    "snooze_minutes": 5,
+                    "atr_stop_multiplier": 1.5,
+                    "reward_risk_ratio": 2.0,
+                    "fixed_target_pct": 3,
+                    "fixed_stoploss_pct": 2,
+                    "trailing_sl_enabled": False,
+                    "trail_beyond_target": False,
+                    "entry_start": time(9, 20),
+                    "entry_end": time(15, 0),
+                    "square_off_time": time(15, 15),
+                }
+        else:
+            if "fixed_target_pct" not in st.session_state.risk:
+                st.session_state.risk["fixed_target_pct"] = 3
+            if "fixed_stoploss_pct" not in st.session_state.risk:
+                st.session_state.risk["fixed_stoploss_pct"] = 2
+            if "trailing_sl_enabled" not in st.session_state.risk:
+                st.session_state.risk["trailing_sl_enabled"] = False
+            if "trail_beyond_target" not in st.session_state.risk:
+                st.session_state.risk["trail_beyond_target"] = False
+            if "trade_side" not in st.session_state.risk:
+                st.session_state.risk["trade_side"] = "BOTH"
+            if "short_lot_size" not in st.session_state.risk:
+                st.session_state.risk["short_lot_size"] = 1
+            if "snooze_period_str" not in st.session_state.risk:
+                st.session_state.risk["snooze_period_str"] = "5 min"
+            if "snooze_minutes" not in st.session_state.risk:
+                st.session_state.risk["snooze_minutes"] = 5
+
+        # Cost defaults
+        if "cost" not in st.session_state:
+            strat = get_strategy(st.session_state.selected_strategy_name)
+            if strat and "cost" in strat:
+                st.session_state.cost = dict(strat["cost"])
+            else:
+                st.session_state.cost = {
+                    "cost_mode": "FLAT_PER_ORDER",
+                    "flat_cost_per_order": 20.0,
+                    "slippage_mode": "FLAT_PER_ORDER",
+                    "flat_slippage_per_order": 20.0,
+                    "slippage_pct": 0.0005,
+                }
+
+        if "active_run" not in st.session_state:
+            st.session_state.active_run = None
+
+
+    init_session_state()
+
+    # ---------------- Load Instruments Cache ----------------
+    try:
+        equities_df = load_nse_equities()
+    except Exception as e:
+        logger.error("Failed loading instruments: %s", e)
+        equities_df = pd.DataFrame()
+
+
+    # ---------------- Sidebar: Execution History ----------------
+    st.sidebar.title("Execution History")
+
+    all_db_strats = db.get_distinct_strategies()
+    all_saved_strats = list_strategy_names()
+    merged_strats = sorted(list(set(all_saved_strats + all_db_strats)))
+
+    strat_filter_options = ["[All Strategies]"] + merged_strats
+    current_selected_strat = st.session_state.get("selected_strategy_name", "")
+    default_filter_idx = 0
+    if current_selected_strat in strat_filter_options:
+        default_filter_idx = strat_filter_options.index(current_selected_strat)
+
+    selected_strat_filter = st.sidebar.selectbox(
+        "🎯 Strategy Filter",
+        strat_filter_options,
+        index=default_filter_idx,
+        key="sb_strat_filter",
+        help="Filter previous executions by Strategy Name",
+    )
+
+    filter_arg = selected_strat_filter if selected_strat_filter != "[All Strategies]" else None
+    recent_runs = db.get_recent_runs(limit=20, strategy_name=filter_arg)
+
+    if recent_runs:
+        run_options = {}
+        for r in recent_runs:
+            net_pnl = r.get("metrics", {}).get("net_pnl")
+            if net_pnl is not None:
+                pnl_val = float(net_pnl)
+                pnl_tag = f"+₹{pnl_val:,.0f}" if pnl_val >= 0 else f"-₹{abs(pnl_val):,.0f}"
+            else:
+                pnl_tag = "N/A"
+            label = f"#{r['id']} | {r['symbol']} ({pnl_tag}) | {r['date_from'][5:]} to {r['date_to'][5:]} | {r['created_at'][5:16]}"
+            run_options[label] = r["id"]
+
+        selected_label = st.sidebar.selectbox(f"Previous executions ({len(recent_runs)}/20)", list(run_options.keys()), key="sb_run_picker")
+        selected_run_id = run_options[selected_label]
+
+        col_btn1, col_btn2 = st.sidebar.columns(2)
+        if col_btn1.button("View Run", use_container_width=True):
+            run_data = db.get_run(selected_run_id)
+            trades_df = db.get_trades(selected_run_id)
+            st.session_state.active_run = {
+                "run_id": selected_run_id,
+                "run_data": run_data,
+                "trades_df": trades_df,
+                "metrics": run_data.get("metrics", {}),
+                "in_sample": None,
+                "out_sample": None,
+            }
+            st.session_state.step = 3
+            st.rerun()
+
+        if col_btn2.button("Re-run Config", use_container_width=True):
+            run_data = db.get_run(selected_run_id)
+            cfg_dict = run_data.get("config", {})
+            if "symbol" in cfg_dict:
+                st.session_state.symbol = cfg_dict["symbol"]
+            if "isin" in cfg_dict:
+                st.session_state.isin = cfg_dict["isin"]
+            if "indicators" in cfg_dict:
+                st.session_state.indicators = cfg_dict["indicators"]
+            strat_to_reload = cfg_dict.get("strategy_name") or run_data.get("strategy_version")
+            if strat_to_reload:
+                st.session_state.selected_strategy_name = strat_to_reload
+                st.session_state.strategy_name_input = strat_to_reload
+                try:
+                    st.session_state["step1_strat_name_input_field"] = strat_to_reload
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step1_load_strat_select"] = strat_to_reload
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step2_strat_selector"] = strat_to_reload
+                except Exception:
+                    pass
+            if "risk" in cfg_dict:
+                r = cfg_dict["risk"]
+                for k in ["entry_start", "entry_end", "square_off_time"]:
+                    if k in r and isinstance(r[k], str):
+                        parts = [int(p) for p in r[k].split(":")]
+                        r[k] = time(*parts)
+                st.session_state.risk = r
+            if "cost" in cfg_dict:
+                st.session_state.cost = cfg_dict["cost"]
+            st.session_state.step = 2
+            st.sidebar.success("Config reloaded! Redirecting to Step 2...")
+            st.rerun()
+    else:
+        st.sidebar.info(f"No executions found for '{selected_strat_filter}'. Complete a backtest to see history.")
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📖 Documentation & Help")
+    if st.sidebar.button("❓ Strategy & Scoring Guide", use_container_width=True, key="btn_side_guide"):
+        show_guide_dialog()
+
+    guide_raw = load_guide_html()
+    st.sidebar.download_button(
+        "⬇️ Download Guide (.html)",
+        data=guide_raw,
+        file_name="strategy_scoring_guide.html",
+        mime="text/html",
+        use_container_width=True,
+        help="Download the offline HTML guide to open in any browser",
+        key="btn_side_dl_guide"
+    )
+
+    # ---------------- Sidebar: Live Access & Audit ----------------
+    st.sidebar.markdown("---")
+    source_badge = "🟢 Localhost"
+    if "Ngrok" in client_info.get("access_source", ""):
+        source_badge = "🌐 Public (Ngrok)"
+    elif "Cloudflare" in client_info.get("access_source", ""):
+        source_badge = "☁️ Public (Cloudflare)"
+    elif "LAN" in client_info.get("access_source", ""):
+        source_badge = "📶 Local Network"
+    elif "Public" in client_info.get("access_source", ""):
+        source_badge = "🌍 Public Internet"
+
+    with st.sidebar.expander(f"🛡️ Access & Audit ({source_badge})", expanded=False):
+        st.markdown(f"**Access Source:** `{client_info.get('access_source', 'Unknown')}`")
+        st.markdown(f"**Client IP:** `{client_info.get('client_ip', '127.0.0.1')}`")
+        st.markdown(f"**Host:** `{client_info.get('host', 'localhost')}`")
+        st.markdown(f"**Device:** `{client_info.get('browser', 'Unknown')} on {client_info.get('os', 'Unknown')}`")
+        st.markdown("---")
+        st.caption("Live Access Audit Trail (newest first):")
+        recent_logs = get_recent_audit_logs(limit=5)
+        if recent_logs:
+            log_df = pd.DataFrame([{
+                "Time": str(r.get("timestamp_local", ""))[-8:],
+                "Src": r.get("access_source", "").replace("Public Tunnel (Ngrok)", "Ngrok").replace("Public Tunnel (Cloudflare)", "Cloudflare"),
+                "IP": r.get("client_ip", ""),
+                "Event": r.get("event_type", ""),
+            } for r in recent_logs])
+            st.dataframe(log_df, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No audit entries recorded yet.")
+
+
+
+    # ---------------- Wizard Steps ----------------
+    steps = ["1. Strategy Config", "2. Instrument & Run", "3. Results"]
+    st.progress(min(st.session_state.step / 3.0, 1.0))
+    col_tabs = st.columns(3)
+    for i, name in enumerate(steps, 1):
+        disabled = (i == 3 and st.session_state.active_run is None)
+        if col_tabs[i - 1].button(name, key=f"nav_tab_{i}", disabled=disabled):
+            if i == 2:
+                active_sname = (st.session_state.get("step1_strat_name_input_field") or st.session_state.get("strategy_name_input") or st.session_state.get("selected_strategy_name", "")).strip()
+                if active_sname:
+                    st.session_state.selected_strategy_name = active_sname
+                    st.session_state.strategy_name_input = active_sname
+                    try:
+                        st.session_state["step2_strat_selector"] = active_sname
+                    except Exception:
+                        pass
+            elif i == 1:
+                active_sname = (st.session_state.get("step2_strat_selector") or st.session_state.get("selected_strategy_name") or st.session_state.get("strategy_name_input", "")).strip()
+                if active_sname:
+                    st.session_state.selected_strategy_name = active_sname
+                    st.session_state.strategy_name_input = active_sname
+                    try:
+                        st.session_state["step1_strat_name_input_field"] = active_sname
+                    except Exception:
+                        pass
+                    try:
+                        st.session_state["step1_load_strat_select"] = active_sname
+                    except Exception:
+                        pass
+            st.session_state.step = i
+            st.rerun()
+
+    st.markdown("---")
+
+
+    def execute_backtest_simulation():
+        progress_bar = st.progress(10)
+        status_text = st.empty()
+        strat_name = st.session_state.get("selected_strategy_name", "custom")
+
+        token = os.getenv("UPSTOX_ACCESS_TOKEN")
+        inst_key = st.session_state.get("instrument_key") or f"NSE_EQ|{st.session_state.isin}"
+        start_d = st.session_state.start_date
+        end_d = st.session_state.end_date
+
+        log_audit_event(
+            "BACKTEST_INITIATED",
+            details={
+                "symbol": st.session_state.symbol,
+                "isin": st.session_state.isin,
+                "from_date": str(start_d),
+                "to_date": str(end_d),
+                "timeframe": f"{st.session_state.timeframe}m",
+                "capital": st.session_state.risk.get("capital"),
+            },
+        )
+
+        try:
+            status_text.text(f"Fetching historical candles for {st.session_state.symbol} ({inst_key})...")
+            progress_bar.progress(25)
+
+            raw_df = None
+            is_kotak_inst = bool(inst_key and ("nse_fo" in inst_key.lower() or "nse_cm" in inst_key.lower() or inst_key.isdigit()))
+            is_fo = "F&O" in st.session_state.get("market_segment", "")
+
+            # 1. Fetch from Kotak Neo Gateway (Primary for F&O and Kotak instruments)
+            if is_kotak_inst or is_fo:
+                try:
+                    kotak_gw = get_gateway("KOTAK")
+                    logger.info("Fetching historical candles from Kotak Neo for %s (%s)", st.session_state.symbol, inst_key)
+                    raw_df = kotak_gw.fetch_historical_candles(
+                        symbol=st.session_state.symbol,
+                        instrument_key=inst_key,
+                        timeframe_minutes=st.session_state.timeframe,
+                        start_date=start_d,
+                        end_date=end_d,
+                    )
+                except Exception as e:
+                    logger.warning("Kotak Neo candle fetch exception: %s", e)
+
+            # 2. If not fetched and Upstox token is available for standard Upstox keys
+            if (raw_df is None or raw_df.empty) and token and not is_kotak_inst:
+                try:
+                    raw_df = fetch_range(inst_key, "minutes", st.session_state.timeframe, start_d, end_d, chunk_days=28)
+                except Exception as e:
+                    logger.warning("Upstox fetch_range failed: %s", e)
+
+            # 3. Local cached CSV fallback if live fetch returned empty
+            if raw_df is None or raw_df.empty:
+                sym_clean = st.session_state.symbol.lower().replace(" ", "")
+                local_fallback = f"data/{st.session_state.symbol.lower()}_{st.session_state.timeframe}m.csv"
+                fallback_clean = f"data/{sym_clean}_{st.session_state.timeframe}m.csv"
+                fallback_5m = f"data/{st.session_state.symbol.lower()}_5m.csv"
+                fallback_clean_5m = f"data/{sym_clean}_5m.csv"
+                fallback_nifty = f"data/nifty_{st.session_state.timeframe}m.csv"
+                fallback_nifty5m = "data/nifty_5m.csv"
+                fallback_2 = f"data/reliance_{st.session_state.timeframe}m.csv"
+                fallback_3 = "data/reliance_5m.csv"
+                fallback_4 = "data/upstox_5m.csv"
+                for fb in [local_fallback, fallback_clean, fallback_5m, fallback_clean_5m, fallback_nifty, fallback_nifty5m, fallback_2, fallback_3, fallback_4]:
+                    if os.path.exists(fb):
+                        logger.warning("Using local fallback file: %s", fb)
+                        raw_df = load_csv(fb)
+                        break
+
+                if raw_df is not None and not raw_df.empty:
+                    ts_dt = pd.to_datetime(raw_df["timestamp"]).dt.date
+                    in_range = raw_df[(ts_dt >= start_d) & (ts_dt <= end_d)]
+                    if not in_range.empty:
+                        raw_df = in_range.copy()
+
+            if raw_df is None or raw_df.empty:
+                raise ValueError(f"No candle data returned for {inst_key} between {start_d} and {end_d}. Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
+
+            progress_bar.progress(50)
+            status_text.text("Calculating 12 custom indicators...")
+
+            ind = st.session_state.indicators
+            risk_inp = st.session_state.risk
+            cost_inp = st.session_state.cost
+
+            custom_cfg = CustomStrategyConfig(
+                name=strat_name,
+                ema_enabled=ind["ema_enabled"], ema_fast=ind["ema_fast"], ema_slow=ind["ema_slow"], ema_weight=ind["ema_weight"],
+                rsi_enabled=ind["rsi_enabled"], rsi_period=ind["rsi_period"], rsi_bull_low=ind["rsi_bull_low"],
+                rsi_bull_high=ind["rsi_bull_high"], rsi_bear_low=ind["rsi_bear_low"], rsi_bear_high=ind["rsi_bear_high"], rsi_weight=ind["rsi_weight"],
+                macd_enabled=ind["macd_enabled"], macd_fast=ind["macd_fast"], macd_slow=ind["macd_slow"], macd_signal=ind["macd_signal"], macd_weight=ind["macd_weight"],
+                vwap_enabled=ind["vwap_enabled"], vwap_weight=ind["vwap_weight"],
+                atr_enabled=ind["atr_enabled"], atr_period=ind["atr_period"], atr_stop_multiplier=risk_inp["atr_stop_multiplier"], atr_reward_risk_ratio=risk_inp["reward_risk_ratio"],
+                adx_enabled=ind["adx_enabled"], adx_period=ind["adx_period"], adx_min=ind["adx_min"], adx_weight=ind["adx_weight"],
+                volume_enabled=ind["volume_enabled"], volume_period=ind["volume_period"], volume_ratio_min=ind["volume_ratio_min"],
+                volume_consecutive=int(ind.get("volume_consecutive", 3)), volume_weight=ind["volume_weight"],
+                bollinger_enabled=ind["bollinger_enabled"], bollinger_period=ind["bollinger_period"], bollinger_std_dev=ind["bollinger_std_dev"], bollinger_weight=ind["bollinger_weight"],
+                stoch_enabled=ind["stoch_enabled"], stoch_k=ind["stoch_k"], stoch_d=ind["stoch_d"], stoch_low=ind["stoch_low"], stoch_high=ind["stoch_high"], stoch_weight=ind["stoch_weight"],
+                obv_enabled=ind["obv_enabled"], obv_ma_period=ind["obv_ma_period"], obv_weight=ind["obv_weight"],
+                higher_high_enabled=bool(ind.get("higher_high_enabled", False)),
+                higher_high_period=int(ind.get("higher_high_period", 5)),
+                higher_high_weight=int(ind.get("higher_high_weight", 1)),
+                lower_low_enabled=bool(ind.get("lower_low_enabled", False)),
+                lower_low_period=int(ind.get("lower_low_period", 5)),
+                lower_low_weight=int(ind.get("lower_low_weight", 1)),
+                long_threshold=ind["long_threshold"], short_threshold=ind["short_threshold"],
+                fixed_target_pct=float(ind.get("fixed_target_pct", 3)), fixed_stoploss_pct=float(ind.get("fixed_stoploss_pct", 2)),
+                trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
+                trail_beyond_target=bool(ind.get("trail_beyond_target", False)),
+            )
+
+            indicators_df = calculate_custom_indicators(raw_df, custom_cfg)
+
+            progress_bar.progress(70)
+            status_text.text("Simulating execution via Backtester...")
+
+            trade_side = ind.get("trade_side", "BOTH")
+            short_lot_size = int(ind.get("short_lot_size", 1)) if trade_side != "LONG" else None
+            snooze_minutes = int(ind.get("snooze_minutes", 0))
+
+            risk_cfg = RiskConfig(
+                capital=float(risk_inp["capital"]),
+                risk_per_trade_pct=float(risk_inp["risk_per_trade_pct"]),
+                max_daily_loss=float(risk_inp["max_daily_loss"]),
+                max_open_positions=int(risk_inp["max_open_positions"]),
+                max_exposure_pct=float(risk_inp["max_exposure_pct"]),
+                max_quantity=int(risk_inp["max_quantity"]),
+                max_consecutive_losses=int(risk_inp["max_consecutive_losses"]),
+                lot_size=int(risk_inp["lot_size"]),
+                tick_size=float(risk_inp["tick_size"]),
+                trade_side=trade_side,
+                short_lot_size=short_lot_size,
+                snooze_minutes=snooze_minutes,
+                atr_stop_multiplier=float(risk_inp["atr_stop_multiplier"]),
+                reward_risk_ratio=float(risk_inp["reward_risk_ratio"]),
+                fixed_target_pct=float(ind.get("fixed_target_pct", 3)),
+                fixed_stoploss_pct=float(ind.get("fixed_stoploss_pct", 2)),
+                trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
+                trail_beyond_target=bool(ind.get("trail_beyond_target", False)),
+                entry_start=risk_inp["entry_start"],
+                entry_end=risk_inp["entry_end"],
+                square_off_time=risk_inp["square_off_time"],
+            )
+
+            cost_cfg = CostConfig(
+                cost_mode=cost_inp["cost_mode"],
+                flat_cost_per_order=float(cost_inp["flat_cost_per_order"]),
+                slippage_mode=cost_inp["slippage_mode"],
+                flat_slippage_per_order=float(cost_inp["flat_slippage_per_order"]),
+                slippage_pct=float(cost_inp.get("slippage_pct", 0.0005)),
+            )
+
+            bt_cfg = BacktestConfig(
+                allow_short=st.session_state.allow_short or (trade_side in ("SHORT", "BOTH")),
+                trade_side=trade_side,
+                short_lot_size=short_lot_size,
+                snooze_minutes=snooze_minutes,
+                trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
+                trail_beyond_target=bool(ind.get("trail_beyond_target", False)),
+            )
+
+            # Full run
+            trades_df, bt = run_backtest(indicators_df, st.session_state.symbol, custom_cfg, risk_cfg, cost_cfg, bt_cfg)
+            full_metrics = compute_metrics(trades_df, risk_cfg.capital, trading_days(indicators_df))
+
+            # Train/Test Split if requested
+            in_sample_res, out_sample_res = None, None
+            if st.session_state.holdout_pct > 0 and len(trading_days(indicators_df)) >= 4:
+                total_days = len(trading_days(indicators_df))
+                out_days = int(np.ceil(total_days * (st.session_state.holdout_pct / 100.0)))
+                in_days = total_days - out_days
+                in_df, out_df = split_by_days(indicators_df, in_days)
+
+                in_trades, _ = run_backtest(in_df, st.session_state.symbol, custom_cfg, risk_cfg, cost_cfg, bt_cfg)
+                out_trades, _ = run_backtest(out_df, st.session_state.symbol, custom_cfg, risk_cfg, cost_cfg, bt_cfg)
+
+                in_sample_res = {
+                    "trades": in_trades,
+                    "metrics": compute_metrics(in_trades, risk_cfg.capital, trading_days(in_df)),
+                    "days": len(trading_days(in_df)),
+                }
+                out_sample_res = {
+                    "trades": out_trades,
+                    "metrics": compute_metrics(out_trades, risk_cfg.capital, trading_days(out_df)),
+                    "days": len(trading_days(out_df)),
+                }
+
+            progress_bar.progress(90)
+            status_text.text("Saving execution to backtest audit database...")
+
+            full_config_save = {
+                "strategy_name": strat_name,
+                "symbol": st.session_state.symbol,
+                "isin": st.session_state.isin,
+                "equity_name": st.session_state.equity_name,
+                "date_from": str(start_d),
+                "date_to": str(end_d),
+                "timeframe": st.session_state.timeframe,
+                "allow_short": st.session_state.allow_short,
+                "holdout_pct": st.session_state.holdout_pct,
+                "indicators": ind,
+                "risk": {k: str(v) if isinstance(v, (time, date)) else v for k, v in risk_inp.items()},
+                "cost": cost_inp,
+            }
+
+            run_id = db.save_run(
+                symbol=st.session_state.symbol,
+                isin=st.session_state.isin,
+                date_from=str(start_d),
+                date_to=str(end_d),
+                timeframe=f"{st.session_state.timeframe}m",
+                strategy_version=strat_name,
+                config=full_config_save,
+                metrics=full_metrics,
+                trades_df=trades_df,
+                status="COMPLETED",
+            )
+
+            log_audit_event(
+                "BACKTEST_COMPLETED",
+                details={
+                    "symbol": st.session_state.symbol,
+                    "run_id": run_id,
+                    "trades": full_metrics.get("num_trades", len(trades_df)),
+                    "net_pnl": round(float(full_metrics.get("net_pnl", 0.0)), 2),
+                    "win_rate_pct": round(float(full_metrics.get("win_rate_pct", 0.0)), 1),
+                },
+            )
+
+            progress_bar.progress(100)
+            status_text.text("Complete!")
+
+            # Update active results
+            run_data = db.get_run(run_id)
+            st.session_state.active_run = {
+                "run_id": run_id,
+                "run_data": run_data,
+                "trades_df": trades_df,
+                "metrics": full_metrics,
+                "in_sample": in_sample_res,
+                "out_sample": out_sample_res,
+                "indicators_df": indicators_df,
+                "raw_df": raw_df,
+                "custom_cfg": custom_cfg,
+            }
+            st.session_state.step = 3
+            st.rerun()
+
+        except Exception as e:
+            progress_bar.progress(100)
+            logger.exception("Backtest execution error: %s", e)
+            st.error(f"❌ Execution Failed: {str(e)}")
+            st.info("Check your Upstox access token in .env, verify date ranges, and ensure network access.")
+            if st.button("⬅️ Return to Step 2"):
+                st.session_state.step = 2
+                st.rerun()
+
+
+    def render_step_1_strategy_config():
+        st.header("Step 1: Strategy Configuration & Rules")
+        st.caption("Configure technical indicators, scoring weights, and risk guardrails. Save your configuration as a named Strategy in your Strategies-List.")
+
+        # Strategy Selection & Management Toolbar
+        saved_strategies = list_strategy_names()
+        target_s1 = st.session_state.get("selected_strategy_name") or (saved_strategies[0] if saved_strategies else "EMA_RSI_MACD_Balanced")
+        if target_s1 not in saved_strategies:
+            saved_strategies.insert(0, target_s1)
+        st.session_state["step1_load_strat_select"] = target_s1
+        curr_strat_idx = saved_strategies.index(target_s1) if target_s1 in saved_strategies else 0
+        current_strat = target_s1
+
+        st.markdown("#### 📂 Strategies-List & Management")
+        col_load, col_new, col_del = st.columns([3, 1, 1])
+
+        def on_load_strategy_change():
+            chosen = st.session_state.get("step1_load_strat_select")
+            if chosen:
+                load_strategy_into_session(chosen)
+                st.session_state.strategy_name_input = chosen
+                try:
+                    st.session_state["step1_strat_name_input_field"] = chosen
+                except Exception:
+                    pass
+
+        with col_load:
+            chosen_strat = st.selectbox(
+                "Load Strategy (Strategies-List)",
+                saved_strategies,
+                index=curr_strat_idx,
+                key="step1_load_strat_select",
+                on_change=on_load_strategy_change,
+                help="Select any saved strategy template to view or alter its rules.",
+            )
+            if chosen_strat != current_strat:
+                load_strategy_into_session(chosen_strat)
+                st.session_state.strategy_name_input = chosen_strat
+                try:
+                    st.session_state["step1_strat_name_input_field"] = chosen_strat
+                except Exception:
+                    pass
+                st.rerun()
+
+        with col_new:
+            st.write("")
+            st.write("")
+            if st.button("➕ New Strategy", use_container_width=True, help="Reset to standard defaults and create a new strategy"):
+                reset_to_default_strategy()
+                suggested = auto_suggest_strategy_name(st.session_state.indicators)
+                st.session_state.strategy_name_input = suggested
+                try:
+                    st.session_state["step1_strat_name_input_field"] = suggested
+                except Exception:
+                    pass
+                st.rerun()
+
+        with col_del:
+            st.write("")
+            st.write("")
+            if st.button("🗑️ Delete", use_container_width=True, help="Delete the current custom strategy", disabled=(len(saved_strategies) <= 1)):
+                deleted = delete_strategy(current_strat)
+                if deleted:
+                    st.success(f"Deleted '{current_strat}'")
+                    saved_remaining = list_strategy_names()
+                    new_active = saved_remaining[0] if saved_remaining else "EMA_RSI_MACD_Balanced"
+                    load_strategy_into_session(new_active)
+                    st.session_state.strategy_name_input = new_active
+                    try:
+                        st.session_state["step1_strat_name_input_field"] = new_active
+                    except Exception:
+                        pass
+                    st.rerun()
+                else:
+                    st.warning("Cannot delete default starter template.")
+
+        # Auto-suggested Strategy Name row
+        suggested_name = auto_suggest_strategy_name(st.session_state.indicators)
+        col_name, col_suggest = st.columns([3, 1])
+        with col_name:
+            if "step1_strat_name_input_field" not in st.session_state:
+                st.session_state["step1_strat_name_input_field"] = st.session_state.get("strategy_name_input", suggested_name)
+
+            strat_name_input = st.text_input(
+                "🏷️ Strategy Name",
+                key="step1_strat_name_input_field",
+                help="Meaningful name for this strategy based on chosen indicators. You can customize this.",
+            )
+            st.session_state.strategy_name_input = strat_name_input
+            if strat_name_input and strat_name_input.strip():
+                st.session_state.selected_strategy_name = strat_name_input.strip()
+                try:
+                    st.session_state["step2_strat_selector"] = strat_name_input.strip()
+                except Exception:
+                    pass
+        def on_auto_suggest_click():
+            s_name = auto_suggest_strategy_name(st.session_state.indicators)
+            st.session_state.strategy_name_input = s_name
+            st.session_state.selected_strategy_name = s_name
+            try:
+                st.session_state["step1_strat_name_input_field"] = s_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step2_strat_selector"] = s_name
+            except Exception:
+                pass
+
+        with col_suggest:
+            st.write("")
+            st.write("")
+            st.button(
+                "✨ Auto-Suggest Name",
+                key="btn_auto_suggest_strat_name",
+                use_container_width=True,
+                help="Generate a meaningful name based on active indicators",
+                on_click=on_auto_suggest_click,
+            )
+
+        st.caption(f"💡 *Suggested based on active indicators:* `{suggested_name}`")
+        st.markdown("---")
+
+        ind = st.session_state.indicators
+        risk = st.session_state.risk
+        cost = st.session_state.cost
+
+        tab_ind, tab_risk, tab_costs = st.tabs(["📊 Technical Indicators", "🛡️ Risk Management Parameters", "💰 Cost & Slippage Model"])
+
+        with tab_ind:
+            t_col1, t_col2 = st.columns([3, 1])
+            with t_col1:
+                st.subheader("Indicator Rules & Scoring Weights")
+                st.caption("Each enabled indicator awards or subtracts points based on candle conditions. Points accumulate into a net signal score.")
+            with t_col2:
+                if st.button("📖 Strategy Guide", key="btn_tab_guide", use_container_width=True):
+                    show_guide_dialog()
+
+            ind_toggle_keys = [
+                ("ema_enabled", "c_ema"),
+                ("rsi_enabled", "c_rsi"),
+                ("macd_enabled", "c_macd"),
+                ("vwap_enabled", "c_vwap"),
+                ("atr_enabled", "c_atr"),
+                ("adx_enabled", "c_adx"),
+                ("volume_enabled", "c_vol"),
+                ("bollinger_enabled", "c_bb"),
+                ("stoch_enabled", "c_stoch"),
+                ("obv_enabled", "c_obv"),
+                ("higher_high_enabled", "c_hh"),
+                ("lower_low_enabled", "c_ll"),
+            ]
+
+            for ik, wk in ind_toggle_keys:
+                if wk not in st.session_state:
+                    st.session_state[wk] = ind.get(ik, False if "enabled" in ik and ("higher_high" in ik or "lower_low" in ik) else True)
+
+            def sync_side_for_indicators():
+                hh = st.session_state.indicators.get("higher_high_enabled", False)
+                ll = st.session_state.indicators.get("lower_low_enabled", False)
+                if hh and ll:
+                    st.session_state.indicators["trade_side"] = "BOTH"
+                    st.session_state.risk["trade_side"] = "BOTH"
+                elif hh:
+                    st.session_state.indicators["trade_side"] = "LONG"
+                    st.session_state.risk["trade_side"] = "LONG"
+                elif ll:
+                    st.session_state.indicators["trade_side"] = "SHORT"
+                    st.session_state.risk["trade_side"] = "SHORT"
+
+            def on_select_all_toggle():
+                target_val = st.session_state["select_all_ind"]
+                for ik, wk in ind_toggle_keys:
+                    st.session_state[wk] = target_val
+                    st.session_state.indicators[ik] = target_val
+                sync_side_for_indicators()
+
+            def on_ind_checkbox_change(ik, wk):
+                st.session_state.indicators[ik] = st.session_state[wk]
+                st.session_state["select_all_ind"] = all(
+                    st.session_state.get(w, False) for _, w in ind_toggle_keys
+                )
+                sync_side_for_indicators()
+
+            if "select_all_ind" not in st.session_state:
+                st.session_state["select_all_ind"] = all(
+                    st.session_state.get(w, False) for _, w in ind_toggle_keys
+                )
+
+            st.checkbox(
+                "☑️ Select All / Deselect All Indicators",
+                key="select_all_ind",
+                on_change=on_select_all_toggle,
+                help="Check to enable all 12 indicators, or uncheck to disable all indicators at once."
+            )
+
+            i_col1, i_col2 = st.columns(2)
+
+            with i_col1:
+                # 1. EMA
+                with st.expander("1. EMA (Exponential Moving Average)", expanded=True):
+                    ind["ema_enabled"] = st.checkbox("Enable EMA", key="c_ema", on_change=on_ind_checkbox_change, args=("ema_enabled", "c_ema"))
+                    e1, e2, e3 = st.columns(3)
+                    ind["ema_fast"] = e1.number_input("Fast Period", min_value=1, max_value=100, value=ind["ema_fast"])
+                    ind["ema_slow"] = e2.number_input("Slow Period", min_value=1, max_value=200, value=ind["ema_slow"])
+                    ind["ema_weight"] = e3.number_input("Weight (Points)", min_value=1, max_value=5, value=ind["ema_weight"])
+
+                # 2. RSI
+                with st.expander("2. RSI (Relative Strength Index)", expanded=True):
+                    ind["rsi_enabled"] = st.checkbox("Enable RSI", key="c_rsi", on_change=on_ind_checkbox_change, args=("rsi_enabled", "c_rsi"))
+                    r1, r2, r3, r4 = st.columns(4)
+                    ind["rsi_period"] = r1.number_input("RSI Period", min_value=2, max_value=50, value=ind["rsi_period"])
+                    ind["rsi_bull_low"] = r2.number_input("Bull Zone Low", min_value=40.0, max_value=60.0, value=ind["rsi_bull_low"])
+                    ind["rsi_bull_high"] = r3.number_input("Bull Zone High", min_value=60.0, max_value=85.0, value=ind["rsi_bull_high"])
+                    ind["rsi_weight"] = r4.number_input("Weight", min_value=1, max_value=5, value=ind["rsi_weight"], key="w_rsi")
+
+                # 3. MACD
+                with st.expander("3. MACD (Moving Average Convergence Divergence)", expanded=True):
+                    ind["macd_enabled"] = st.checkbox("Enable MACD", key="c_macd", on_change=on_ind_checkbox_change, args=("macd_enabled", "c_macd"))
+                    m1, m2, m3, m4 = st.columns(4)
+                    ind["macd_fast"] = m1.number_input("Fast EMA", min_value=2, max_value=50, value=ind["macd_fast"])
+                    ind["macd_slow"] = m2.number_input("Slow EMA", min_value=10, max_value=100, value=ind["macd_slow"])
+                    ind["macd_signal"] = m3.number_input("Signal Period", min_value=2, max_value=30, value=ind["macd_signal"])
+                    ind["macd_weight"] = m4.number_input("Weight", min_value=1, max_value=5, value=ind["macd_weight"], key="w_macd")
+
+                # 4. VWAP
+                with st.expander("4. VWAP (Volume-Weighted Average Price)", expanded=True):
+                    ind["vwap_enabled"] = st.checkbox("Enable VWAP", key="c_vwap", on_change=on_ind_checkbox_change, args=("vwap_enabled", "c_vwap"))
+                    st.caption("VWAP is computed per intraday session. Bullish if Close > VWAP, Bearish if Close < VWAP.")
+                    ind["vwap_weight"] = st.number_input("VWAP Weight", min_value=1, max_value=5, value=ind["vwap_weight"])
+
+                # 5. ATR (Levels Only)
+                with st.expander("5. ATR (Average True Range) - Stops & Targets", expanded=True):
+                    ind["atr_enabled"] = st.checkbox("Enable ATR Stops", key="c_atr", on_change=on_ind_checkbox_change, args=("atr_enabled", "c_atr"))
+                    ind["atr_period"] = st.number_input("ATR Period", min_value=2, max_value=50, value=ind["atr_period"])
+                    st.caption(f"Stop multiplier ({risk['atr_stop_multiplier']}x) & Reward:Risk ({risk['reward_risk_ratio']}:1) configured under Risk Management tab.")
+
+                # 11. Higher High (NEW)
+                with st.expander("11. Higher High (NEW)", expanded=True):
+                    ind["higher_high_enabled"] = st.checkbox(
+                        "Enable Higher High",
+                        key="c_hh",
+                        on_change=on_ind_checkbox_change,
+                        args=("higher_high_enabled", "c_hh"),
+                        help="Condition: Current candle high > previous swing high. Automatically locks trade direction to LONG only."
+                    )
+                    st.caption("Condition: **Current candle high > previous swing high**. Automatically locks Long trade direction only.")
+                    hh1, hh2 = st.columns(2)
+                    ind["higher_high_period"] = hh1.number_input(
+                        "Swing Lookback Period",
+                        min_value=1,
+                        max_value=50,
+                        value=ind.get("higher_high_period", 5),
+                        help="Lookback period of previous candles to identify the swing high."
+                    )
+                    ind["higher_high_weight"] = hh2.number_input(
+                        "Higher High Weight",
+                        min_value=1,
+                        max_value=5,
+                        value=ind.get("higher_high_weight", 1),
+                        key="w_hh"
+                    )
+
+            with i_col2:
+                # 6. ADX
+                with st.expander("6. ADX (Average Directional Index)", expanded=True):
+                    ind["adx_enabled"] = st.checkbox("Enable ADX", key="c_adx", on_change=on_ind_checkbox_change, args=("adx_enabled", "c_adx"))
+                    a1, a2, a3 = st.columns(3)
+                    ind["adx_period"] = a1.number_input("ADX Period", min_value=2, max_value=50, value=ind["adx_period"])
+                    ind["adx_min"] = a2.number_input("Min Trend ADX", min_value=10.0, max_value=50.0, value=ind["adx_min"])
+                    ind["adx_weight"] = a3.number_input("ADX Weight", min_value=1, max_value=5, value=ind["adx_weight"], key="w_adx")
+
+                # 7. Volume Confirmation
+                with st.expander("7. Volume Ratio (Confirmation)", expanded=True):
+                    ind["volume_enabled"] = st.checkbox("Enable Volume", key="c_vol", on_change=on_ind_checkbox_change, args=("volume_enabled", "c_vol"))
+                    st.caption("Requires N consecutive candles where EACH candle close is in trend and volume ratio >= min within intraday.")
+                    v1, v2, v3, v4 = st.columns(4)
+                    ind["volume_period"] = v1.number_input("Volume MA Period", min_value=5, max_value=100, value=ind["volume_period"])
+                    ind["volume_ratio_min"] = v2.number_input("Min Volume Ratio", min_value=1.0, max_value=3.0, value=ind["volume_ratio_min"], step=0.1)
+                    cur_consec = int(ind.get("volume_consecutive", 3))
+                    consec_opts = [1, 2, 3, 4, 5]
+                    consec_idx = consec_opts.index(cur_consec) if cur_consec in consec_opts else 2
+                    ind["volume_consecutive"] = v3.selectbox(
+                        "consecutive period:",
+                        options=consec_opts,
+                        index=consec_idx,
+                        help="Checks last N consecutive candles: EACH must have close > prev close AND volume ratio >= min (LONG), or close < prev close AND volume ratio >= min (SHORT). 9:15 open candle is not compared."
+                    )
+                    ind["volume_weight"] = v4.number_input("Volume Weight", min_value=1, max_value=5, value=ind["volume_weight"], key="w_vol")
+
+                # 8. Bollinger Bands (NEW)
+                with st.expander("8. Bollinger Bands (NEW)", expanded=True):
+                    ind["bollinger_enabled"] = st.checkbox("Enable Bollinger", key="c_bb", on_change=on_ind_checkbox_change, args=("bollinger_enabled", "c_bb"))
+                    b1, b2, b3 = st.columns(3)
+                    ind["bollinger_period"] = b1.number_input("BB Period", min_value=5, max_value=100, value=ind["bollinger_period"])
+                    ind["bollinger_std_dev"] = b2.number_input("Std Deviations", min_value=0.5, max_value=4.0, value=ind["bollinger_std_dev"], step=0.1)
+                    ind["bollinger_weight"] = b3.number_input("BB Weight", min_value=1, max_value=5, value=ind["bollinger_weight"], key="w_bb")
+
+                # 9. Stochastic (NEW)
+                with st.expander("9. Stochastic Oscillator (NEW)", expanded=True):
+                    ind["stoch_enabled"] = st.checkbox("Enable Stochastic", key="c_stoch", on_change=on_ind_checkbox_change, args=("stoch_enabled", "c_stoch"))
+                    s1, s2, s3 = st.columns(3)
+                    ind["stoch_k"] = s1.number_input("%K Period", min_value=2, max_value=50, value=ind["stoch_k"])
+                    ind["stoch_d"] = s2.number_input("%D Period", min_value=1, max_value=20, value=ind["stoch_d"])
+                    ind["stoch_weight"] = s3.number_input("Stoch Weight", min_value=1, max_value=5, value=ind["stoch_weight"], key="w_stoch")
+
+                # 10. OBV (NEW)
+                with st.expander("10. On-Balance Volume (NEW)", expanded=True):
+                    ind["obv_enabled"] = st.checkbox("Enable OBV", key="c_obv", on_change=on_ind_checkbox_change, args=("obv_enabled", "c_obv"))
+                    o1, o2 = st.columns(2)
+                    ind["obv_ma_period"] = o1.number_input("OBV MA Period", min_value=5, max_value=100, value=ind["obv_ma_period"])
+                    ind["obv_weight"] = o2.number_input("OBV Weight", min_value=1, max_value=5, value=ind["obv_weight"], key="w_obv")
+
+                # 12. Lower Low (NEW)
+                with st.expander("12. Lower Low (NEW)", expanded=True):
+                    ind["lower_low_enabled"] = st.checkbox(
+                        "Enable Lower Low",
+                        key="c_ll",
+                        on_change=on_ind_checkbox_change,
+                        args=("lower_low_enabled", "c_ll"),
+                        help="Condition: Current candle low < previous swing low. Automatically locks trade direction to SHORT only."
+                    )
+                    st.caption("Condition: **Current candle low < previous swing low**. Automatically locks Short trade direction only.")
+                    ll1, ll2 = st.columns(2)
+                    ind["lower_low_period"] = ll1.number_input(
+                        "Swing Lookback Period",
+                        min_value=1,
+                        max_value=50,
+                        value=ind.get("lower_low_period", 5),
+                        help="Lookback period of previous candles to identify the swing low."
+                    )
+                    ind["lower_low_weight"] = ll2.number_input(
+                        "Lower Low Weight",
+                        min_value=1,
+                        max_value=5,
+                        value=ind.get("lower_low_weight", 1),
+                        key="w_ll"
+                    )
+
+            # Dynamic Max Score Calculation
+            max_possible = 0
+            if ind["ema_enabled"]: max_possible += ind["ema_weight"]
+            if ind["rsi_enabled"]: max_possible += ind["rsi_weight"]
+            if ind["macd_enabled"]: max_possible += ind["macd_weight"]
+            if ind["vwap_enabled"]: max_possible += ind["vwap_weight"]
+            if ind["adx_enabled"]: max_possible += ind["adx_weight"]
+            if ind["volume_enabled"]: max_possible += ind["volume_weight"]
+            if ind["bollinger_enabled"]: max_possible += ind["bollinger_weight"]
+            if ind["stoch_enabled"]: max_possible += ind["stoch_weight"]
+            if ind["obv_enabled"]: max_possible += ind["obv_weight"]
+            if ind.get("higher_high_enabled"): max_possible += ind.get("higher_high_weight", 1)
+            if ind.get("lower_low_enabled"): max_possible += ind.get("lower_low_weight", 1)
+            max_possible = max(max_possible, 1)
+
+            th_head_col, th_help_col = st.columns([3, 1])
+            with th_head_col:
+                st.markdown(f"#### Signal Thresholds (Max Possible Score: **{max_possible}**)")
+            with th_help_col:
+                if st.button("❓ How Thresholds Work", key="btn_help_thresholds", use_container_width=True):
+                    show_guide_dialog()
+
+            if ind.get("volume_enabled"):
+                st.info(f"📊 **Volume Trend Gate Active:** Trade entries require {ind.get('volume_consecutive', 3)} consecutive candles meeting price close direction AND volume ≥ {ind.get('volume_ratio_min', 1.2)}× MA.")
+            if ind.get("higher_high_enabled"):
+                st.info(f"📈 **Higher High Active (Indicator 11):** Only LONG trades taken. Requires Current Candle High > Previous Swing High (Lookback: {ind.get('higher_high_period', 5)} candles).")
+            if ind.get("lower_low_enabled"):
+                st.info(f"📉 **Lower Low Active (Indicator 12):** Only SHORT trades taken. Requires Current Candle Low < Previous Swing Low (Lookback: {ind.get('lower_low_period', 5)} candles).")
+
+            th1, th2 = st.columns(2)
+            ind["long_threshold"] = th1.number_input(
+                f"LONG Threshold (>= points, max {max_possible})",
+                min_value=1, max_value=max_possible, value=min(ind["long_threshold"], max_possible)
+            )
+            ind["short_threshold"] = th2.number_input(
+                f"SHORT Threshold (<= points, min -{max_possible})",
+                min_value=-max_possible, max_value=-1, value=max(ind["short_threshold"], -max_possible)
+            )
+
+            st.markdown("#### Fixed Target & Stoploss")
+            st.caption("Calculate target and stoploss as a fixed percentage of entry price for each trade.")
+            pct_col1, pct_col2 = st.columns(2)
+            target_options = list(range(1, 51))
+            stoploss_options = list(range(1, 11))
+
+            current_tgt = int(ind.get("fixed_target_pct", 3))
+            current_tgt_idx = target_options.index(current_tgt) if current_tgt in target_options else 2
+
+            current_sl = int(ind.get("fixed_stoploss_pct", 2))
+            current_sl_idx = stoploss_options.index(current_sl) if current_sl in stoploss_options else 1
+
+            ind["fixed_target_pct"] = pct_col1.selectbox(
+                "Fixed Target Percentage",
+                options=target_options,
+                index=current_tgt_idx,
+                format_func=lambda x: f"{x}%",
+                key="sb_fixed_target_pct",
+                help="Fixed profit target percentage for each trade."
+            )
+            ind["fixed_stoploss_pct"] = pct_col2.selectbox(
+                "Fixed Stoploss Percentage",
+                options=stoploss_options,
+                index=current_sl_idx,
+                format_func=lambda x: f"{x}%",
+                key="sb_fixed_stoploss_pct",
+                help="Fixed stoploss percentage for each trade."
+            )
+            risk["fixed_target_pct"] = ind["fixed_target_pct"]
+            risk["fixed_stoploss_pct"] = ind["fixed_stoploss_pct"]
+
+            # Trailing Stop-Loss Section (Model B)
+            st.markdown("##### 📈 Trailing Stop-Loss (Model B: Breakeven & Target-Lock)")
+            tsl_col1, tsl_col2 = st.columns(2)
+            ind["trailing_sl_enabled"] = tsl_col1.checkbox(
+                "Enable Trailing Stop-Loss",
+                value=bool(ind.get("trailing_sl_enabled", False)),
+                key="cb_trailing_sl_enabled",
+                help="Milestone 1: Moves Stop Loss to Breakeven (Entry Price) once profit reaches 50% of Fixed Target.\nMilestone 2: Above 50% of Fixed Target, continuously trails the peak price by Fixed Stoploss %."
+            )
+            if ind["trailing_sl_enabled"]:
+                ind["trail_beyond_target"] = tsl_col2.checkbox(
+                    "Trail beyond Fixed Target (let runner trades run)",
+                    value=bool(ind.get("trail_beyond_target", False)),
+                    key="cb_trail_beyond_target",
+                    help="If checked, trades won't cap at Fixed Target, but will keep trailing to capture runaway upside."
+                )
+                mode_desc = "Runs past Fixed Target" if ind.get("trail_beyond_target") else "Secures Fixed Target when reached"
+                st.info(
+                    f"🛡️ **Trailing Stop-Loss Active (Model B):**\n\n"
+                    f"• **Milestone 1 (Breakeven):** When profit reaches **{ind['fixed_target_pct']/2:.1f}%** (50% of target), Stop Loss moves to Entry Price (Zero Risk).\n\n"
+                    f"• **Milestone 2 (Profit Trailing):** Continuously trails the highest peak by **{ind['fixed_stoploss_pct']}%**, locking in gains.\n\n"
+                    f"• **Target Handling:** {mode_desc}."
+                )
+            else:
+                ind["trail_beyond_target"] = False
+            risk["trailing_sl_enabled"] = ind["trailing_sl_enabled"]
+            risk["trail_beyond_target"] = ind["trail_beyond_target"]
+
+            st.markdown("#### Trade Direction & Short Sizing")
+            st.caption("Select allowed trading side (LONG, SHORT, or BOTH) and configure fixed 1-lot sizing for short trades.")
+            side_col1, side_col2 = st.columns(2)
+
+            hh_active = bool(ind.get("higher_high_enabled", False))
+            ll_active = bool(ind.get("lower_low_enabled", False))
+
+            side_options = ["LONG", "SHORT", "BOTH"]
+            if hh_active and ll_active:
+                current_side = "BOTH"
+                side_disabled = True
+                side_caption = "🔒 Locked to **BOTH**: Higher High (Long) and Lower Low (Short) are both enabled."
+                side_help = "Automatically locked to BOTH because both Higher High and Lower Low indicators are enabled."
+            elif hh_active:
+                current_side = "LONG"
+                side_disabled = True
+                side_caption = "🔒 Locked to **LONG**: Indicator 11 (Higher High) takes only Long trades."
+                side_help = "Automatically locked to LONG because Higher High indicator is enabled."
+            elif ll_active:
+                current_side = "SHORT"
+                side_disabled = True
+                side_caption = "🔒 Locked to **SHORT**: Indicator 12 (Lower Low) takes only Short trades."
+                side_help = "Automatically locked to SHORT because Lower Low indicator is enabled."
+            else:
+                current_side = ind.get("trade_side", "BOTH")
+                side_disabled = False
+                side_caption = None
+                side_help = "Filter trades: LONG only, SHORT only, or BOTH."
+
+            current_side_idx = side_options.index(current_side) if current_side in side_options else 2
+
+            chosen_side = side_col1.selectbox(
+                "Long/Short Side",
+                options=side_options,
+                index=current_side_idx,
+                disabled=side_disabled,
+                help=side_help
+            )
+            if side_caption:
+                side_col1.caption(side_caption)
+
+            ind["trade_side"] = chosen_side
+            risk["trade_side"] = chosen_side
+
+            # If user chooses SHORT or BOTH, enable Short Lot Size textbox with value 1 (non-editable)
+            # If user chooses LONG, disable Short Lot Size
+            if chosen_side == "LONG":
+                side_col2.text_input(
+                    "Short Lot Size:",
+                    value="Disabled",
+                    disabled=True,
+                    help="Disabled because only LONG trades are selected."
+                )
+                ind["short_lot_size"] = 1
+                risk["short_lot_size"] = 1
+            else:
+                side_col2.text_input(
+                    "Short Lot Size:",
+                    value="1",
+                    disabled=True,
+                    help="Fixed at 1 lot for SHORT trades."
+                )
+                ind["short_lot_size"] = 1
+                risk["short_lot_size"] = 1
+
+            st.markdown("#### Trade Snooze Period")
+            st.caption("Prevent new trade entries for 5 to 10 minutes (or custom duration) after previous trade exits.")
+            snooze_col1, snooze_col2 = st.columns(2)
+
+            current_snooze_str = ind.get("snooze_period_str", "5 min")
+            snooze_input = snooze_col1.text_input(
+                "Trade Snooze Period",
+                value=current_snooze_str,
+                key="ti_snooze_period",
+                help="Specify cooldown duration after trade exit (e.g. '5 min', '10 min', or '0' to disable)."
+            )
+
+            import re
+            snooze_digits = re.findall(r'\d+', snooze_input or "")
+            parsed_snooze_mins = int(snooze_digits[0]) if snooze_digits else 0
+
+            ind["snooze_period_str"] = snooze_input
+            ind["snooze_minutes"] = parsed_snooze_mins
+            risk["snooze_period_str"] = snooze_input
+            risk["snooze_minutes"] = parsed_snooze_mins
+
+            if parsed_snooze_mins > 0:
+                snooze_col2.info(f"⏳ **Cooldown Active:** New trade entries will be prevented for **{parsed_snooze_mins} minutes** after any trade exit.")
+            else:
+                snooze_col2.info("ℹ️ **Cooldown Inactive:** No delay between trade exit and subsequent entry.")
+
+        with tab_risk:
+            st.subheader("🛡️ Risk Parameters (from RiskConfig)")
+            st.caption("Customize account capital, daily limits, position sizing, and intraday market hours.")
+
+            rk1, rk2, rk3 = st.columns(3)
+            risk["capital"] = rk1.number_input("Starting Capital (₹)", min_value=1000.0, max_value=10_000_000.0, value=float(risk["capital"]), step=10000.0)
+            risk["risk_per_trade_pct"] = rk2.number_input("Risk Per Trade (Fraction, 0.01 = 1%)", min_value=0.001, max_value=0.05, value=float(risk["risk_per_trade_pct"]), step=0.0025, format="%.4f")
+            risk["max_daily_loss"] = rk3.number_input("Max Daily Loss (₹)", min_value=100.0, max_value=500_000.0, value=float(risk["max_daily_loss"]), step=500.0)
+
+            rk4, rk5, rk6 = st.columns(3)
+            risk["max_open_positions"] = rk4.number_input("Max Open Positions", min_value=1, max_value=10, value=int(risk["max_open_positions"]))
+            risk["max_exposure_pct"] = rk5.number_input("Max Exposure Ratio (1.0 = 100%)", min_value=0.1, max_value=5.0, value=float(risk["max_exposure_pct"]), step=0.1)
+            risk["max_quantity"] = rk6.number_input("Max Order Quantity (Shares)", min_value=1, max_value=50_000, value=int(risk["max_quantity"]), step=500)
+
+            rk7, rk8, rk9 = st.columns(3)
+            risk["max_consecutive_losses"] = rk7.number_input("Max Consecutive Losses", min_value=1, max_value=10, value=int(risk["max_consecutive_losses"]))
+            risk["lot_size"] = rk8.number_input("Lot Size", min_value=1, max_value=1000, value=int(risk["lot_size"]))
+            risk["tick_size"] = rk9.number_input("Tick Size (₹)", min_value=0.01, max_value=1.0, value=float(risk["tick_size"]), step=0.05)
+
+            st.markdown("##### ATR Stop-Loss & Target Sizing (from RiskConfig)")
+            st.info(f"🎯 **Fixed Levels Active:** Fixed Target = **{ind.get('fixed_target_pct', 3)}%** | Fixed Stoploss = **{ind.get('fixed_stoploss_pct', 2)}%** (configured under Technical Indicators tab)")
+            atr_r1, atr_r2 = st.columns(2)
+            risk["atr_stop_multiplier"] = atr_r1.number_input(
+                "ATR Stop Multiplier (Stop distance = multiplier × ATR)",
+                min_value=0.5, max_value=5.0, value=float(risk["atr_stop_multiplier"]), step=0.1, key="rk_atr_stop_multiplier"
+            )
+            risk["reward_risk_ratio"] = atr_r2.number_input(
+                "Reward-to-Risk Ratio (Target distance = ratio × stop distance)",
+                min_value=0.5, max_value=5.0, value=float(risk["reward_risk_ratio"]), step=0.1, key="rk_reward_risk_ratio"
+            )
+
+            st.markdown("##### Trading Hours (IST)")
+            h1, h2, h3 = st.columns(3)
+            risk["entry_start"] = h1.time_input("Entry Start Time", value=risk["entry_start"])
+            risk["entry_end"] = h2.time_input("Entry End Time", value=risk["entry_end"])
+            risk["square_off_time"] = h3.time_input("Square-off Time", value=risk["square_off_time"])
+
+        with tab_costs:
+            st.subheader("💰 Cost & Slippage Configuration")
+            c_col1, c_col2 = st.columns(2)
+
+            with c_col1:
+                cost["cost_mode"] = st.selectbox(
+                    "Cost Model", ["FLAT_PER_ORDER", "PERCENT_MODEL"],
+                    index=0 if cost["cost_mode"] == "FLAT_PER_ORDER" else 1,
+                    help="FLAT_PER_ORDER charges a fixed fee per order. PERCENT_MODEL applies brokerage, STT, turnover, SEBI, GST, stamp duty."
+                )
+                if cost["cost_mode"] == "FLAT_PER_ORDER":
+                    cost["flat_cost_per_order"] = st.number_input("Flat Brokerage Per Order (₹)", min_value=0.0, max_value=500.0, value=float(cost["flat_cost_per_order"]), step=5.0)
+                    st.warning("⚠️ **Notice:** Flat cost ignores STT, GST, exchange and SEBI charges; real costs are higher. Verify against Upstox's current brokerage schedule.")
+                else:
+                    st.info("Full percentage model active: charges STT, Exchange turnover, SEBI, GST, and Stamp Duty on order legs.")
+
+            with c_col2:
+                cost["slippage_mode"] = st.selectbox(
+                    "Slippage Model", ["FLAT_PER_ORDER", "PERCENT"],
+                    index=0 if cost["slippage_mode"] == "FLAT_PER_ORDER" else 1,
+                    help="FLAT_PER_ORDER applies a flat adverse rupees impact per order spread across quantity. PERCENT applies a percentage factor."
+                )
+                if cost["slippage_mode"] == "FLAT_PER_ORDER":
+                    cost["flat_slippage_per_order"] = st.number_input("Flat Adverse Slippage Per Order (₹)", min_value=0.0, max_value=500.0, value=float(cost["flat_slippage_per_order"]), step=5.0)
+                    st.caption("Adverse impact = flat_slippage_per_order / quantity per share.")
+                else:
+                    cost["slippage_pct"] = st.number_input("Slippage Percent (0.0005 = 0.05%)", min_value=0.0, max_value=0.05, value=float(cost["slippage_pct"]), format="%.5f")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        b_col1, b_col2 = st.columns([1, 2])
+        strat_save_name = (st.session_state.strategy_name_input or "").strip() or suggested_name
+
+        if b_col1.button("💾 Save Strategy", use_container_width=True):
+            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
+            load_strategy_into_session(strat_save_name)
+            st.session_state.selected_strategy_name = strat_save_name
+            st.session_state.strategy_name_input = strat_save_name
+            try:
+                st.session_state["step2_strat_selector"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_load_strat_select"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_strat_name_input_field"] = strat_save_name
+            except Exception:
+                pass
+            st.success(f"✅ Strategy '{strat_save_name}' saved to Strategies-List!")
+
+        if b_col2.button("💾 Save & Proceed to Instrument Selection ➡️", type="primary", use_container_width=True):
+            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
+            load_strategy_into_session(strat_save_name)
+            st.session_state.selected_strategy_name = strat_save_name
+            st.session_state.strategy_name_input = strat_save_name
+            try:
+                st.session_state["step2_strat_selector"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_load_strat_select"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_strat_name_input_field"] = strat_save_name
+            except Exception:
+                pass
+            st.session_state.step = 2
+            st.rerun()
+
+
+    def render_step_2_instrument_and_run(equities_df):
+        st.header("Step 2: Instrument & Period Selection")
+        st.caption("Select an active Strategy from your Strategies-List, choose the NSE equity, date range, and execute the backtest.")
+
+        saved_strats = list_strategy_names()
+        target_strat = (
+            st.session_state.get("selected_strategy_name")
+            or st.session_state.get("strategy_name_input")
+            or st.session_state.get("step1_strat_name_input_field")
+            or (saved_strats[0] if saved_strats else "EMA_RSI_MACD_Balanced")
+        ).strip()
+        if target_strat not in saved_strats:
+            saved_strats.insert(0, target_strat)
+        st.session_state["step2_strat_selector"] = target_strat
+        curr_idx = saved_strats.index(target_strat) if target_strat in saved_strats else 0
+        current_strat = target_strat
+
+        st.markdown("#### 🎯 Active Strategy Selection")
+        c_s1, c_s2, c_s3 = st.columns([3, 1, 1])
+
+        def on_step2_strategy_change():
+            chosen = st.session_state.get("step2_strat_selector")
+            if chosen:
+                load_strategy_into_session(chosen)
+                st.session_state.strategy_name_input = chosen
+                try:
+                    st.session_state["step1_strat_name_input_field"] = chosen
+                except Exception:
+                    pass
+
+        with c_s1:
+            chosen_strat = st.selectbox(
+                "Strategy Name (Strategies-List)",
+                saved_strats,
+                index=curr_idx,
+                key="step2_strat_selector",
+                on_change=on_step2_strategy_change,
+                help="Choose which saved strategy to test against historical data.",
+            )
+            if chosen_strat != current_strat:
+                load_strategy_into_session(chosen_strat)
+                st.session_state.strategy_name_input = chosen_strat
+                try:
+                    st.session_state["step1_strat_name_input_field"] = chosen_strat
+                except Exception:
+                    pass
+                st.rerun()
+        with c_s2:
+            st.write("")
+            st.write("")
+            if st.button("✏️ Edit Strategy", use_container_width=True, help="Modify indicator weights and risk parameters in Step 1"):
+                active_to_edit = chosen_strat or current_strat
+                load_strategy_into_session(active_to_edit)
+                st.session_state.selected_strategy_name = active_to_edit
+                st.session_state.strategy_name_input = active_to_edit
+                try:
+                    st.session_state["step1_strat_name_input_field"] = active_to_edit
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step1_load_strat_select"] = active_to_edit
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step2_strat_selector"] = active_to_edit
+                except Exception:
+                    pass
+                st.session_state.step = 1
+                st.rerun()
+        with c_s3:
+            st.write("")
+            st.write("")
+            if st.button("➕ New Strategy", use_container_width=True, help="Create a new strategy from scratch"):
+                reset_to_default_strategy()
+                suggested = auto_suggest_strategy_name(st.session_state.indicators)
+                st.session_state.strategy_name_input = suggested
+                try:
+                    st.session_state["step1_strat_name_input_field"] = suggested
+                except Exception:
+                    pass
+                st.session_state.step = 1
+                st.rerun()
+
+        active_inds = [k.replace('_enabled', '').upper() for k, v in st.session_state.indicators.items() if k.endswith('_enabled') and v]
+        cap = st.session_state.risk.get('capital', 100000.0)
+        tp = st.session_state.indicators.get('fixed_target_pct', st.session_state.risk.get('fixed_target_pct', 3))
+        sl = st.session_state.indicators.get('fixed_stoploss_pct', st.session_state.risk.get('fixed_stoploss_pct', 2))
+        st.info(
+            f"📌 **Active Strategy:** `{current_strat}` | "
+            f"**Active Indicators ({len(active_inds)}):** {', '.join(active_inds) if active_inds else 'None'} | "
+            f"**Capital:** ₹{cap:,.0f} | **Target / SL:** {tp}% / {sl}%"
+        )
+        st.markdown("---")
+
+        st.markdown("#### 🏢 2. Instrument Configuration")
+
+        seg_choice = st.radio(
+            "Market Segment",
+            ["🎯 NSE F&O (Options & Futures) [Kotak Live Priority]", "🏢 NSE Cash Equity"],
+            index=0 if "F&O" in st.session_state.get("market_segment", "F&O") else 1,
+            horizontal=True,
+            key="backtest_market_segment_radio",
+            help="NSE F&O dynamically queries live rolling contracts, weekly/monthly expiries, and strikes directly from Kotak Neo endpoints."
+        )
+        st.session_state.market_segment = seg_choice
+        is_fo = "F&O" in seg_choice
+        is_valid_isin = True
+
+        if is_fo:
+            col_und, col_exp = st.columns(2)
+            with col_und:
+                underlying_choice = st.selectbox(
+                    "Underlying Index / Stock",
+                    ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
+                    index=0,
+                    key="backtest_underlying_choice"
+                )
+            with col_exp:
+                live_expiries = fetch_kotak_expiries(underlying_choice)
+                if live_expiries:
+                    sel_expiry = st.selectbox(
+                        "Rolling Expiry Date (Kotak Live)",
+                        live_expiries,
+                        index=0,
+                        help="Live weekly and monthly rolling expiries from Kotak API.",
+                        key="backtest_sel_expiry"
+                    )
+                else:
+                    sel_expiry = None
+                    st.warning("Kotak expiries not available. Check connection.")
+
+            col_typ, col_strk = st.columns(2)
+            with col_typ:
+                opt_type_choice = st.radio("Option Type", ["PE (Put)", "CE (Call)"], horizontal=True, key="backtest_opt_type_choice")
+                clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
+
+            with col_strk:
+                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if sel_expiry else {}
+                spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
+                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", 65))
+
+                oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
+                strikes = []
+                strike_to_inst = {}
+                for item in oc_chain:
+                    inst = item.get("inst", {})
+                    strk = inst.get("strkPrc")
+                    if strk:
+                        strikes.append(strk)
+                        strike_to_inst[strk] = inst
+
+                if strikes:
+                    try:
+                        strikes = sorted(list(set(strikes)), key=lambda x: float(x))
+                    except Exception:
+                        strikes = sorted(list(set(strikes)))
+                    mid_idx = len(strikes) // 2
+                    chosen_strike = st.selectbox(f"Strike Price (Spot: ~{spot_val})", strikes, index=mid_idx, key="backtest_chosen_strike")
+                    selected_inst = strike_to_inst.get(chosen_strike, {})
+                    if selected_inst:
+                        st.session_state.symbol = selected_inst.get("symbol", f"{underlying_choice}{chosen_strike}{clean_opt_type}")
+                        st.session_state.isin = selected_inst.get("neoSymbol", "").split("|")[-1]
+                        st.session_state.instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
+                        st.session_state.equity_name = f"{underlying_choice} {sel_expiry} {chosen_strike} {clean_opt_type}"
+                        st.session_state.risk["lot_size"] = mkt_lot
+                else:
+                    chosen_strike = st.text_input("Strike Price", value="22500", key="backtest_chosen_strike_txt")
+                    st.session_state.symbol = f"{underlying_choice}26OCT{chosen_strike}{clean_opt_type}"
+                    st.session_state.equity_name = f"{underlying_choice} {chosen_strike} {clean_opt_type}"
+                    st.session_state.risk["lot_size"] = 65
+
+            st.caption(f"🎯 **Active Selection:** `{st.session_state.symbol}` | Key: `{st.session_state.instrument_key}` | Lot: `{st.session_state.risk.get('lot_size', 65)}`")
+
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("⚡ **Popular Benchmarks:**")
+                q_cols = st.columns(4)
+                if q_cols[0].button("📈 NIFTY 50", use_container_width=True, key="backtest_quick_nifty"):
+                    st.session_state.symbol = "NIFTY"
+                    st.session_state.isin = "INF204KB14I2"
+                    st.session_state.equity_name = "Nifty 50 Index (NIP IND ETF NIFTY BEES)"
+                    st.rerun()
+                if q_cols[1].button("🐝 NIFTYBEES", use_container_width=True, key="backtest_quick_bees"):
+                    st.session_state.symbol = "NIFTYBEES"
+                    st.session_state.isin = "INF204KB14I2"
+                    st.session_state.equity_name = "NIP IND ETF NIFTY BEES"
+                    st.rerun()
+                if q_cols[2].button("🏦 BANKNIFTY", use_container_width=True, key="backtest_quick_bnifty"):
+                    st.session_state.symbol = "BANKNIFTY"
+                    st.session_state.isin = "INF174KA1ZB7"
+                    st.session_state.equity_name = "Nifty Bank Index (Kotak Bank Nifty ETF)"
+                    st.rerun()
+                if q_cols[3].button("🏢 RELIANCE", use_container_width=True, key="backtest_quick_rel"):
+                    st.session_state.symbol = "RELIANCE"
+                    st.session_state.isin = "INE002A01018"
+                    st.session_state.equity_name = "Reliance Industries Limited"
+                    st.rerun()
+
+                search_query = st.text_input("Search Equity (Symbol or Name)", value=st.session_state.symbol, key="backtest_search_query")
+                matched_equities = search_equities(search_query, equities_df, limit=30) if not equities_df.empty else pd.DataFrame()
+
+                options = []
+                if not matched_equities.empty:
+                    for _, r in matched_equities.iterrows():
+                        options.append(f"{r['tradingsymbol']} - {r['name']} ({r['isin']})")
+                else:
+                    options = [f"{st.session_state.symbol} - {st.session_state.equity_name} ({st.session_state.isin})"]
+
+                curr_opt_idx = 0
+                for idx, opt in enumerate(options):
+                    if opt.startswith(f"{st.session_state.symbol} -"):
+                        curr_opt_idx = idx
+                        break
+
+                selected_eq = st.selectbox("Matching Equities", options, index=curr_opt_idx, key="backtest_sel_equity")
+                if selected_eq:
+                    sel_sym = selected_eq.split(" - ")[0].strip()
+                    found = find_equity_by_symbol(sel_sym, equities_df)
+                    if found:
+                        st.session_state.symbol = found["tradingsymbol"]
+                        st.session_state.isin = found["isin"]
+                        st.session_state.equity_name = found["name"]
+                        st.session_state.instrument_key = found.get("instrument_key", f"NSE_EQ|{found['isin']}")
+                        if "lot_size" in found and pd.notna(found["lot_size"]):
+                            st.session_state.risk["lot_size"] = int(found["lot_size"])
+                        if "tick_size" in found and pd.notna(found["tick_size"]):
+                            st.session_state.risk["tick_size"] = float(found["tick_size"])
+
+            with c2:
+                input_isin = st.text_input("ISIN (12 alphanumeric chars)", value=st.session_state.isin, key="backtest_input_isin")
+                if input_isin != st.session_state.isin:
+                    st.session_state.isin = input_isin.strip().upper()
+                    found = find_equity_by_isin(st.session_state.isin, equities_df)
+                    if found:
+                        st.session_state.symbol = found["tradingsymbol"]
+                        st.session_state.equity_name = found["name"]
+                        st.session_state.instrument_key = found.get("instrument_key", f"NSE_EQ|{found['isin']}")
+                        if "lot_size" in found and pd.notna(found["lot_size"]):
+                            st.session_state.risk["lot_size"] = int(found["lot_size"])
+                        if "tick_size" in found and pd.notna(found["tick_size"]):
+                            st.session_state.risk["tick_size"] = float(found["tick_size"])
+
+                is_valid_isin = validate_isin(st.session_state.isin)
+                if is_valid_isin:
+                    st.success(f"Valid ISIN: {st.session_state.isin} ({st.session_state.symbol} - {st.session_state.equity_name})")
+                else:
+                    st.error("Invalid ISIN: Must start with 'IN' and pass the 12-char Luhn check-digit test.")
+
+        st.markdown("### Date Range & Environment")
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            st.session_state.start_date = st.date_input("From Date", value=st.session_state.start_date, key="backtest_start_date")
+        with d2:
+            st.session_state.end_date = st.date_input("To Date", value=st.session_state.end_date, key="backtest_end_date")
+        with d3:
+            tf_options = [1, 3, 5, 15, 30, 60]
+            curr_tf_idx = tf_options.index(st.session_state.timeframe) if st.session_state.timeframe in tf_options else 2
+            st.session_state.timeframe = st.selectbox(
+                "Candle Timeframe",
+                tf_options,
+                index=curr_tf_idx,
+                format_func=lambda x: f"{x} Minute" if x == 1 else f"{x} Minutes",
+                key="backtest_timeframe_select",
+            )
+        with d4:
+            st.session_state.allow_short = st.toggle("Allow Intraday Shorting", value=st.session_state.allow_short, key="backtest_allow_short")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        b_col1, b_col2 = st.columns([1, 2])
+        if b_col1.button("⬅️ Back to Strategy Config (Step 1)", use_container_width=True, key="backtest_btn_step1"):
+            st.session_state.step = 1
+            st.rerun()
+
+        can_run_backtest = bool(st.session_state.symbol) if is_fo else is_valid_isin
+        if b_col2.button("🚀 Run Backtest Now", type="primary", use_container_width=True, disabled=not can_run_backtest, key="backtest_btn_run"):
+            execute_backtest_simulation()
+
+
+
+    # ==============================================================================
+    # STEP ROUTING & DISPATCH
+    # ==============================================================================
+    if st.session_state.step == 1:
+        render_step_1_strategy_config()
+    elif st.session_state.step == 2:
+        render_step_2_instrument_and_run(equities_df)
+    # ==============================================================================
+    # STEP 3: Results Screen
+    # ==============================================================================
+    elif st.session_state.step == 3:
+        res = st.session_state.active_run
+        if not res:
+            st.warning("No run results loaded.")
+            if st.button("Start New Backtest"):
+                st.session_state.step = 2
+                st.rerun()
+            return
+
+        run_data = res.get("run_data", {})
+        trades = res.get("trades_df", pd.DataFrame())
+        metrics = res.get("metrics", {})
+        cfg_json = run_data.get("config", {})
+        capital = cfg_json.get("risk", {}).get("capital", 100_000.0)
+
+        tsl_on = cfg_json.get("indicators", {}).get("trailing_sl_enabled") or cfg_json.get("risk", {}).get("trailing_sl_enabled")
+        tsl_runner = cfg_json.get("indicators", {}).get("trail_beyond_target") or cfg_json.get("risk", {}).get("trail_beyond_target")
+        tsl_info = " | Trailing SL: Model B Active" + (" (Runner)" if tsl_runner else "") if tsl_on else ""
+        st.header(f"Results: Run #{run_data.get('id', 'N/A')} ({run_data.get('symbol', 'EQUITY')})")
+        st.caption(f"Strategy: `{run_data.get('strategy_version', 'custom')}` | Period: {run_data.get('date_from')} to {run_data.get('date_to')}{tsl_info}")
+
+        # Disclaimer Note
+        st.warning("⚠️ **Notice:** Past results do not predict future results. Changing parameters after seeing results turns this data into in-sample data.")
+
+        # KPI Metrics
+        k1, k2, k3, k4, k5, k6 = st.columns(6)
+        net_pnl = metrics.get("net_pnl") if metrics.get("net_pnl") is not None else 0.0
+        num_trades = metrics.get("num_trades") if metrics.get("num_trades") is not None else len(trades)
+        return_pct = metrics.get("return_pct") if metrics.get("return_pct") is not None else 0.0
+        gross_pnl = metrics.get("gross_pnl") if metrics.get("gross_pnl") is not None else 0.0
+        total_costs = metrics.get("total_costs") if metrics.get("total_costs") is not None else 0.0
+        win_rate = metrics.get("win_rate_pct") if metrics.get("win_rate_pct") is not None else 0.0
+        pf = metrics.get("profit_factor")
+        pf_str = f"{pf:.2f}" if pf is not None else ("∞ (No Losses)" if gross_pnl > 0 else "0.00")
+
+        k1.metric("Trades", num_trades)
+        k2.metric("Net P&L (₹)", f"{net_pnl:,.2f}", f"{return_pct:.2f}%")
+        k3.metric("Gross P&L (₹)", f"{gross_pnl:,.2f}")
+        k4.metric("Total Costs (₹)", f"{total_costs:,.2f}")
+        k5.metric("Win Rate", f"{win_rate:.1f}%")
+        k6.metric("Profit Factor", pf_str)
+
+        k7, k8, k9, k10, k11, k12 = st.columns(6)
+        max_dd = metrics.get("max_drawdown") if metrics.get("max_drawdown") is not None else 0.0
+        max_dd_pct = metrics.get("max_drawdown_pct") if metrics.get("max_drawdown_pct") is not None else 0.0
+        tot_slip = metrics.get("total_slippage") if metrics.get("total_slippage") is not None else 0.0
+        avg_tr = metrics.get("avg_trade") if metrics.get("avg_trade") is not None else 0.0
+        rr = metrics.get("risk_reward")
+        rr_str = f"{rr:.2f}" if rr is not None else "N/A"
+        loss_streak = metrics.get("max_consecutive_losses") if metrics.get("max_consecutive_losses") is not None else 0
+        sh = metrics.get("sharpe")
+        sh_str = f"{sh:.2f}" if sh is not None else "N/A"
+
+        k7.metric("Max Drawdown", f"₹{max_dd:,.0f}", f"-{max_dd_pct:.1f}%")
+        k8.metric("Total Slippage (₹)", f"{tot_slip:,.2f}")
+        k9.metric("Avg Trade (₹)", f"{avg_tr:,.2f}")
+        k10.metric("Reward/Risk", rr_str)
+        k11.metric("Max Loss Streak", loss_streak)
+        k12.metric("Sharpe Ratio", sh_str)
+
+        # Calculated_Score Profile Metrics
+        ind_cfg = cfg_json.get("indicators", {})
+        max_score_cfg = 0
+        if ind_cfg.get("ema_enabled", False): max_score_cfg += ind_cfg.get("ema_weight", 2)
+        if ind_cfg.get("rsi_enabled", False): max_score_cfg += ind_cfg.get("rsi_weight", 1)
+        if ind_cfg.get("macd_enabled", False): max_score_cfg += ind_cfg.get("macd_weight", 2)
+        if ind_cfg.get("vwap_enabled", False): max_score_cfg += ind_cfg.get("vwap_weight", 1)
+        if ind_cfg.get("adx_enabled", False): max_score_cfg += ind_cfg.get("adx_weight", 1)
+        if ind_cfg.get("volume_enabled", False): max_score_cfg += ind_cfg.get("volume_weight", 1)
+        if ind_cfg.get("bollinger_enabled", False): max_score_cfg += ind_cfg.get("bollinger_weight", 1)
+        if ind_cfg.get("stoch_enabled", False): max_score_cfg += ind_cfg.get("stoch_weight", 1)
+        if ind_cfg.get("obv_enabled", False): max_score_cfg += ind_cfg.get("obv_weight", 1)
+        max_score_cfg = max(max_score_cfg, 1)
+
+        long_th = ind_cfg.get("long_threshold", 5)
+        short_th = ind_cfg.get("short_threshold", -5)
+        avg_score = trades["score"].mean() if not trades.empty and "score" in trades.columns else 0.0
+
+        st.markdown("##### ⚡ Strategy Calculated_Score Profile")
+        cs1, cs2, cs3, cs4 = st.columns(4)
+        cs1.metric("Calculated_Score (Max)", f"{max_score_cfg} pts", help="Maximum possible consensus score from active indicators.")
+        cs2.metric("LONG Threshold", f"≥ {long_th} pts", help="Score threshold that triggered LONG entries.")
+        cs3.metric("SHORT Threshold", f"≤ {short_th} pts", help="Score threshold that triggered SHORT entries.")
+        cs4.metric("Avg Trade Score", f"{avg_score:+.2f} pts" if not trades.empty else "N/A", help="Average Calculated_Score at entry across executed trades.")
+
+        tgt_val = ind_cfg.get("fixed_target_pct", 3)
+        sl_val = ind_cfg.get("fixed_stoploss_pct", 2)
+        side_val = ind_cfg.get("trade_side", "BOTH")
+        snooze_val = ind_cfg.get("snooze_minutes", 0)
+        tsl_flag = ind_cfg.get("trailing_sl_enabled", False)
+        runner_flag = ind_cfg.get("trail_beyond_target", False)
+        tsl_disp = f" | Trailing SL = **Model B Active{' (Runner)' if runner_flag else ''}**" if tsl_flag else ""
+        short_lot_disp = f" | Short Lot Size = **{ind_cfg.get('short_lot_size', 1)} Lot**" if side_val != "LONG" else ""
+        snooze_disp = f" | Snooze = **{snooze_val} min**" if snooze_val > 0 else ""
+        st.caption(f"🎯 **Trade Levels:** Fixed Target = **{tgt_val}%** | Fixed Stoploss = **{sl_val}%**{tsl_disp} | Side = **{side_val}**{short_lot_disp}{snooze_disp}")
+
+        # Benchmark Buy-and-Hold
+        if "indicators_df" in res and res["indicators_df"] is not None and not res["indicators_df"].empty:
+            c_series = res["indicators_df"]["close"]
+            b_and_h = (c_series.iloc[-1] / c_series.iloc[0] - 1) * 100
+            st.caption(f"Benchmark Buy-and-Hold for same period: **{b_and_h:.2f}%**")
+
+        # In-Sample vs Out-of-Sample Split Comparison
+        in_s = res.get("in_sample")
+        out_s = res.get("out_sample")
+        if in_s and out_s:
+            st.markdown("### 🔬 In-Sample vs Out-of-Sample Validation")
+            s_col1, s_col2 = st.columns(2)
+            with s_col1:
+                st.markdown(f"**In-Sample (Training - {in_s['days']} days)**")
+                m_in = in_s["metrics"]
+                pf_in = m_in.get("profit_factor")
+                pf_in_str = f"{pf_in:.2f}" if pf_in is not None else ("∞" if (m_in.get("gross_pnl") or 0.0) > 0 else "0.00")
+                st.write(f"Trades: **{m_in.get('num_trades', 0)}** | Net P&L: **₹{(m_in.get('net_pnl') or 0.0):,.2f}** ({(m_in.get('return_pct') or 0.0):.2f}%)")
+                st.write(f"Win Rate: **{(m_in.get('win_rate_pct') or 0.0):.1f}%** | Profit Factor: **{pf_in_str}** | Max DD: **₹{(m_in.get('max_drawdown') or 0.0):,.0f}**")
+            with s_col2:
+                st.markdown(f"**Out-of-Sample (Testing - {out_s['days']} days)**")
+                m_out = out_s["metrics"]
+                pf_out = m_out.get("profit_factor")
+                pf_out_str = f"{pf_out:.2f}" if pf_out is not None else ("∞" if (m_out.get("gross_pnl") or 0.0) > 0 else "0.00")
+                st.write(f"Trades: **{m_out.get('num_trades', 0)}** | Net P&L: **₹{(m_out.get('net_pnl') or 0.0):,.2f}** ({(m_out.get('return_pct') or 0.0):.2f}%)")
+                st.write(f"Win Rate: **{(m_out.get('win_rate_pct') or 0.0):.1f}%** | Profit Factor: **{pf_out_str}** | Max DD: **₹{(m_out.get('max_drawdown') or 0.0):,.0f}**")
+
+        # Charts
+        if not trades.empty:
+            ch_l, ch_r = st.columns(2)
+            with ch_l:
+                st.subheader("Equity Curve")
+                eq = pd.concat([pd.Series([capital]), capital + trades["net_pnl"].cumsum()], ignore_index=True)
+                st.line_chart(eq.rename("Equity (₹)"))
+
+            with ch_r:
+                st.subheader("Daily Net P&L")
+                if "exit_time" in trades.columns:
+                    trades["day"] = pd.to_datetime(trades["exit_time"]).dt.date
+                    daily_pnl = trades.groupby("day")["net_pnl"].sum()
+                    st.bar_chart(daily_pnl)
+
+            # Breakdowns
+            b_l, b_r = st.columns(2)
+            with b_l:
+                st.subheader("By Exit Reason")
+                by_exit = trades.groupby("exit_reason")["net_pnl"].agg(
+                    Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                ).round(2)
+                st.dataframe(by_exit, use_container_width=True)
+
+            with b_r:
+                st.subheader("By Side & Regime")
+                if "regime" in trades.columns and (trades["regime"] != "").any():
+                    by_regime = trades.groupby("regime")["net_pnl"].agg(
+                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                    ).round(2)
+                    st.dataframe(by_regime, use_container_width=True)
+                else:
+                    by_side = trades.groupby("side")["net_pnl"].agg(
+                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                    ).round(2)
+                    st.dataframe(by_side, use_container_width=True)
+
+            # Trades Table
+            st.subheader("Trade Audit Trail (All Executions)")
+            if not trades.empty:
+                if "score" in trades.columns and "Calculated_Score" not in trades.columns:
+                    trades["Calculated_Score"] = trades["score"]
+                if "quantity" in trades.columns and "entry_price" in trades.columns:
+                    trades["Margin used"] = (trades["quantity"] * trades["entry_price"]).round(2)
+                    trades["margin_used"] = trades["Margin used"]
+
+                # Calculate Stop_Risk per trade: crossed percentage slab (5%, 10%, 15%, 20%, 25%...) reached before exit / Stop
+                raw_candles_for_trades = res.get("raw_df")
+                if raw_candles_for_trades is None or raw_candles_for_trades.empty:
+                    raw_candles_for_trades = res.get("indicators_df")
+
+                def calc_stop_risk(row):
+                    side = row.get("side", "LONG")
+                    entry_p = float(row.get("entry_price", 0.0))
+                    if entry_p <= 0:
+                        return "0% (+0.0%)"
+
+                    peak_pct = 0.0
+                    # 1. Use engine-tracked peak_gain_pct if present and > 0
+                    if "peak_gain_pct" in row and pd.notna(row["peak_gain_pct"]) and float(row["peak_gain_pct"]) > 0:
+                        peak_pct = float(row["peak_gain_pct"])
+                    # 2. Otherwise calculate from historical candle high/low between entry and exit
+                    elif raw_candles_for_trades is not None and not raw_candles_for_trades.empty:
+                        try:
+                            e_ts = pd.to_datetime(row.get("entry_time"))
+                            x_ts = pd.to_datetime(row.get("exit_time"))
+                            c_ts = pd.to_datetime(raw_candles_for_trades["timestamp"])
+                            mask = (c_ts >= e_ts) & (c_ts <= x_ts)
+                            c_slice = raw_candles_for_trades.loc[mask]
+                            if not c_slice.empty:
+                                if side == "LONG":
+                                    max_h = float(c_slice["high"].max())
+                                    peak_pct = max(0.0, (max_h - entry_p) / entry_p * 100.0)
+                                else:
+                                    min_l = float(c_slice["low"].min())
+                                    peak_pct = max(0.0, (entry_p - min_l) / entry_p * 100.0)
+                        except Exception:
+                            pass
+
+                    # Percentage slab crossed: 5%, 10%, 15%, 20%, 25%, etc.
+                    if peak_pct >= 5.0:
+                        slab = int(peak_pct // 5) * 5
+                        return f"{slab}% (+{peak_pct:.1f}%)"
+                    else:
+                        return f"0% (+{peak_pct:.1f}%)"
+
+                trades["peak_gain"] = trades.apply(calc_stop_risk, axis=1)
+                trades["Stop_Risk"] = trades["peak_gain"]
+
+                # ---------------- Milestone Slab Confluence Scores (5%, 10%, 15%, 20%, 25%, 30%) ----------------
+                # Calculates the confluence score on the first candle when the trade touched each milestone slab
+                ind_df_candles = res.get("indicators_df")
+                if ind_df_candles is None or ind_df_candles.empty:
+                    ind_df_candles = res.get("raw_df")
+
+                slabs = [5, 10, 15, 20, 25, 30]
+                slab_cols = [f"{s}%" for s in slabs]
+
+                cfg_for_scoring = res.get("custom_cfg")
+                if cfg_for_scoring is None:
+                    try:
+                        cfg_d = run_data.get("config", {})
+                        ind_d = cfg_d.get("indicators") or st.session_state.get("indicators", {})
+                        risk_d = cfg_d.get("risk") or st.session_state.get("risk", {})
+                        cfg_for_scoring = CustomStrategyConfig(
+                            name=run_data.get("strategy_version", "custom"),
+                            ema_enabled=ind_d.get("ema_enabled", True), ema_fast=ind_d.get("ema_fast", 20), ema_slow=ind_d.get("ema_slow", 50), ema_weight=ind_d.get("ema_weight", 2),
+                            rsi_enabled=ind_d.get("rsi_enabled", True), rsi_period=ind_d.get("rsi_period", 14), rsi_bull_low=ind_d.get("rsi_bull_low", 55.0),
+                            rsi_bull_high=ind_d.get("rsi_bull_high", 70.0), rsi_bear_low=ind_d.get("rsi_bear_low", 30.0), rsi_bear_high=ind_d.get("rsi_bear_high", 45.0), rsi_weight=ind_d.get("rsi_weight", 1),
+                            macd_enabled=ind_d.get("macd_enabled", True), macd_fast=ind_d.get("macd_fast", 12), macd_slow=ind_d.get("macd_slow", 26), macd_signal=ind_d.get("macd_signal", 9), macd_weight=ind_d.get("macd_weight", 2),
+                            vwap_enabled=ind_d.get("vwap_enabled", True), vwap_weight=ind_d.get("vwap_weight", 1),
+                            atr_enabled=ind_d.get("atr_enabled", True), atr_period=ind_d.get("atr_period", 14), atr_stop_multiplier=risk_d.get("atr_stop_multiplier", 1.5), atr_reward_risk_ratio=risk_d.get("reward_risk_ratio", 2.0),
+                            adx_enabled=ind_d.get("adx_enabled", True), adx_period=ind_d.get("adx_period", 14), adx_min=ind_d.get("adx_min", 20.0), adx_weight=ind_d.get("adx_weight", 1),
+                            volume_enabled=ind_d.get("volume_enabled", True), volume_period=ind_d.get("volume_period", 20), volume_ratio_min=ind_d.get("volume_ratio_min", 1.0),
+                            volume_consecutive=int(ind_d.get("volume_consecutive", 3)), volume_weight=ind_d.get("volume_weight", 1),
+                            bollinger_enabled=ind_d.get("bollinger_enabled", False), bollinger_period=ind_d.get("bollinger_period", 20), bollinger_std_dev=ind_d.get("bollinger_std_dev", 2.0), bollinger_weight=ind_d.get("bollinger_weight", 1),
+                            stoch_enabled=ind_d.get("stoch_enabled", False), stoch_k=ind_d.get("stoch_k", 14), stoch_d=ind_d.get("stoch_d", 3), stoch_low=ind_d.get("stoch_low", 20.0), stoch_high=ind_d.get("stoch_high", 80.0), stoch_weight=ind_d.get("stoch_weight", 1),
+                            obv_enabled=ind_d.get("obv_enabled", False), obv_ma_period=ind_d.get("obv_ma_period", 20), obv_weight=ind_d.get("obv_weight", 1),
+                            higher_high_enabled=bool(ind_d.get("higher_high_enabled", False)), higher_high_period=int(ind_d.get("higher_high_period", 5)), higher_high_weight=int(ind_d.get("higher_high_weight", 1)),
+                            lower_low_enabled=bool(ind_d.get("lower_low_enabled", False)), lower_low_period=int(ind_d.get("lower_low_period", 5)), lower_low_weight=int(ind_d.get("lower_low_weight", 1)),
+                            long_threshold=ind_d.get("long_threshold", 4), short_threshold=ind_d.get("short_threshold", -4),
+                        )
+                    except Exception:
+                        pass
+
+                c_ts_series = None
+                if ind_df_candles is not None and not ind_df_candles.empty:
+                    try:
+                        c_ts_series = pd.to_datetime(ind_df_candles["timestamp"])
+                    except Exception:
+                        c_ts_series = None
+
+                for col_name in slab_cols:
+                    trades[col_name] = "-"
+
+                for idx, r_tr in trades.iterrows():
+                    s_side = r_tr.get("side", "LONG")
+                    e_p = float(r_tr.get("entry_price", 0.0))
+                    if e_p <= 0 or c_ts_series is None:
+                        continue
+                    try:
+                        tr_e_ts = pd.to_datetime(r_tr.get("entry_time"))
+                        tr_x_ts = pd.to_datetime(r_tr.get("exit_time"))
+                        s_mask = (c_ts_series >= tr_e_ts) & (c_ts_series <= tr_x_ts)
+                        c_sub = ind_df_candles.loc[s_mask]
+                        if c_sub.empty:
+                            continue
+
+                        for s_val, col_name in zip(slabs, slab_cols):
+                            if s_side == "LONG":
+                                tgt_p = e_p * (1.0 + s_val / 100.0)
+                                r_cand = c_sub[c_sub["high"] >= tgt_p]
+                            else:
+                                tgt_p = e_p * (1.0 - s_val / 100.0)
+                                r_cand = c_sub[c_sub["low"] <= tgt_p]
+
+                            if not r_cand.empty:
+                                f_cand = r_cand.iloc[0]
+                                sc_val = f_cand.get("score")
+                                if sc_val is None or pd.isna(sc_val):
+                                    if cfg_for_scoring is not None:
+                                        sc_val = sum(score_custom_row(f_cand, cfg_for_scoring).values())
+                                    else:
+                                        sc_val = r_tr.get("score", 0)
+                                sc_int = int(sc_val)
+                                trades.at[idx, col_name] = f"+{sc_int}" if sc_int > 0 else str(sc_int)
+                    except Exception:
+                        pass
+
+            cols = [c for c in [
+                "id", "side", "regime", "Calculated_Score", "entry_time", "exit_time",
+                "quantity", "entry_price", "Margin used", "peak_gain",
+                "5%", "10%", "15%", "20%", "25%", "30%",
+                "exit_price", "stop_loss", "target",
+                "exit_reason", "gross_pnl", "costs", "slippage_cost", "net_pnl"
+            ] if c in trades.columns]
+            show_n = st.number_input(
+                "Rows to show (newest first)",
+                min_value=min(5, max(1, len(trades))),
+                max_value=max(len(trades), 5),
+                value=max(len(trades), min(5, max(1, len(trades)))),
+                step=5,
+            )
+            st.dataframe(
+                trades[cols].tail(int(show_n)).iloc[::-1],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Margin used": st.column_config.NumberColumn(
+                        "Margin used",
+                        help="Margin used per trade = Quantity × Entry Price",
+                        format="₹%.2f",
+                    ),
+                    "peak_gain": st.column_config.TextColumn(
+                        "peak_gain",
+                        help="Crossed profit slab (5%, 10%, 15%, 20%, 25%...) reached before reversing to exit / Stop.",
+                    ),
+                    "5%": st.column_config.TextColumn("5%", help="Milestone Confluence Score on the candle that first reached +5% gain"),
+                    "10%": st.column_config.TextColumn("10%", help="Milestone Confluence Score on the candle that first reached +10% gain"),
+                    "15%": st.column_config.TextColumn("15%", help="Milestone Confluence Score on the candle that first reached +15% gain"),
+                    "20%": st.column_config.TextColumn("20%", help="Milestone Confluence Score on the candle that first reached +20% gain"),
+                    "25%": st.column_config.TextColumn("25%", help="Milestone Confluence Score on the candle that first reached +25% gain"),
+                    "30%": st.column_config.TextColumn("30%", help="Milestone Confluence Score on the candle that first reached +30% gain"),
+                    "entry_price": st.column_config.NumberColumn("entry_price", format="%.2f"),
+                    "exit_price": st.column_config.NumberColumn("exit_price", format="%.2f"),
+                    "net_pnl": st.column_config.NumberColumn("net_pnl", format="₹%.2f"),
+                },
+            )
+
+            # ---------------- Trade Audit Trail-2 (Candle Progression: C1 to C360) ----------------
+            st.markdown("---")
+            st.subheader("Trade Audit Trail-2 (Candle Progression: C1 to C360)")
+            st.caption(
+                "Candle-by-candle multi-factor confluence score and percentage gain from entry until exit. "
+                "Format: Score(Gain%) e.g. +5(+10.0%), +4(+1.3%). "
+                "Positive values (+1 to +8) indicate bullish momentum, negative values (-1 to -8) indicate bearish momentum. "
+                "Unreached / post-exit candles are marked '-'."
+            )
+
+            c_cols = [f"C{i}" for i in range(1, 361)]
+            c_data = {col: ["-"] * len(trades) for col in c_cols}
+
+            if c_ts_series is not None and not ind_df_candles.empty:
+                for row_idx, (_, r_tr) in enumerate(trades.iterrows()):
+                    try:
+                        tr_e_ts = pd.to_datetime(r_tr.get("entry_time"))
+                        tr_x_ts = pd.to_datetime(r_tr.get("exit_time"))
+                        if pd.isna(tr_e_ts) or pd.isna(tr_x_ts):
+                            continue
+
+                        # Handle timezone compatibility
+                        if c_ts_series.dt.tz is not None:
+                            if tr_e_ts.tzinfo is None:
+                                tr_e_ts = tr_e_ts.tz_localize(c_ts_series.dt.tz)
+                            else:
+                                tr_e_ts = tr_e_ts.tz_convert(c_ts_series.dt.tz)
+                            if tr_x_ts.tzinfo is None:
+                                tr_x_ts = tr_x_ts.tz_localize(c_ts_series.dt.tz)
+                            else:
+                                tr_x_ts = tr_x_ts.tz_convert(c_ts_series.dt.tz)
+                        else:
+                            if tr_e_ts.tzinfo is not None:
+                                tr_e_ts = tr_e_ts.tz_localize(None)
+                            if tr_x_ts.tzinfo is not None:
+                                tr_x_ts = tr_x_ts.tz_localize(None)
+
+                        # Candlesticks from after entry_time up to exit_time
+                        s_mask = (c_ts_series > tr_e_ts) & (c_ts_series <= tr_x_ts)
+                        c_sub = ind_df_candles.loc[s_mask]
+                        if c_sub.empty:
+                            s_mask = (c_ts_series >= tr_e_ts) & (c_ts_series <= tr_x_ts)
+                            c_sub = ind_df_candles.loc[s_mask]
+
+                        s_side = r_tr.get("side", "LONG")
+                        e_p = float(r_tr.get("entry_price", 0.0))
+                        num_candles = min(len(c_sub), 360)
+                        for k in range(num_candles):
+                            cand_row = c_sub.iloc[k]
+                            sc_val = cand_row.get("score")
+                            if sc_val is None or pd.isna(sc_val):
+                                if cfg_for_scoring is not None:
+                                    sc_val = sum(score_custom_row(cand_row, cfg_for_scoring).values())
+                                else:
+                                    sc_val = r_tr.get("score", 0)
+                            sc_int = int(sc_val)
+                            sc_str = f"+{sc_int}" if sc_int > 0 else str(sc_int)
+
+                            # Calculate current candle percentage gain from entry price
+                            c_close = cand_row.get("close")
+                            if e_p > 0 and c_close is not None and pd.notna(c_close):
+                                c_close = float(c_close)
+                                gain_pts = (c_close - e_p) if s_side == "LONG" else (e_p - c_close)
+                                gain_pct = (gain_pts / e_p) * 100.0
+                                c_data[f"C{k+1}"][row_idx] = f"{sc_str}({gain_pct:+.1f}%)"
+                            else:
+                                c_data[f"C{k+1}"][row_idx] = sc_str
+                    except Exception:
+                        pass
+
+            c_df = pd.DataFrame(c_data, index=trades.index)
+            base_cols_2 = [c for c in cols if c in trades.columns]
+            trades_2 = pd.concat([trades[base_cols_2], c_df], axis=1)
+
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                show_n_2 = st.number_input(
+                    "Rows to show (newest first)",
+                    min_value=min(5, max(1, len(trades_2))),
+                    max_value=max(len(trades_2), 5),
+                    value=max(len(trades_2), min(5, max(1, len(trades_2)))),
+                    step=5,
+                    key="audit_trail_2_show_n",
+                )
+            with col_b:
+                st.write("")
+                st.download_button(
+                    label="📥 Export Trail-2 CSV",
+                    data=trades_2.to_csv(index=False).encode("utf-8"),
+                    file_name="trade_audit_trail_2_candle_scores.csv",
+                    mime="text/csv",
+                    key="dl_trade_audit_trail_2",
+                )
+
+            st.dataframe(
+                trades_2.tail(int(show_n_2)).iloc[::-1],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Margin used": st.column_config.NumberColumn(
+                        "Margin used",
+                        help="Margin used per trade = Quantity × Entry Price",
+                        format="₹%.2f",
+                    ),
+                    "peak_gain": st.column_config.TextColumn(
+                        "peak_gain",
+                        help="Crossed profit slab (5%, 10%, 15%, 20%, 25%...) reached before reversing to exit / Stop.",
+                    ),
+                    "5%": st.column_config.TextColumn("5%", help="Milestone Confluence Score on the candle that first reached +5% gain"),
+                    "10%": st.column_config.TextColumn("10%", help="Milestone Confluence Score on the candle that first reached +10% gain"),
+                    "15%": st.column_config.TextColumn("15%", help="Milestone Confluence Score on the candle that first reached +15% gain"),
+                    "20%": st.column_config.TextColumn("20%", help="Milestone Confluence Score on the candle that first reached +20% gain"),
+                    "25%": st.column_config.TextColumn("25%", help="Milestone Confluence Score on the candle that first reached +25% gain"),
+                    "30%": st.column_config.TextColumn("30%", help="Milestone Confluence Score on the candle that first reached +30% gain"),
+                    "entry_price": st.column_config.NumberColumn("entry_price", format="%.2f"),
+                    "exit_price": st.column_config.NumberColumn("exit_price", format="%.2f"),
+                    "net_pnl": st.column_config.NumberColumn("net_pnl", format="₹%.2f"),
+                },
+            )
+        else:
+            st.info("No trades executed during this period with the current strategy threshold settings.")
+
+        # ---------------- Historical Raw Data Table ----------------
+        st.markdown("---")
+        st.subheader("📊 Historical Raw Data (All Records)")
+
+        raw_candles = res.get("raw_df")
+        if raw_candles is None or raw_candles.empty:
+            raw_candles = res.get("indicators_df")
+        if raw_candles is None or raw_candles.empty:
+            sym = run_data.get("symbol", st.session_state.symbol).lower()
+            tf = st.session_state.get("timeframe", 5)
+            for fb in [f"data/{sym}_{tf}m.csv", f"data/{sym}_5m.csv", "data/upstox_5m.csv", "data/reliance_5m.csv"]:
+                if os.path.exists(fb):
+                    raw_candles = load_csv(fb)
+                    break
+
+        if raw_candles is not None and not raw_candles.empty:
+            req_cols = ["timestamp", "open", "high", "low", "close", "volume"]
+            avail_cols = [c for c in req_cols if c in raw_candles.columns]
+            df_raw = raw_candles[avail_cols].copy()
+
+            # Filter strictly based on the date range selected
+            date_from = run_data.get("date_from") or str(st.session_state.get("start_date", ""))
+            date_to = run_data.get("date_to") or str(st.session_state.get("end_date", ""))
+
+            ts_series = pd.to_datetime(df_raw["timestamp"])
+            mask = pd.Series(True, index=df_raw.index)
+            if date_from:
+                try:
+                    mask &= (ts_series.dt.date >= pd.to_datetime(date_from).date())
+                except Exception:
+                    pass
+            if date_to:
+                try:
+                    mask &= (ts_series.dt.date <= pd.to_datetime(date_to).date())
+                except Exception:
+                    pass
+
+            filtered_raw = df_raw[mask].sort_values("timestamp").reset_index(drop=True)
+            if filtered_raw.empty:
+                filtered_raw = df_raw.sort_values("timestamp").reset_index(drop=True)
+
+            # 7th column: Direction Of Change
+            # 1st row: blank
+            # Row 2+: if close > prev close -> 🟢 UP (green button/flag)
+            #         if close < prev close -> 🔴 DOWN (red button/flag)
+            diff = filtered_raw["close"].diff()
+            direction_col = pd.Series("", index=filtered_raw.index, dtype=str)
+            direction_col[diff > 0] = "🟢 UP"
+            direction_col[diff < 0] = "🔴 DOWN"
+            if len(direction_col) > 0:
+                direction_col.iloc[0] = ""
+
+            filtered_raw["Direction Of Change"] = direction_col
+            filtered_raw["timestamp"] = filtered_raw["timestamp"].astype(str)
+
+            st.caption(
+                f"Displaying all **{len(filtered_raw):,}** records based on selected date range "
+                f"(`{date_from or 'start'}` to `{date_to or 'end'}`). "
+                "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
+            )
+
+            def style_direction_cell(val):
+                if "UP" in str(val) or "🟢" in str(val):
+                    return "background-color: rgba(38, 166, 154, 0.22); color: #26a69a; font-weight: 700; border-radius: 4px;"
+                elif "DOWN" in str(val) or "🔴" in str(val):
+                    return "background-color: rgba(239, 83, 80, 0.22); color: #ef5350; font-weight: 700; border-radius: 4px;"
+                return ""
+
+            styled_raw = filtered_raw.style.map(
+                style_direction_cell, subset=["Direction Of Change"]
+            ).format({
+                "open": "{:.2f}",
+                "high": "{:.2f}",
+                "low": "{:.2f}",
+                "close": "{:.2f}",
+                "volume": "{:,.0f}",
+            })
+
+            st.dataframe(
+                styled_raw,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "timestamp": st.column_config.TextColumn("timestamp"),
+                    "open": st.column_config.NumberColumn("open", format="%.2f"),
+                    "high": st.column_config.NumberColumn("high", format="%.2f"),
+                    "low": st.column_config.NumberColumn("low", format="%.2f"),
+                    "close": st.column_config.NumberColumn("close", format="%.2f"),
+                    "volume": st.column_config.NumberColumn("volume", format="%d"),
+                    "Direction Of Change": st.column_config.TextColumn("Direction Of Change"),
+                }
+            )
+
+            csv_bytes = filtered_raw.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Historical Raw Data (CSV)",
+                data=csv_bytes,
+                file_name=f"{run_data.get('symbol', st.session_state.symbol)}_raw_candles_{date_from}_{date_to}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No historical raw candle data available for this run.")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        res_b1, res_b2 = st.columns(2)
+        run_strat = run_data.get("strategy_name") or run_data.get("strategy_version") or st.session_state.get("selected_strategy_name", "")
+        if res_b1.button("⬅️ Run Another Backtest (Step 2)", use_container_width=True):
+            if run_strat:
+                load_strategy_into_session(run_strat)
+                st.session_state.selected_strategy_name = run_strat
+                st.session_state.strategy_name_input = run_strat
+                try:
+                    st.session_state["step2_strat_selector"] = run_strat
+                except Exception:
+                    pass
+            st.session_state.step = 2
+            st.rerun()
+        if res_b2.button("⚙️ Edit Strategy (Step 1)", use_container_width=True):
+            if run_strat:
+                load_strategy_into_session(run_strat)
+                st.session_state.selected_strategy_name = run_strat
+                st.session_state.strategy_name_input = run_strat
+                try:
+                    st.session_state["step1_strat_name_input_field"] = run_strat
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step1_load_strat_select"] = run_strat
+                except Exception:
+                    pass
+                try:
+                    st.session_state["step2_strat_selector"] = run_strat
+                except Exception:
+                    pass
+            st.session_state.step = 1
+            st.rerun()
+
+if __name__ == "__main__":
+    st.set_page_config(
+        page_title="AI Auto-Trading Backtest Studio",
+        page_icon="📈",
+        layout="wide",
+    )
+    render_backtest_module()

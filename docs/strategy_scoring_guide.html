@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Strategy Scoring & Signal Thresholds Guide</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-card: #243248;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --text-muted: #64748b;
+            --accent-blue: #38bdf8;
+            --accent-green: #34d399;
+            --accent-red: #fb7185;
+            --accent-yellow: #fbbf24;
+            --border-color: #334155;
+            --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: var(--font-family);
+            line-height: 1.6;
+            padding: 2rem 1rem;
+        }
+
+        .container {
+            max-width: 960px;
+            margin: 0 auto;
+        }
+
+        header {
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 1.5rem;
+            margin-bottom: 2rem;
+        }
+
+        .badge {
+            display: inline-block;
+            background: rgba(56, 189, 248, 0.15);
+            color: var(--accent-blue);
+            font-size: 0.8rem;
+            font-weight: 600;
+            padding: 0.25rem 0.75rem;
+            border-radius: 9999px;
+            margin-bottom: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        h1 {
+            font-size: 2.25rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, #f8fafc 0%, #94a3b8 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        h2 {
+            font-size: 1.5rem;
+            margin: 2rem 0 1rem;
+            color: var(--accent-blue);
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        h3 {
+            font-size: 1.2rem;
+            margin: 1.25rem 0 0.5rem;
+            color: #e2e8f0;
+        }
+
+        p {
+            margin-bottom: 1rem;
+            color: #cbd5e1;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Score visual diagram */
+        .diagram-container {
+            background: var(--bg-card);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin: 1.5rem 0;
+            text-align: center;
+        }
+
+        .scale-bar {
+            display: flex;
+            height: 36px;
+            border-radius: 8px;
+            overflow: hidden;
+            margin: 1.25rem 0 0.5rem;
+            font-weight: bold;
+            font-size: 0.85rem;
+        }
+
+        .scale-sell {
+            flex: 3;
+            background: rgba(251, 113, 133, 0.35);
+            border: 1px solid var(--accent-red);
+            color: var(--accent-red);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .scale-hold {
+            flex: 5;
+            background: rgba(148, 163, 184, 0.15);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .scale-buy {
+            flex: 3;
+            background: rgba(52, 211, 153, 0.35);
+            border: 1px solid var(--accent-green);
+            color: var(--accent-green);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .scale-labels {
+            display: flex;
+            justify-content: space-between;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-family: monospace;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 1rem 0;
+            font-size: 0.95rem;
+        }
+
+        th, td {
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        th {
+            background-color: rgba(30, 41, 59, 0.8);
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+
+        tr:hover {
+            background-color: rgba(255, 255, 255, 0.02);
+        }
+
+        .tag-bull {
+            color: var(--accent-green);
+            background: rgba(52, 211, 153, 0.15);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .tag-bear {
+            color: var(--accent-red);
+            background: rgba(251, 113, 133, 0.15);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            font-weight: 600;
+        }
+
+        .tag-neutral {
+            color: var(--text-muted);
+            background: rgba(148, 163, 184, 0.1);
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+        }
+
+        .callout {
+            border-left: 4px solid var(--accent-blue);
+            background: rgba(56, 189, 248, 0.08);
+            padding: 1rem 1.25rem;
+            border-radius: 0 8px 8px 0;
+            margin: 1rem 0;
+        }
+
+        .callout-title {
+            font-weight: 600;
+            color: var(--accent-blue);
+            margin-bottom: 0.25rem;
+        }
+
+        code {
+            font-family: "Consolas", "Courier New", monospace;
+            background: rgba(0, 0, 0, 0.3);
+            color: #38bdf8;
+            padding: 0.2rem 0.4rem;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+
+        pre {
+            background: #090d16;
+            padding: 1rem;
+            border-radius: 8px;
+            overflow-x: auto;
+            border: 1px solid var(--border-color);
+            margin: 1rem 0;
+        }
+
+        pre code {
+            background: none;
+            padding: 0;
+            color: #e2e8f0;
+        }
+
+        footer {
+            margin-top: 3rem;
+            border-top: 1px solid var(--border-color);
+            padding-top: 1.5rem;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <span class="badge">Reference & Strategy Guide</span>
+            <h1>Technical Indicators, Scoring & Thresholds</h1>
+            <p class="subtitle">A complete handbook on how indicator weights calculate the final candle score and how signal thresholds gate trading decisions.</p>
+        </header>
+
+        <!-- SECTION 1 -->
+        <section class="card">
+            <h2>1. The Consensus Scoring Architecture</h2>
+            <p>In modern quantitative trading, relying on a single indicator (like an isolated EMA crossover or RSI reading) produces frequent whipsaws. Our system uses a <strong>point-scoring consensus system</strong>.</p>
+            <p>Every enabled indicator independently evaluates the current candle and casts its vote:</p>
+            <ul>
+                <li><strong>Bullish Condition:</strong> Adds positive points equal to its configured weight (<code>+Weight</code>).</li>
+                <li><strong>Bearish Condition:</strong> Subtracts points equal to its configured weight (<code>-Weight</code>).</li>
+                <li><strong>Neutral / Conflicting / Inconclusive:</strong> Awards <code>0</code> points.</li>
+            </ul>
+            <div class="callout">
+                <div class="callout-title">Sum of Points = fin_score</div>
+                The sum of all votes from all enabled indicators on that candle forms the net sentiment score, referred to as <code>fin_score</code>.
+            </div>
+        </section>
+
+        <!-- SECTION 2 -->
+        <section class="card">
+            <h2>2. Indicator Weights & Max Possible Score</h2>
+            <h3>What is Indicator Weight?</h3>
+            <p>The <strong>Weight</strong> represents the <strong>voting power (influence)</strong> of an indicator:</p>
+            <ul>
+                <li>An indicator with <strong>Weight = 1</strong> has 1 vote (<code>+1</code> or <code>-1</code>).</li>
+                <li>An indicator with <strong>Weight = 3</strong> has 3 votes (<code>+3</code> or <code>-3</code>). It is 3 times more influential in deciding whether a trade triggers.</li>
+            </ul>
+
+            <h3>Why is Weight User-Configurable?</h3>
+            <p>Different trading styles prioritize different aspects of price action:</p>
+            <ul>
+                <li><strong>Trend-Following Strategy:</strong> Assign heavier weights to <code>EMA</code> and <code>MACD</code> (e.g., 2 or 3), and lower weight to mean-reversion filters.</li>
+                <li><strong>Mean-Reversion Strategy:</strong> Assign heavier weights to <code>Bollinger Bands</code>, <code>RSI</code>, and <code>Stochastic</code>.</li>
+                <li><strong>Volume Strategy:</strong> Prioritize <code>OBV</code> and <code>Volume Ratio</code>.</li>
+            </ul>
+
+            <h3>Dynamic "Max Possible Score"</h3>
+            <p>The <strong>Max Possible Score</strong> is the sum of all weights across enabled indicators:</p>
+            <p><code>Max Possible Score = &Sigma; (Weight of all enabled indicators)</code></p>
+            <p>If all indicators are simultaneously bullish, <code>fin_score = +Max Possible Score</code>.<br>
+            If all indicators are simultaneously bearish, <code>fin_score = -Max Possible Score</code>.</p>
+        </section>
+
+        <!-- SECTION 3 -->
+        <section class="card">
+            <h2>3. How LONG & SHORT Thresholds Work</h2>
+            <p>The <code>LONG Threshold</code> and <code>SHORT Threshold</code> serve as the <strong>Gatekeeper (Decision Boundary)</strong>. They do <strong>not</strong> alter the <code>fin_score</code> itself; rather, they dictate whether that score warrants opening a position.</p>
+
+            <div class="diagram-container">
+                <div style="font-weight: 600; color: #f8fafc;">Signal Decision Spectrum</div>
+                <div class="scale-bar">
+                    <div class="scale-sell">&larr; SHORT / SELL ZONE</div>
+                    <div class="scale-hold">HOLD / NO TRADE ZONE</div>
+                    <div class="scale-buy">LONG / BUY ZONE &rarr;</div>
+                </div>
+                <div class="scale-labels">
+                    <span>-Max (-11)</span>
+                    <span>SHORT Threshold (&le; -5)</span>
+                    <span>0 (Neutral)</span>
+                    <span>LONG Threshold (&ge; +5)</span>
+                    <span>+Max (+11)</span>
+                </div>
+            </div>
+
+            <pre><code>if fin_score &gt;= LONG_Threshold:
+    signal = "BUY (LONG)"
+elif fin_score &lt;= SHORT_Threshold:
+    signal = "SELL (SHORT)"
+else:
+    signal = "HOLD (Wait / Indecisive Market)"</code></pre>
+
+            <h3>How Threshold Selection Affects Performance</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Setting Style</th>
+                        <th>Threshold (Out of 11)</th>
+                        <th>Market Behavior</th>
+                        <th>Pros & Cons</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Conservative</strong></td>
+                        <td><code>LONG: &ge; 8</code><br><code>SHORT: &le; -8</code></td>
+                        <td>Requires near-unanimous agreement across trend, momentum, and volume.</td>
+                        <td><span class="tag-bull">High Win Rate</span>, fewer whipsaws, low brokerage fees. Might enter late or miss modest moves.</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Balanced (Default)</strong></td>
+                        <td><code>LONG: &ge; 5</code><br><code>SHORT: &le; -5</code></td>
+                        <td>Requires ~50% to 60% consensus of all enabled indicators.</td>
+                        <td><span class="tag-bull">Optimal Balance</span> between entry timeliness and confirmation.</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Aggressive</strong></td>
+                        <td><code>LONG: &ge; 2</code><br><code>SHORT: &le; -2</code></td>
+                        <td>Enters upon minimal agreement (e.g., just EMA + VWAP agreeing).</td>
+                        <td><span class="tag-bull">Early Entries</span>, but <span class="tag-bear">High Churn</span> and higher brokerage eating returns.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <!-- SECTION 4 -->
+        <section class="card">
+            <h2>4. Detailed Step-by-Step Walkthrough</h2>
+            <p>Suppose you are analyzing a 5-minute candle for <strong>RELIANCE at 10:15 AM</strong> with default weights (Max Score = 11):</p>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Indicator</th>
+                        <th>Observed Candle Value</th>
+                        <th>Weight</th>
+                        <th>Condition Met</th>
+                        <th>Points Awarded</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>EMA (20 / 50)</strong></td>
+                        <td>EMA20 (₹2,510) &gt; EMA50 (₹2,500)</td>
+                        <td>2</td>
+                        <td><span class="tag-bull">Bullish Trend</span></td>
+                        <td><strong>+2</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>MACD</strong></td>
+                        <td>Histogram = +0.85 (&gt; 0)</td>
+                        <td>2</td>
+                        <td><span class="tag-bull">Bullish Momentum</span></td>
+                        <td><strong>+2</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>VWAP</strong></td>
+                        <td>Close ₹2,515 &gt; VWAP ₹2,508</td>
+                        <td>1</td>
+                        <td><span class="tag-bull">Above Session VWAP</span></td>
+                        <td><strong>+1</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>RSI (14)</strong></td>
+                        <td>RSI = 74 (&gt; 70 overbought ceiling)</td>
+                        <td>1</td>
+                        <td><span class="tag-neutral">Neutral (Overbought Zone)</span></td>
+                        <td><strong>0</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>ADX (14)</strong></td>
+                        <td>ADX = 24 (&ge; 20) with +DI &gt; -DI</td>
+                        <td>1</td>
+                        <td><span class="tag-bull">Bullish Trend Strength</span></td>
+                        <td><strong>+1</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Volume Ratio</strong></td>
+                        <td>Volume Ratio = 0.9 (&lt; 1.2 min surge)</td>
+                        <td>1</td>
+                        <td><span class="tag-neutral">Neutral (No Volume Spike)</span></td>
+                        <td><strong>0</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Bollinger Bands</strong></td>
+                        <td>Price inside upper and lower bands</td>
+                        <td>1</td>
+                        <td><span class="tag-neutral">Neutral (In Channel)</span></td>
+                        <td><strong>0</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>Stochastic</strong></td>
+                        <td>%K crossed below %D</td>
+                        <td>1</td>
+                        <td><span class="tag-bear">Bearish Cross</span></td>
+                        <td><strong>-1</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>OBV</strong></td>
+                        <td>OBV &gt; 20-period OBV MA</td>
+                        <td>1</td>
+                        <td><span class="tag-bull">Accumulation</span></td>
+                        <td><strong>+1</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>ATR (14)</strong></td>
+                        <td>ATR = ₹2.64</td>
+                        <td>0</td>
+                        <td><em>Levels only: Stop = 1.5&times;ATR, Target = 3&times;ATR</em></td>
+                        <td><strong>0</strong></td>
+                    </tr>
+                </tbody>
+            </table>
+
+            <div class="callout" style="border-left-color: var(--accent-green); background: rgba(52, 211, 153, 0.08);">
+                <div class="callout-title" style="color: var(--accent-green);">Calculation of fin_score</div>
+                <code>fin_score = (+2) + (+2) + (+1) + 0 + (+1) + 0 + 0 + (-1) + (+1) = +6</code>
+            </div>
+
+            <h3>Evaluating Against User Thresholds:</h3>
+            <ul>
+                <li><strong>If LONG Threshold is set to 5 (Balanced):</strong><br>
+                    Is <code>fin_score (+6) &gt;= 5</code>? <strong>YES &rarr; ACTION: BUY (LONG)</strong> placed at next candle open.
+                </li>
+                <li><strong>If LONG Threshold is set to 8 (Conservative):</strong><br>
+                    Is <code>fin_score (+6) &gt;= 8</code>? <strong>NO &rarr; ACTION: HOLD (No Trade)</strong>. The system waits for RSI, Volume, or Bollinger confirmation.
+                </li>
+            </ul>
+        </section>
+
+        <!-- SECTION 5 -->
+        <section class="card">
+            <h2>5. Quick Reference Summary</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Term</th>
+                        <th>Definition</th>
+                        <th>Who Controls It</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>Weight</strong></td>
+                        <td>The number of points awarded when an indicator triggers (1 to 5).</td>
+                        <td><strong>User</strong> (per indicator)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Max Possible Score</strong></td>
+                        <td>Sum of all enabled indicator weights. Upper and lower bound of score spectrum.</td>
+                        <td><strong>Calculated Automatically</strong></td>
+                    </tr>
+                    <tr>
+                        <td><strong>fin_score</strong></td>
+                        <td>Sum of positive, negative, and neutral indicator points for a specific candle.</td>
+                        <td><strong>Strategy Engine</strong> (per candle)</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Thresholds</strong></td>
+                        <td>The numeric cut-off required to execute a LONG or SHORT trade.</td>
+                        <td><strong>User</strong> (Step 2 of UI)</td>
+                    </tr>
+                </tbody>
+            </table>
+        </section>
+
+        <footer>
+            <span>AI Autotrading Platform &bull; Quantitative Strategy Engine</span>
+            <span>Version 2.0</span>
+        </footer>
+    </div>
+</body>
+</html>

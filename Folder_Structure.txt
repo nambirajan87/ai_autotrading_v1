@@ -1,0 +1,24 @@
+4. Folder structure (Phase 1 only)
+ai_autotrading/
+├── app/
+│   ├── __init__.py
+│   ├── main.py
+│   ├── config/
+│   │   ├── __init__.py
+│   │   └── settings.py
+│   └── data/
+│       ├── __init__.py          (empty)
+│       ├── market_data.py       NEW: normalize + validate + gap check
+│       ├── historical_data.py   NEW: CSV loader
+│       └── sample_data.py       NEW: synthetic data generator    
+│   └── monitoring/
+│       ├── __init__.py
+│       └── logging_setup.py
+├── tests/
+│   └── test_settings.py
+│   └── test_market_data.py      NEW
+├── data/
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md

@@ -1,0 +1,84 @@
+# ==========================================
+# Environments & Secrets
+# ==========================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.cert
+*.p12
+secrets/
+credentials.json
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Python Bytecode & Cache
+# ==========================================
+__pycache__/
+*/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
+
+# ==========================================
+# Logs & Audit Tracking
+# ==========================================
+logs/
+*.log
+*.log.*
+*.jsonl
+
+# ==========================================
+# Databases & Local Runtime Storage
+# ==========================================
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+
+# ==========================================
+# Temporary Exports, Scratch Files & Downloads
+# ==========================================
+downloads/
+*.tmp
+*.bak
+README.md.txt
+trade_audit_trail*.csv
+data/trade_audit_trail*.csv
+data/dry_run*.csv
+data/backtest_trades.csv
+data/upstox_backtest_trades.csv
+data/backtest_report.txt
+data/backtest_analyse_report.txt
+data/empirical_action_plan_results.json
+data/*.py
+
+# ==========================================
+# Operating System & IDE Configs
+# ==========================================
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.streamlit/secrets.toml

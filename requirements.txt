@@ -1,0 +1,7 @@
+python-dotenv>=1.0
+pytest>=8.0
+pandas>=2.2
+numpy>=1.26
+requests>=2.31
+streamlit>=1.30
+plotly>=5.18
