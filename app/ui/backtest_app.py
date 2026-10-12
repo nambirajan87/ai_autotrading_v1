@@ -658,6 +658,15 @@ def render_backtest_module():
                     in_range = raw_df[(ts_dt >= start_d) & (ts_dt <= end_d)]
                     if not in_range.empty:
                         raw_df = in_range.copy()
+                    else:
+                        avail_min = ts_dt.min()
+                        avail_max = ts_dt.max()
+                        raw_df = None
+                        raise ValueError(
+                            f"Candle data for {st.session_state.symbol} in fallback cache only covers {avail_min} to {avail_max}, "
+                            f"which does not match your requested backtest date range ({start_d} to {end_d}). "
+                            "Please ensure Kotak/Upstox live market connection is active or select an available date range."
+                        )
 
             if raw_df is None or raw_df.empty:
                 raise ValueError(f"No candle data returned for {inst_key} between {start_d} and {end_d}. Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
@@ -1679,7 +1688,20 @@ def render_backtest_module():
                 if not selected_inst:
                     try:
                         gw = get_gateway("KOTAK")
-                        if hasattr(gw, "search_scrip"):
+                        target_sym = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
+                        if hasattr(gw, "smart_search_instruments"):
+                            scrips = gw.smart_search_instruments(target_sym)
+                            for sc in scrips:
+                                p_tok = str(sc.get("pSymbol") or "")
+                                if p_tok:
+                                    selected_inst = {
+                                        "symbol": sc.get("tradingsymbol", target_sym),
+                                        "neoSymbol": f"nse_fo|{p_tok}",
+                                        "optType": clean_opt_type,
+                                        "strkPrc": chosen_strike,
+                                    }
+                                    break
+                        if not selected_inst and hasattr(gw, "search_scrip"):
                             scrip_res = gw.search_scrip(
                                 symbol=underlying_choice,
                                 expiry=sel_expiry,
@@ -2337,7 +2359,14 @@ def render_backtest_module():
                     pass
 
             filtered_raw = df_raw[mask].sort_values("timestamp").reset_index(drop=True)
-            if filtered_raw.empty:
+            matched_date_range = not filtered_raw.empty
+            if not matched_date_range:
+                min_avail = str(ts_series.dt.date.min())
+                max_avail = str(ts_series.dt.date.max())
+                st.warning(
+                    f"⚠️ Note: Candle dataset does not contain records for requested date range (`{date_from}` to `{date_to}`). "
+                    f"Displaying all records available in this backtest dataset (`{min_avail}` to `{max_avail}`)."
+                )
                 filtered_raw = df_raw.sort_values("timestamp").reset_index(drop=True)
 
             # 7th column: Direction Of Change
@@ -2354,11 +2383,18 @@ def render_backtest_module():
             filtered_raw["Direction Of Change"] = direction_col
             filtered_raw["timestamp"] = filtered_raw["timestamp"].astype(str)
 
-            st.caption(
-                f"Displaying all **{len(filtered_raw):,}** records based on selected date range "
-                f"(`{date_from or 'start'}` to `{date_to or 'end'}`). "
-                "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
-            )
+            if matched_date_range:
+                st.caption(
+                    f"Displaying all **{len(filtered_raw):,}** records based on selected date range "
+                    f"(`{date_from or 'start'}` to `{date_to or 'end'}`). "
+                    "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
+                )
+            else:
+                st.caption(
+                    f"Displaying all **{len(filtered_raw):,}** records from dataset "
+                    f"(`{ts_series.dt.date.min()}` to `{ts_series.dt.date.max()}`). "
+                    "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
+                )
 
             def style_direction_cell(val):
                 if "UP" in str(val) or "🟢" in str(val):

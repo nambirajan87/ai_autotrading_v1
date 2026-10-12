@@ -309,13 +309,28 @@ class KotakGateway(BaseBrokerGateway):
         if not self._client:
             return []
         try:
+            exp_param = expiry
+            if expiry and "-" in expiry and len(expiry) == 10:
+                try:
+                    exp_param = datetime.strptime(expiry, "%Y-%m-%d").strftime("%d-%b-%Y")
+                except Exception:
+                    pass
             res = self._client.search_scrip(
                 exchange_segment=exchange_segment,
                 symbol=symbol,
-                expiry=expiry,
+                expiry=exp_param,
                 option_type=option_type,
                 strike_price=strike_price,
             )
+            if not res and expiry:
+                # Retry without expiry to let Kotak match by symbol, strike and option type
+                res = self._client.search_scrip(
+                    exchange_segment=exchange_segment,
+                    symbol=symbol,
+                    expiry=None,
+                    option_type=option_type,
+                    strike_price=strike_price,
+                )
             if isinstance(res, list):
                 return res
         except Exception as e:
@@ -567,10 +582,35 @@ class KotakGateway(BaseBrokerGateway):
                         logger.info("Kotak session expired exception, auto-relogin...")
                         if self.login():
                             continue
-                    logger.warning("Kotak Neo historical_data attempt %d error: %s", attempt + 1, err)
-                    break
+        # 2. Token resolution retry: If primary neosymbol returned no candles, resolve actual token from symbol
+        if self._client and (symbol or neosym):
+            try:
+                search_query = symbol or neosym
+                scrips = self.smart_search_instruments(search_query)
+                for sc in scrips:
+                    target_tok = str(sc.get("pSymbol") or "")
+                    if target_tok and f"nse_fo|{target_tok}" != neosym:
+                        logger.info("Retrying Kotak historical_data with resolved token %s for %s", target_tok, search_query)
+                        res = self._client.historical_data(
+                            neosymbol=f"nse_fo|{target_tok}",
+                            interval=interval_str,
+                            from_date=from_str,
+                            to_date=to_str,
+                        )
+                        if isinstance(res, dict) and res.get("status") == "SUCCESS":
+                            candles = res.get("data", {}).get("candles", [])
+                            if candles:
+                                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+                                df["timestamp"] = pd.to_datetime(df["timestamp"])
+                                if df["timestamp"].dt.tz is not None:
+                                    df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+                                for c in ["open", "high", "low", "close", "volume"]:
+                                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                                return df.dropna().reset_index(drop=True)
+            except Exception as e:
+                logger.debug("Kotak smart token retry error: %s", e)
 
-        # 2. Fallback to Upstox only if key is standard Upstox format
+        # 3. Fallback to Upstox only if key is standard Upstox format
         if instrument_key and ("NSE_EQ" in instrument_key or "NSE_INDEX" in instrument_key):
             try:
                 from app.data.upstox_loader import fetch_range

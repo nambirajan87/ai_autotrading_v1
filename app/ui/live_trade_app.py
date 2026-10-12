@@ -580,13 +580,26 @@ def render_live_trade_module():
                     if not selected_inst:
                         try:
                             gw = get_gateway("KOTAK")
-                            if hasattr(gw, "search_scrip"):
+                            target_sym = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
+                            if hasattr(gw, "smart_search_instruments"):
+                                scrips = gw.smart_search_instruments(target_sym)
+                                for sc in scrips:
+                                    p_tok = str(sc.get("pSymbol") or "")
+                                    if p_tok:
+                                        selected_inst = {
+                                            "symbol": sc.get("tradingsymbol", target_sym),
+                                            "neoSymbol": f"nse_fo|{p_tok}",
+                                            "optType": clean_opt_type,
+                                            "strkPrc": chosen_strike,
+                                        }
+                                        break
+                            if not selected_inst and hasattr(gw, "search_scrip"):
                                 scrip_res = gw.search_scrip(
                                     symbol=underlying_choice,
                                     expiry=sel_expiry,
                                     option_type=clean_opt_type,
                                     strike_price=chosen_strike,
-                                    )
+                                )
                                 if scrip_res and isinstance(scrip_res, list) and len(scrip_res) > 0:
                                     scrip_item = scrip_res[0]
                                     p_tok = str(scrip_item.get("pSymbol") or scrip_item.get("token") or "")
