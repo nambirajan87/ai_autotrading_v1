@@ -147,13 +147,67 @@ class KotakGateway(BaseBrokerGateway):
                 return False
 
             if isinstance(val_resp, dict) and "data" in val_resp:
-                self._access_token = val_resp["data"].get("token", self._access_token)
+                d = val_resp["data"]
+                self._access_token = d.get("token", self._access_token)
+                self._session_id = d.get("sid", self._session_id)
+                if self._client and hasattr(self._client, "configuration"):
+                    self._client.configuration.bearer_token = self._access_token
+                    self._client.configuration.edit_token = self._access_token
+                    self._client.configuration.view_token = self._access_token
+                    if self._session_id:
+                        self._client.configuration.sid = self._session_id
+                        self._client.configuration.edit_sid = self._session_id
+                
+                # Persist fresh session token to .env for persistence across restarts
+                try:
+                    env_file = os.path.join(os.getcwd(), ".env")
+                    if os.path.exists(env_file):
+                        with open(env_file, "r", encoding="utf-8") as ef:
+                            lines = ef.readlines()
+                        updated_lines = []
+                        for line in lines:
+                            if line.startswith("KOTAK_SESSION_TOKEN="):
+                                updated_lines.append(f"KOTAK_SESSION_TOKEN='{self._access_token}'\n")
+                            elif line.startswith("KOTAK_SESSION_ID=") and self._session_id:
+                                updated_lines.append(f"KOTAK_SESSION_ID='{self._session_id}'\n")
+                            else:
+                                updated_lines.append(line)
+                        with open(env_file, "w", encoding="utf-8") as ef:
+                            ef.writelines(updated_lines)
+                except Exception as ex:
+                    logger.debug("Failed saving fresh session token to .env: %s", ex)
+
             self._authenticated = True
             logger.info("Kotak Neo API logged in successfully for UCC: %s", self._ucc)
             return True
         except Exception as e:
             logger.warning("Kotak login exception: %s", e)
             return False
+
+    def ensure_authenticated(self) -> bool:
+        """
+        Verifies session health against broker endpoints.
+        If expired (401 / invalid token), automatically calls self.login() with 2FA TOTP.
+        """
+        if not self._client:
+            return False
+        if not self._authenticated or not self._access_token:
+            return self.login()
+        try:
+            lim = self._client.limits()
+            if isinstance(lim, dict) and lim.get("stat") == "Ok":
+                self._authenticated = True
+                return True
+            st_code = lim.get("stCode") if isinstance(lim, dict) else None
+            err_msg = str(lim.get("errMsg", "")).lower() if isinstance(lim, dict) else ""
+            if st_code in (100022, 100008, 401) or "invalid session" in err_msg or "unauthorized" in err_msg:
+                logger.info("Kotak Neo session expired (stCode=%s). Auto re-authenticating...", st_code)
+                return self.login()
+        except Exception as e:
+            if "401" in str(e) or "unauthorized" in str(e).lower():
+                logger.info("Kotak limits 401 Unauthorized. Auto re-authenticating...")
+                return self.login()
+        return self._authenticated
 
     def is_connected(self) -> bool:
         """Returns True if Kotak Neo consumer key or access token is configured."""
@@ -227,10 +281,83 @@ class KotakGateway(BaseBrokerGateway):
             total_capital=self._capital,
         )
 
+    def sync_live_broker_records(self) -> None:
+        """Syncs real-time orders and open positions directly from Kotak Neo SDK endpoints."""
+        if not (self._client and self._authenticated):
+            return
+        # 1. Sync live orders from order_report()
+        try:
+            ord_rep = self._client.order_report()
+            raw_list = []
+            if isinstance(ord_rep, dict) and "data" in ord_rep and isinstance(ord_rep["data"], list):
+                raw_list = ord_rep["data"]
+            elif isinstance(ord_rep, list):
+                raw_list = ord_rep
+
+            for ro in raw_list:
+                ord_no = str(ro.get("nOrdNo") or ro.get("orderNo") or "")
+                if not ord_no:
+                    continue
+                broker_ord_id = f"KOTAK-LIVE-{ord_no}"
+                if not any(o.order_id == broker_ord_id for o in self._orders):
+                    tx_type = "BUY" if str(ro.get("trnsTp", "")).upper() in ("B", "BUY") else "SELL"
+                    q = int(float(ro.get("qty", 0) or ro.get("orderQty", 0)))
+                    p = float(ro.get("avgPrc", 0.0) or ro.get("prc", 0.0) or 0.0)
+                    st_val = str(ro.get("ordSt") or ro.get("status") or "FILLED").upper()
+                    t_str = str(ro.get("ordDtTm") or ro.get("orderDateTime") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    self._orders.insert(0, GatewayOrder(
+                        order_id=broker_ord_id,
+                        gateway="KOTAK",
+                        symbol=str(ro.get("trdSym") or ro.get("tradingSymbol") or ""),
+                        side=tx_type,
+                        order_type=str(ro.get("prcTp") or "MARKET"),
+                        quantity=q,
+                        price=p,
+                        status=st_val,
+                        timestamp=t_str,
+                        fill_price=p,
+                        fill_time=t_str,
+                        reason=ro.get("rejRsn", ""),
+                    ))
+        except Exception as e:
+            logger.debug("Kotak order_report sync note: %s", e)
+
+        # 2. Sync live positions from positions()
+        try:
+            pos_resp = self._client.positions()
+            pos_list = []
+            if isinstance(pos_resp, dict) and "data" in pos_resp and isinstance(pos_resp["data"], list):
+                pos_list = pos_resp["data"]
+            elif isinstance(pos_resp, list):
+                pos_list = pos_resp
+
+            for rp in pos_list:
+                sym = str(rp.get("trdSym") or rp.get("tradingSymbol") or "")
+                net_qty = int(float(rp.get("netQty", 0) or rp.get("flBuyQty", 0) - float(rp.get("flSellQty", 0) or 0)))
+                if sym and net_qty != 0:
+                    avg_p = float(rp.get("buyAvgPrc", 0.0) or rp.get("avgPrc", 0.0) or 0.0)
+                    ltp = float(rp.get("mktPrc", 0.0) or avg_p)
+                    pnl = float(rp.get("urmtom", 0.0) or rp.get("totalPnl", 0.0) or 0.0)
+                    self._positions[sym] = GatewayPosition(
+                        symbol=sym,
+                        gateway="KOTAK",
+                        quantity=net_qty,
+                        avg_price=avg_p,
+                        ltp=ltp,
+                        pnl=pnl,
+                        side="LONG" if net_qty > 0 else "SHORT",
+                    )
+        except Exception as e:
+            logger.debug("Kotak positions sync note: %s", e)
+
     def get_positions(self) -> List[GatewayPosition]:
+        if getattr(self, "live_order_routing", False):
+            self.sync_live_broker_records()
         return list(self._positions.values())
 
     def get_orders(self) -> List[GatewayOrder]:
+        if getattr(self, "live_order_routing", False):
+            self.sync_live_broker_records()
         return list(self._orders)
 
     def get_ltp(self, symbol: str, instrument_key: Optional[str] = None) -> float:
@@ -655,7 +782,7 @@ class KotakGateway(BaseBrokerGateway):
         """
         self._order_counter += 1
         now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        order_id = f"KOTAK-NEO-{datetime.now().strftime('%y%m%d')}-{self._order_counter:05d}"
+        is_live = getattr(self, "live_order_routing", False)
 
         # Determine fill price
         fill_price = reference_price if reference_price and reference_price > 0 else self.get_ltp(symbol, instrument_key)
@@ -663,10 +790,15 @@ class KotakGateway(BaseBrokerGateway):
             fill_price = 100.0
 
         # In live real-money execution mode, route order through official Kotak Neo SDK endpoint
-        if getattr(self, "live_order_routing", False) and self._client and self._authenticated:
+        if is_live:
+            if not self.ensure_authenticated():
+                raise RuntimeError("Kotak Neo live order routing failed: Authentication error. Please re-authenticate via 2FA TOTP in sidebar.")
+
+            seg = "nse_fo" if ("fo" in str(instrument_key or isin).lower() or len(symbol) > 10) else "nse_cm"
+            tx_type = "B" if side.upper() == "BUY" else "S"
+            order_id = f"KOTAK-LIVE-{datetime.now().strftime('%y%m%d')}-{self._order_counter:05d}"
+
             try:
-                seg = "nse_fo" if ("fo" in str(instrument_key or isin).lower() or len(symbol) > 10) else "nse_cm"
-                tx_type = "B" if side.upper() == "BUY" else "S"
                 resp = self._client.place_order(
                     exchange_segment=seg,
                     product="MIS",
@@ -681,14 +813,81 @@ class KotakGateway(BaseBrokerGateway):
                     trigger_price="0",
                     tag="KOTAKLIVE"
                 )
-                if isinstance(resp, dict) and "nOrdNo" in resp:
-                    live_broker_order_id = resp["nOrdNo"]
-                    order_id = f"KOTAK-LIVE-{live_broker_order_id}"
-                    logger.info("Kotak Live order placed via SDK: Order ID %s (%s)", live_broker_order_id, resp)
-                elif isinstance(resp, dict) and "message" in resp:
-                    logger.warning("Kotak Live order rejected by broker: %s", resp["message"])
             except Exception as e:
-                logger.error("Kotak Live broker order placement call error: %s", e)
+                # If 401 or session token expired, retry once after re-login
+                if "401" in str(e) or "unauthorized" in str(e).lower() or "token" in str(e).lower():
+                    logger.warning("Kotak place_order 401 Unauthorized, re-logging in: %s", e)
+                    self.login()
+                    resp = self._client.place_order(
+                        exchange_segment=seg,
+                        product="MIS",
+                        price="0",
+                        order_type="MKT",
+                        quantity=str(quantity),
+                        validity="DAY",
+                        trading_symbol=symbol,
+                        transaction_type=tx_type,
+                        amo="NO",
+                        disclosed_quantity="0",
+                        trigger_price="0",
+                        tag="KOTAKLIVE"
+                    )
+                else:
+                    raise
+
+            # If response returned unauthorized status, retry once after 2FA login
+            if isinstance(resp, dict) and (resp.get("stCode") in (100008, 100022, 401) or "unauthorized" in str(resp.get("errMsg", "")).lower() or "invalid session" in str(resp.get("errMsg", "")).lower()):
+                logger.warning("Kotak place_order returned unauthorized (stCode=%s). Re-authenticating via 2FA...", resp.get("stCode"))
+                if self.login():
+                    resp = self._client.place_order(
+                        exchange_segment=seg,
+                        product="MIS",
+                        price="0",
+                        order_type="MKT",
+                        quantity=str(quantity),
+                        validity="DAY",
+                        trading_symbol=symbol,
+                        transaction_type=tx_type,
+                        amo="NO",
+                        disclosed_quantity="0",
+                        trigger_price="0",
+                        tag="KOTAKLIVE"
+                    )
+
+            # Process broker response
+            if isinstance(resp, dict) and "nOrdNo" in resp:
+                live_broker_order_id = resp["nOrdNo"]
+                order_id = f"KOTAK-LIVE-{live_broker_order_id}"
+                logger.info("Kotak Live order placed via SDK: Order ID %s (%s)", live_broker_order_id, resp)
+            else:
+                err_msg = ""
+                if isinstance(resp, dict):
+                    err_msg = resp.get("errMsg") or resp.get("desc") or resp.get("message") or resp.get("stat") or str(resp)
+                else:
+                    err_msg = str(resp)
+                logger.error("Kotak Live broker order rejected: %s", err_msg)
+                
+                # In real money mode, NEVER simulate silently on rejection!
+                rej_order = GatewayOrder(
+                    order_id=order_id,
+                    gateway="KOTAK",
+                    symbol=symbol,
+                    side=side,
+                    order_type="MARKET",
+                    quantity=quantity,
+                    price=round(fill_price, 2),
+                    status="REJECTED",
+                    timestamp=now_ts,
+                    fill_price=0.0,
+                    fill_time="",
+                    charges=0.0,
+                    client_order_id=client_order_id,
+                    reason=err_msg,
+                )
+                self._orders.insert(0, rej_order)
+                raise RuntimeError(f"Kotak Broker Rejected Order: {err_msg}")
+        else:
+            order_id = f"KOTAK-PAPER-{datetime.now().strftime('%y%m%d')}-{self._order_counter:05d}"
 
         # Apply market slippage
         adjusted_price = apply_slippage(fill_price, side, self._cost_cfg.slippage_pct)

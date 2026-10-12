@@ -144,13 +144,44 @@ class LiveTradeEngine:
         qty = self.lot_size
 
         # Place instant Market Order through Gateway
-        order = self.gateway.place_market_order(
-            symbol=self.symbol,
-            side=order_side,
-            quantity=qty,
-            isin=self.isin,
-            reference_price=close_p,
-        )
+        try:
+            order = self.gateway.place_market_order(
+                symbol=self.symbol,
+                side=order_side,
+                quantity=qty,
+                isin=self.isin,
+                reference_price=close_p,
+            )
+        except Exception as e:
+            self._log("ERROR", f"Order execution failed on {self.gateway.gateway_name}: {e}")
+            self.db.record_order({
+                "session_id": self.session_id,
+                "gateway": self.gateway.gateway_name,
+                "order_id": f"REJECTED-{int(datetime.now().timestamp())}",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "symbol": self.symbol,
+                "side": order_side,
+                "quantity": qty,
+                "price": close_p,
+                "status": "REJECTED",
+                "reason": str(e),
+            })
+            raise
+
+        if order.status != "FILLED":
+            self.db.record_order({
+                "session_id": self.session_id,
+                "gateway": self.gateway.gateway_name,
+                "order_id": order.order_id,
+                "timestamp": order.fill_time or ts,
+                "symbol": self.symbol,
+                "side": order_side,
+                "quantity": qty,
+                "price": order.price or close_p,
+                "status": order.status,
+                "reason": order.reason or f"Order {order.status}",
+            })
+            raise RuntimeError(f"Order {order.status}: {order.reason}")
 
         # Verified broker fill parameters
         fill_price = order.fill_price or close_p
@@ -388,8 +419,12 @@ class LiveTradeEngine:
             "close": ref_price,
             "volume": 1000,
         })
-        self._execute_entry(mock_sig, dummy_candle, ref_price, str(dummy_candle["timestamp"]))
-        return {"status": "SUCCESS", "side": sig_decision, "fill_price": ref_price}
+        try:
+            self._execute_entry(mock_sig, dummy_candle, ref_price, str(dummy_candle["timestamp"]))
+            fill_p = self.open_position["entry_price"] if self.open_position else ref_price
+            return {"status": "SUCCESS", "side": sig_decision, "fill_price": fill_p}
+        except Exception as e:
+            return {"status": "ERROR", "message": str(e)}
 
     def force_manual_exit(self, reason: str = "MANUAL_EXIT") -> Dict[str, Any]:
         """Manually squares off the open position at current market price without halting the engine."""
@@ -401,12 +436,16 @@ class LiveTradeEngine:
         qty = pos["quantity"]
         order_side = "SELL" if side == "LONG" else "BUY"
 
-        order = self.gateway.place_market_order(
-            symbol=self.symbol,
-            side=order_side,
-            quantity=qty,
-            isin=self.isin,
-        )
+        try:
+            order = self.gateway.place_market_order(
+                symbol=self.symbol,
+                side=order_side,
+                quantity=qty,
+                isin=self.isin,
+            )
+        except Exception as e:
+            return {"status": "ERROR", "message": f"Square-off rejected by broker: {e}"}
+
         exit_p = order.fill_price or pos["entry_price"]
         gross_pnl = round(qty * (exit_p - pos["entry_price"]) if side == "LONG" else qty * (pos["entry_price"] - exit_p), 2)
         net_pnl = round(gross_pnl - order.charges, 2)

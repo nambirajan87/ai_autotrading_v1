@@ -20,6 +20,7 @@ class GatewayOrder:
     fill_time: str = ""
     charges: float = 0.0
     rejection_reason: str = ""
+    reason: str = ""
     client_order_id: Optional[str] = None
 
 

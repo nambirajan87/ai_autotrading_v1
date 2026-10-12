@@ -230,13 +230,25 @@ def render_live_trade_module():
     sel_mode = st.sidebar.radio("Routing Mode", mode_opts, index=0 if "Paper" in st.session_state.live_execution_mode else 1)
     st.session_state.live_execution_mode = sel_mode
 
-    if "Real Money" in sel_mode:
-        if hasattr(gateway, "live_order_routing"):
-            gateway.live_order_routing = True
-        st.sidebar.error("⚠️ REAL MONEY MODE ACTIVE! Verified market orders will route to exchange upon candle close.")
+    is_real = "Real Money" in sel_mode
+    if hasattr(gateway, "live_order_routing"):
+        gateway.live_order_routing = is_real
+    if st.session_state.live_engine is not None and hasattr(st.session_state.live_engine.gateway, "live_order_routing"):
+        st.session_state.live_engine.gateway.live_order_routing = is_real
+
+    if is_real:
+        st.sidebar.error("⚠️ REAL MONEY MODE ACTIVE! Verified market orders will route directly to Kotak Neo exchange.")
     else:
-        if hasattr(gateway, "live_order_routing"):
-            gateway.live_order_routing = False
+        st.sidebar.info("🛡️ PAPER SANDBOX MODE: Simulated orders with zero capital risk.")
+
+    if "Kotak" in sel_gw:
+        if st.sidebar.button("🔐 Re-authenticate Kotak 2FA", use_container_width=True, help="Refreshes 2FA TOTP session token with Kotak Neo"):
+            with st.sidebar:
+                with st.spinner("Connecting to Kotak Neo 2FA..."):
+                    if gateway.login():
+                        st.success("✅ Kotak Neo Authenticated & Session Token Active!")
+                    else:
+                        st.error("❌ 2FA Login failed. Verify credentials in .env")
 
     st.sidebar.markdown("---")
 
@@ -420,12 +432,34 @@ def render_live_trade_module():
                 </div>
                 """, unsafe_allow_html=True)
             else:
-                st.markdown("""
-                <div class="live-card" style="text-align: center; padding: 25px;">
-                    <h4 style="color: #bdbdbd; margin: 0;">⚪ No Open Position</h4>
-                    <p style="color: #757575; margin: 5px 0 0 0;">Scanning completed candles. Market order will execute immediately upon Signal-Bar Close.</p>
-                </div>
-                """, unsafe_allow_html=True)
+                last_trades = live_db.get_trades(session_id=engine.session_id)
+                if last_trades:
+                    lt = last_trades[-1]
+                    pnl_col = "#00e676" if float(lt.get("net_pnl", 0)) >= 0 else "#ff5252"
+                    st.markdown(f"""
+                    <div class="live-card" style="padding: 18px 24px; border-left: 5px solid {pnl_col};">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span style="background: rgba(255,255,255,0.08); padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">LAST TRADE SQUARED OFF</span>
+                                &nbsp;&nbsp;<b>{lt.get('side')} {lt.get('quantity')} QTY</b> ({lt.get('symbol')})
+                                <div style="margin-top: 4px; color: #bdbdbd; font-size: 0.85rem;">
+                                    Fill: ₹{float(lt.get('entry_price', 0)):.2f} &rarr; Exit: ₹{float(lt.get('exit_price', 0)):.2f} ({lt.get('exit_reason')}) | Exit Time: {lt.get('exit_time')}
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div style="font-size: 0.8rem; color: #888;">REALIZED NET P&L</div>
+                                <div style="font-size: 1.25rem; font-weight: 700; color: {pnl_col};">₹{float(lt.get('net_pnl', 0)):+,.2f}</div>
+                            </div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown("""
+                    <div class="live-card" style="text-align: center; padding: 25px;">
+                        <h4 style="color: #bdbdbd; margin: 0;">⚪ No Open Position</h4>
+                        <p style="color: #757575; margin: 5px 0 0 0;">Scanning completed candles. Market order will execute immediately upon Signal-Bar Close or Manual Buy.</p>
+                    </div>
+                    """, unsafe_allow_html=True)
 
             st.markdown("---")
 
@@ -627,22 +661,50 @@ def render_live_trade_module():
                 """, unsafe_allow_html=True)
 
             # Session Order Book (Executed and Open Orders)
-            sess_orders = gateway.get_orders()
-            if sess_orders:
-                st.markdown("##### 📋 Broker Order Book & Real-Time Fills")
-                ord_records = []
-                for o in sess_orders[:10]:
-                    ord_records.append({
+            if hasattr(gateway, "sync_live_broker_records"):
+                gateway.sync_live_broker_records()
+
+            db_orders = live_db.get_orders(session_id=engine.session_id)
+            gw_orders = engine.gateway.get_orders() if engine.gateway else gateway.get_orders()
+
+            merged_orders = []
+            seen_ids = set()
+            for o in gw_orders:
+                if o.order_id not in seen_ids:
+                    seen_ids.add(o.order_id)
+                    merged_orders.append({
                         "Order ID": o.order_id,
-                        "Time": str(o.timestamp)[-8:],
+                        "Time": str(o.timestamp)[-8:] if o.timestamp else "-",
                         "Side": o.side,
                         "Quantity": o.quantity,
                         "Price": f"₹{o.price:.2f}",
                         "Status": o.status,
                         "Charges": f"₹{o.charges:.2f}",
                         "Fill Time": str(o.fill_time)[-8:] if o.fill_time else "-",
+                        "Reason": o.reason or "Broker Fill",
                     })
-                st.dataframe(pd.DataFrame(ord_records), use_container_width=True, hide_index=True)
+
+            for do in db_orders:
+                oid = do.get("order_id", "")
+                if oid and oid not in seen_ids:
+                    seen_ids.add(oid)
+                    merged_orders.append({
+                        "Order ID": oid,
+                        "Time": str(do.get("timestamp", ""))[-8:] if do.get("timestamp") else "-",
+                        "Side": do.get("side", ""),
+                        "Quantity": do.get("quantity", 0),
+                        "Price": f"₹{float(do.get('price', 0)):.2f}",
+                        "Status": do.get("status", "FILLED"),
+                        "Charges": "₹0.00",
+                        "Fill Time": str(do.get("timestamp", ""))[-8:] if do.get("timestamp") else "-",
+                        "Reason": do.get("reason", ""),
+                    })
+
+            st.markdown("##### 📋 Broker Order Book & Real-Time Fills")
+            if merged_orders:
+                st.dataframe(pd.DataFrame(merged_orders), use_container_width=True, hide_index=True)
+            else:
+                st.info("⚪ No orders placed yet in this session. Orders executed or rejected will be logged here in real time.")
 
             # 6. Action Hub & High-Frequency Stream Controls
             st.markdown("#### ⚡ Real-Time Execution Actions & Controls")

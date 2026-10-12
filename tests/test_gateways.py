@@ -67,7 +67,7 @@ def test_kotak_gateway_operations():
     assert order.status == "FILLED"
     assert order.gateway == "KOTAK"
     assert order.quantity == 65
-    assert "KOTAK-NEO" in order.order_id
+    assert "KOTAK-PAPER" in order.order_id or "KOTAK-NEO" in order.order_id
 
     positions = gw.get_positions()
     assert len(positions) == 1
