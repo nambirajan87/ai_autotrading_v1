@@ -79,6 +79,17 @@ class LiveTradeEngine:
 
         self._log("INFO", f"Live Trading Session #{self.session_id} initialized on {gateway.gateway_name} Gateway")
 
+    def warmup(self, candles_df: pd.DataFrame) -> int:
+        """Prime strategy indicators with historical candles before live stepping."""
+        if candles_df is None or candles_df.empty:
+            return 0
+        warmed = 0
+        for _, row in candles_df.iterrows():
+            self.engine.on_candle(row)
+            warmed += 1
+        self._log("INFO", f"Engine pre-warmed with {warmed} historical bars. Indicators primed.")
+        return warmed
+
     def _log(self, level: str, message: str) -> None:
         entry = {
             "timestamp": datetime.now().strftime("%H:%M:%S"),

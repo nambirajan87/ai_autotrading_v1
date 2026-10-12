@@ -272,7 +272,32 @@ def render_live_trade_module():
         engine: Optional[LiveTradeEngine] = st.session_state.live_engine
 
         if engine is None:
-            st.info("👈 Please initialize the Live Trading Session below or in the **'Strategy & Gateway Setup'** tab.")
+            st.markdown("### 🚀 Arm Live Algorithmic Session")
+            st.caption("Select your strategy and configure order parameters before engaging the live execution engine.")
+
+            available_strats = list_strategy_names()
+            cur_strat_idx = available_strats.index(st.session_state.live_strategy_name) if st.session_state.live_strategy_name in available_strats else 0
+
+            launch_c1, launch_c2 = st.columns(2)
+            with launch_c1:
+                sel_strat = st.selectbox("Strategy to Engage", available_strats, index=cur_strat_idx, key="live_cockpit_strat_select")
+                st.session_state.live_strategy_name = sel_strat
+                strat_dict = get_strategy(sel_strat) or {}
+                ind_cfg = strat_dict.get("indicators", {})
+                tp_pct = float(ind_cfg.get("fixed_target_pct", 30.0))
+                sl_pct = float(ind_cfg.get("fixed_stoploss_pct", 5.0))
+                side_rule = ind_cfg.get("trade_side", "BOTH")
+                tsl_on = bool(ind_cfg.get("trailing_sl_enabled", False))
+                st.info(
+                    f"🎯 Target: **{tp_pct}%** | Stop Loss: **{sl_pct}%** | Side: **{side_rule}** | Trailing SL: **{'Model B Active' if tsl_on else 'Off'}**"
+                )
+
+            with launch_c2:
+                st.markdown(f"**🌐 Active Gateway:** `{gateway.gateway_name}`")
+                st.markdown(f"**🛡️ Execution Mode:** `{st.session_state.live_execution_mode}`")
+                st.markdown(f"**📈 Active Instrument:** `{st.session_state.live_symbol}` ({st.session_state.live_equity_name})")
+                st.caption(f"Timeframe: **{st.session_state.live_timeframe}m** | Lot Size: **{st.session_state.live_lot_size}** | Key: `{st.session_state.live_instrument_key}`")
+
             if st.button("🚀 Arm & Launch Live Trading Engine Now", type="primary", use_container_width=True):
                 strat_name = st.session_state.live_strategy_name
                 strat_dict = get_strategy(strat_name) or {}
@@ -296,24 +321,58 @@ def render_live_trade_module():
                     trail_beyond_target=trail_beyond,
                     max_daily_loss=float(st.session_state.get("live_max_daily_loss", 2_000.0)),
                 )
+
+                # Fetch and pre-warm engine with recent history
+                try:
+                    tf = new_engine.timeframe
+                    inst = st.session_state.live_instrument_key
+                    today = date.today()
+                    raw = gateway.fetch_historical_candles(new_engine.symbol, inst, tf, today - timedelta(days=5), today)
+                    if raw is not None and not raw.empty:
+                        st.session_state.live_candles = raw
+                        warm_cursor = max(0, len(raw) - 1)
+                        st.session_state.live_candle_cursor = warm_cursor
+                        new_engine.warmup(raw.iloc[:warm_cursor])
+                except Exception as e:
+                    logger.debug("Live engine initial warmup error: %s", e)
+
                 st.session_state.live_engine = new_engine
                 st.rerun()
 
         else:
             # Emergency Controls & KPI Bar
-            kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns([2, 2, 2, 2, 3])
+            kpi_s, kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns([3, 2, 2, 2, 2, 2])
+            kpi_s.metric("Active Strategy", engine.strategy_name)
             kpi1.metric("Gateway", engine.gateway.gateway_name)
             kpi2.metric("Symbol", engine.symbol, f"{engine.timeframe}m Timeframe")
             kpi3.metric("Trades Executed", engine.total_trades)
             kpi4.metric("Realized P&L", f"₹{engine.daily_pnl:+,.2f}")
 
             with kpi5:
-                if st.button("🚨 EMERGENCY KILL SWITCH", type="primary", use_container_width=True):
+                if st.button("🚨 KILL SWITCH", type="primary", use_container_width=True, help="Instantly exits all positions and halts engine"):
                     engine.emergency_square_off()
                     st.warning("⚠️ KILL SWITCH TRIGGERED: All positions closed at market, engine halted!")
                     st.rerun()
+                if st.button("🔄 Disarm / Switch", use_container_width=True, help="Disarm engine and select a different strategy"):
+                    st.session_state.live_engine = None
+                    st.session_state.live_streaming_active = False
+                    st.rerun()
 
-            st.markdown("<br>", unsafe_allow_html=True)
+            strat_dict = get_strategy(engine.strategy_name) or {}
+            ind_cfg = strat_dict.get("indicators", {})
+            long_th = ind_cfg.get("long_threshold", 1)
+            short_th = ind_cfg.get("short_threshold", -1)
+            side_rule = ind_cfg.get("trade_side", "BOTH")
+            last_sig = engine.engine.latest_signal
+            sig_disp = f"Latest Bar: <b>{last_sig.score:+d} pts</b> (<code>{last_sig.decision}</code>)" if last_sig else "Awaiting candle evaluation"
+
+            st.markdown(
+                f"<div style='background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 10px 16px; margin-top: 6px; margin-bottom: 12px; font-size: 0.88rem; display: flex; justify-content: space-between; align-items: center;'>"
+                f"<div>⚡ <b>Rules:</b> LONG Entry ≥ <b>+{long_th}</b> pts | SHORT Entry ≤ <b>{short_th}</b> pts | Side: <b>{side_rule}</b> | Target: <b>+{engine.target_pct}%</b> | SL: <b>-{engine.stoploss_pct}%</b></div>"
+                f"<div>📡 <b>Mode:</b> <span style='color: #00e676;'><b>{st.session_state.live_execution_mode}</b></span> | {sig_disp}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
 
             # Active Position Cockpit
             pos = engine.open_position
@@ -402,7 +461,10 @@ def render_live_trade_module():
                                     raw = load_csv(fb)
                                     break
                         st.session_state.live_candles = raw
-                        st.session_state.live_candle_cursor = 100 if raw is not None and len(raw) > 100 else 0
+                        warm_cursor = max(0, len(raw) - 1) if raw is not None and len(raw) > 1 else 0
+                        st.session_state.live_candle_cursor = warm_cursor
+                        if raw is not None and warm_cursor > 0:
+                            engine.warmup(raw.iloc[:warm_cursor])
 
                     candles_df = st.session_state.live_candles
                     if candles_df is not None and st.session_state.live_candle_cursor < len(candles_df):
@@ -420,6 +482,30 @@ def render_live_trade_module():
 
             with c_step3:
                 st.caption("ℹ️ **Signal-Bar Close Policy:** Strategy indicators calculate on the completed candle. Entry order executes instantly at market price; verified fill timestamp & price are recorded.")
+
+            # Auto Live Poll Stepper
+            if st.session_state.live_streaming_active and engine is not None and engine.is_active:
+                import time as _t
+                _t.sleep(3.0)
+                if st.session_state.live_candles is not None:
+                    cursor = st.session_state.live_candle_cursor
+                    if cursor < len(st.session_state.live_candles):
+                        next_c = st.session_state.live_candles.iloc[cursor]
+                        st.session_state.live_candle_cursor += 1
+                        engine.on_candle_close(next_c)
+                    else:
+                        try:
+                            inst = st.session_state.live_instrument_key
+                            today = date.today()
+                            fresh = gateway.fetch_historical_candles(engine.symbol, inst, engine.timeframe, today, today)
+                            if fresh is not None and not fresh.empty and len(fresh) > len(st.session_state.live_candles):
+                                st.session_state.live_candles = fresh
+                                next_c = fresh.iloc[-1]
+                                st.session_state.live_candle_cursor = len(fresh)
+                                engine.on_candle_close(next_c)
+                        except Exception:
+                            pass
+                st.rerun()
 
             # Interactive Chart of Recent Candle Feed
             if st.session_state.live_candles is not None and not st.session_state.live_candles.empty and HAS_PLOTLY:
