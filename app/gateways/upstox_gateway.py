@@ -192,4 +192,5 @@ class UpstoxGateway(BaseBrokerGateway):
         start_date: Any,
         end_date: Any,
     ) -> pd.DataFrame:
-        return fetch_range(instrument_key, "minutes", timeframe_minutes, start_date, end_date)
+        clean_key = str(instrument_key or symbol or "").strip().upper()
+        return fetch_range(clean_key, "minutes", timeframe_minutes, start_date, end_date)

@@ -122,14 +122,14 @@ def render_paper_trade_module():
             st.session_state.paper_equity_name = "RELIANCE INDUSTRIES LTD"
         if "paper_instrument_key" not in st.session_state:
             st.session_state.paper_instrument_key = "NSE_EQ|INE002A01018"
-        if "paper_date" not in st.session_state:
-            st.session_state.paper_date = date(2026, 9, 30)
+        if "paper_date" not in st.session_state or st.session_state.paper_date == date(2026, 9, 30):
+            st.session_state.paper_date = date.today()
         if "paper_timeframe" not in st.session_state:
             st.session_state.paper_timeframe = 5
         if "paper_capital" not in st.session_state:
             st.session_state.paper_capital = 100_000.0
-        if "paper_gateway" not in st.session_state:
-            st.session_state.paper_gateway = "🟢 Upstox Pro"
+        if "paper_gateway" not in st.session_state or st.session_state.paper_gateway == "🟢 Upstox Pro":
+            st.session_state.paper_gateway = "🔵 Kotak Neo"
         if "paper_market_segment" not in st.session_state:
             st.session_state.paper_market_segment = "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]"
         if "paper_lot_size" not in st.session_state:
@@ -809,27 +809,68 @@ def render_paper_trade_module():
         st.markdown("<br>", unsafe_allow_html=True)
         can_launch_paper = bool(st.session_state.paper_symbol) if is_fo else is_valid_isin
         if st.button("🚀 Initialize Paper Trading Desk ➡️", type="primary", use_container_width=True, disabled=not can_launch_paper):
-            with st.spinner(f"Loading historical candles for {st.session_state.paper_symbol} on {st.session_state.paper_date}..."):
-                chosen_gw_key = "KOTAK" if "Kotak" in st.session_state.get("paper_gateway", "Upstox") else "UPSTOX"
-                active_gw = get_gateway(chosen_gw_key)
+            with st.spinner(f"Loading candles for {st.session_state.paper_symbol} on {st.session_state.paper_date}..."):
+                # Prioritize Kotak Neo if F&O segment, Kotak instrument key, or Kotak selected in gateway
+                is_kotak_pref = (
+                    "Kotak" in st.session_state.get("paper_gateway", "")
+                    or is_fo
+                    or "nse_fo" in str(st.session_state.get("paper_instrument_key", "")).lower()
+                )
+                chosen_gw_key = "KOTAK" if is_kotak_pref else "UPSTOX"
                 sym = st.session_state.paper_symbol.lower()
                 sym_clean = sym.replace(" ", "")
                 tf = st.session_state.paper_timeframe
                 target_date = st.session_state.paper_date
                 inst_key = st.session_state.get("paper_instrument_key") or f"NSE_EQ|{st.session_state.paper_isin}"
+                start_d = target_date - timedelta(days=14)
 
                 raw_df = None
-                try:
-                    # Look back 14 days before target date for sufficient indicator warmup bars
-                    start_d = target_date - timedelta(days=14)
-                    logger.info("Fetching %s candles: %s from %s to %s", chosen_gw_key, inst_key, start_d, target_date)
-                    raw_df = active_gw.fetch_historical_candles(st.session_state.paper_symbol, inst_key, tf, start_d, target_date)
-                    if raw_df is not None and not raw_df.empty:
-                        logger.info("Successfully fetched %d candles from %s for %s", len(raw_df), chosen_gw_key, inst_key)
-                except Exception as e:
-                    logger.warning("%s fetch failed: %s. Trying local fallback.", chosen_gw_key, e)
-                    raw_df = None
 
+                # 1. Primary gateway fetch
+                try:
+                    active_gw = get_gateway(chosen_gw_key)
+                    logger.info("Fetching %s candles: %s from %s to %s", chosen_gw_key, inst_key, start_d, target_date)
+                    cand_df = active_gw.fetch_historical_candles(st.session_state.paper_symbol, inst_key, tf, start_d, target_date)
+                    if cand_df is not None and not cand_df.empty:
+                        day_series = pd.to_datetime(cand_df["timestamp"]).dt.date
+                        if not cand_df[day_series == target_date].empty:
+                            raw_df = cand_df
+                            logger.info("Successfully fetched %d candles from %s for %s including target date %s", len(raw_df), chosen_gw_key, inst_key, target_date)
+                        else:
+                            logger.info("Gateway %s returned data but target date %s not found. Will try alternate gateway.", chosen_gw_key, target_date)
+                            raw_df = cand_df
+                except Exception as e:
+                    logger.warning("%s fetch failed: %s", chosen_gw_key, e)
+
+                # 2. Try alternate gateway if raw_df is empty or missing target_date
+                has_target = (raw_df is not None and not raw_df.empty and not raw_df[pd.to_datetime(raw_df["timestamp"]).dt.date == target_date].empty)
+                if not has_target:
+                    alt_gw_key = "UPSTOX" if chosen_gw_key == "KOTAK" else "KOTAK"
+                    try:
+                        logger.info("Trying alternate gateway %s for %s (%s)...", alt_gw_key, st.session_state.paper_symbol, inst_key)
+                        alt_gw = get_gateway(alt_gw_key)
+                        alt_cand = alt_gw.fetch_historical_candles(st.session_state.paper_symbol, inst_key, tf, start_d, target_date)
+                        if alt_cand is not None and not alt_cand.empty:
+                            alt_days = pd.to_datetime(alt_cand["timestamp"]).dt.date
+                            if not alt_cand[alt_days == target_date].empty:
+                                raw_df = alt_cand
+                                logger.info("Successfully fetched %d candles with target date from alternate %s", len(raw_df), alt_gw_key)
+                            elif raw_df is None or raw_df.empty:
+                                raw_df = alt_cand
+                    except Exception as e:
+                        logger.warning("Alternate gateway %s fetch failed: %s", alt_gw_key, e)
+
+                # Cache live fetched candles to disk for fast reload
+                if raw_df is not None and not raw_df.empty:
+                    try:
+                        os.makedirs("data", exist_ok=True)
+                        raw_df.to_csv(f"data/{sym}_{tf}m.csv", index=False)
+                        if sym != sym_clean:
+                            raw_df.to_csv(f"data/{sym_clean}_{tf}m.csv", index=False)
+                    except Exception:
+                        pass
+
+                # 3. Local cached CSV fallback only if live gateways completely failed
                 if raw_df is None or raw_df.empty:
                     fallbacks = [
                         f"data/{sym}_{tf}m.csv",
@@ -852,7 +893,7 @@ def render_paper_trade_module():
                             break
 
                 if raw_df is None or raw_df.empty:
-                    st.error(f"No historical candles found for {st.session_state.paper_symbol} ({inst_key}). Verify Upstox token or ensure local cached CSV exists in data/.")
+                    st.error(f"No historical candles found for {st.session_state.paper_symbol} ({inst_key}). Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
                     return
 
                 # Filter for lookback + target date

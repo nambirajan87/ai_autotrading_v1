@@ -381,6 +381,15 @@ def render_live_trade_module():
                             raw = gateway.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
                         except Exception:
                             raw = None
+                        if raw is None or raw.empty or raw[pd.to_datetime(raw["timestamp"]).dt.date == today].empty:
+                            alt_gw_key = "KOTAK" if gw_key == "UPSTOX" else "UPSTOX"
+                            try:
+                                alt_gw = get_gateway(alt_gw_key)
+                                alt_raw = alt_gw.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
+                                if alt_raw is not None and not alt_raw.empty:
+                                    raw = alt_raw
+                            except Exception:
+                                pass
                         if raw is None or raw.empty:
                             # Fallback to local cached data
                             fallbacks = [

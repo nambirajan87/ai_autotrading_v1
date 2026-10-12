@@ -489,7 +489,7 @@ class KotakGateway(BaseBrokerGateway):
         to_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
 
         # Format neosymbol: e.g. "nse_fo|51331", "nse_cm|2885"
-        neosym = instrument_key or symbol
+        neosym = str(instrument_key or symbol or "").strip()
         if "|" in neosym:
             seg, tok = neosym.split("|", 1)
             seg_lower = seg.lower()
@@ -499,9 +499,33 @@ class KotakGateway(BaseBrokerGateway):
                 neosym = f"nse_cm|{tok}"
             else:
                 neosym = f"{seg_lower}|{tok}"
+        elif neosym.isdigit():
+            neosym = f"nse_fo|{neosym}"
         else:
-            if neosym.isdigit():
-                neosym = f"nse_fo|{neosym}"
+            token_found = None
+            try:
+                from app.data.instrument_loader import NIFTY_STANDARD_INSTRUMENTS
+                target_sym = (symbol or neosym).upper().replace(" ", "")
+                for item in NIFTY_STANDARD_INSTRUMENTS:
+                    if item.get("tradingsymbol", "").upper() == target_sym:
+                        ikey = item.get("instrument_key", "")
+                        if "|" in ikey:
+                            token_found = ikey.split("|")[-1]
+                            break
+            except Exception:
+                pass
+            if not token_found:
+                try:
+                    scrips = self.smart_search_instruments(symbol or neosym)
+                    for sc in scrips:
+                        p_sym = str(sc.get("pSymbol") or "")
+                        if p_sym:
+                            token_found = p_sym
+                            break
+                except Exception:
+                    pass
+            if token_found:
+                neosym = f"nse_fo|{token_found}"
 
         # 1. Primary: Use Kotak Neo SDK historical_data
         if self._client:
@@ -528,13 +552,21 @@ class KotakGateway(BaseBrokerGateway):
                         import time as _t
                         _t.sleep(1.0)
                         continue
+                    elif isinstance(res, dict) and (res.get("stCode") == 100022 or "invalid session" in str(res).lower() or res.get("status") == 401 or res.get("code") == 401):
+                        logger.info("Kotak session token expired, attempting auto-relogin...")
+                        if self.login():
+                            continue
                     break
                 except Exception as err:
-                    err_msg = str(err)
-                    if "429" in err_msg or "Rate limit" in err_msg:
+                    err_msg = str(err).lower()
+                    if "429" in err_msg or "rate limit" in err_msg:
                         import time as _t
                         _t.sleep(1.0)
                         continue
+                    if "100022" in err_msg or "invalid session" in err_msg or "unauthorized" in err_msg or "401" in err_msg:
+                        logger.info("Kotak session expired exception, auto-relogin...")
+                        if self.login():
+                            continue
                     logger.warning("Kotak Neo historical_data attempt %d error: %s", attempt + 1, err)
                     break
 
