@@ -347,3 +347,92 @@ class LiveTradeEngine:
 
         self.is_active = False
         self.db.update_session_status(self.session_id, "EMERGENCY_HALT", self.total_trades, self.daily_pnl)
+
+    def force_manual_entry(self, side: str, reference_price: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Manually trigger an immediate trade (BUY / LONG or SELL / SHORT) from the Cockpit.
+        Bypasses indicator wait and executes an immediate market order through the active Gateway.
+        """
+        if not self.is_active:
+            return {"status": "ERROR", "message": "Engine is halted. Please re-arm engine."}
+
+        if self.open_position is not None:
+            return {"status": "ERROR", "message": f"Position already open ({self.open_position['side']} {self.open_position['quantity']} qty). Exit current position first."}
+
+        ref_price = reference_price
+        if not ref_price or ref_price <= 0:
+            try:
+                ref_price = self.gateway.get_ltp(self.symbol, self.isin)
+            except Exception:
+                ref_price = 0.0
+
+        if not ref_price or ref_price <= 0:
+            ref_price = 100.0
+
+        from app.indicators.rules_engine import SignalDecision
+        sig_decision = "LONG" if side.upper() in ("BUY", "LONG") else "SHORT"
+        mock_sig = SignalDecision(
+            decision=sig_decision,
+            score=2 if sig_decision == "LONG" else -2,
+            active_signals={"MANUAL_OVERRIDE": True},
+            timestamp=datetime.now(),
+        )
+        dummy_candle = pd.Series({
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "open": ref_price,
+            "high": ref_price,
+            "low": ref_price,
+            "close": ref_price,
+            "volume": 1000,
+        })
+        self._execute_entry(mock_sig, dummy_candle, ref_price, str(dummy_candle["timestamp"]))
+        return {"status": "SUCCESS", "side": sig_decision, "fill_price": ref_price}
+
+    def force_manual_exit(self, reason: str = "MANUAL_EXIT") -> Dict[str, Any]:
+        """Manually squares off the open position at current market price without halting the engine."""
+        if self.open_position is None:
+            return {"status": "ERROR", "message": "No open position to exit."}
+
+        pos = self.open_position
+        side = pos["side"]
+        qty = pos["quantity"]
+        order_side = "SELL" if side == "LONG" else "BUY"
+
+        order = self.gateway.place_market_order(
+            symbol=self.symbol,
+            side=order_side,
+            quantity=qty,
+            isin=self.isin,
+        )
+        exit_p = order.fill_price or pos["entry_price"]
+        gross_pnl = round(qty * (exit_p - pos["entry_price"]) if side == "LONG" else qty * (pos["entry_price"] - exit_p), 2)
+        net_pnl = round(gross_pnl - order.charges, 2)
+        self.daily_pnl += net_pnl
+        self.total_trades += 1
+
+        self.db.record_trade({
+            "session_id": self.session_id,
+            "gateway": self.gateway.gateway_name,
+            "strategy_name": self.strategy_name,
+            "symbol": self.symbol,
+            "trade_id": pos["trade_id"],
+            "side": side,
+            "quantity": qty,
+            "signal_time": pos["signal_time"],
+            "entry_time": pos["entry_time"],
+            "entry_price": pos["entry_price"],
+            "exit_time": order.fill_time,
+            "exit_price": exit_p,
+            "exit_reason": reason,
+            "gross_pnl": gross_pnl,
+            "charges": order.charges,
+            "net_pnl": net_pnl,
+            "stop_loss": pos["stop_loss"],
+            "target": pos["target"],
+            "score": pos["score"],
+        })
+        self.open_position = None
+        self._log("INFO", f"Manual Square Off executed: Closed {side} at ₹{exit_p:.2f} | Net P&L: ₹{net_pnl:+,.2f}")
+        self.db.update_session_status(self.session_id, "ACTIVE", self.total_trades, self.daily_pnl)
+        return {"status": "SUCCESS", "exit_price": exit_p, "net_pnl": net_pnl}
+

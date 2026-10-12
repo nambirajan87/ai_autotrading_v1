@@ -113,6 +113,7 @@ class KotakGateway(BaseBrokerGateway):
         # Kotak Trade-Free Plan: Intraday Eq brokerage = 0, F&O = flat 20
         self._cost_cfg = CostConfig(flat_cost_per_order=0.0)
         self._order_counter = 0
+        self.live_order_routing = False
 
     @property
     def gateway_name(self) -> str:
@@ -233,13 +234,32 @@ class KotakGateway(BaseBrokerGateway):
         return list(self._orders)
 
     def get_ltp(self, symbol: str, instrument_key: Optional[str] = None) -> float:
+        # 1. Try Kotak Neo SDK quotes endpoint (high accuracy live tick)
+        if self._client:
+            tok = None
+            if instrument_key and "|" in str(instrument_key):
+                tok = str(instrument_key).split("|")[-1]
+            elif symbol and str(symbol).isdigit():
+                tok = str(symbol)
+            elif instrument_key and str(instrument_key).isdigit():
+                tok = str(instrument_key)
+
+            if tok and tok.isdigit():
+                try:
+                    seg = "nse_fo" if ("fo" in str(instrument_key).lower() or len(symbol) > 10) else "nse_cm"
+                    q = self._client.quotes([{"instrument_token": str(tok), "exchange_segment": seg}])
+                    if isinstance(q, list) and q and "ltp" in q[0]:
+                        return float(q[0]["ltp"])
+                except Exception as e:
+                    logger.debug("Kotak SDK quotes LTP error: %s", e)
+
+        # 2. Try REST quotes endpoint
         if self.is_connected() and self._access_token:
             try:
                 headers = {
                     "Accept": "application/json",
                     "Authorization": f"Bearer {self._access_token}",
                 }
-                # Kotak Quotes endpoint
                 resp = requests.get(f"{self._base_url}/Quotes/2.0/quote/marketwatch/{symbol}", headers=headers, timeout=3)
                 if resp.status_code == 200:
                     data = resp.json().get("data", {})
@@ -251,6 +271,109 @@ class KotakGateway(BaseBrokerGateway):
         if symbol in self._positions:
             return self._positions[symbol].ltp
         return 0.0
+
+    def test_top5_endpoints(self, symbol: str = "NIFTY26OCT22500PE", token: str = "51331") -> Dict[str, Any]:
+        """
+        Tests the Top 5 priority Kotak Neo endpoints live and returns structured diagnostic results.
+        1. Historical Data (Candle Feed)
+        2. Quotes (Live LTP & 5-Level Market Depth)
+        3. Limits (Margin & Capital Balance)
+        4. Positions (Open Positions Book)
+        5. Order Report (Live Order History & Order Book)
+        """
+        import time as _t
+        results = {}
+        if not self._client:
+            self.login()
+        if not self._client:
+            return {"error": "Kotak Neo client not initialized"}
+
+        # 1. Limits (Margin)
+        try:
+            t0 = _t.time()
+            lim = self._client.limits()
+            ms = int((_t.time() - t0) * 1000)
+            if isinstance(lim, dict) and (lim.get("stCode") == 100022 or lim.get("code") == 401):
+                self.login()
+                lim = self._client.limits()
+            stat = "ONLINE" if isinstance(lim, dict) and (lim.get("stat") == "Ok" or "Net" in lim) else "ERROR"
+            results["1_limits"] = {
+                "name": "Limits & Margin (Account Balance)",
+                "status": stat,
+                "latency_ms": ms,
+                "summary": f"Net Margin: ₹{lim.get('Net', 'N/A')} | Status: {lim.get('stat', 'Ok')}" if isinstance(lim, dict) else str(lim)[:60],
+            }
+        except Exception as e:
+            results["1_limits"] = {"name": "Limits & Margin", "status": "ERROR", "summary": str(e)}
+
+        # 2. Quotes (LTP & Depth)
+        try:
+            t0 = _t.time()
+            q = self._client.quotes([{"instrument_token": str(token), "exchange_segment": "nse_fo"}])
+            ms = int((_t.time() - t0) * 1000)
+            if isinstance(q, list) and q and "ltp" in q[0]:
+                item = q[0]
+                results["2_quotes"] = {
+                    "name": "Quotes & Market Depth (Live LTP)",
+                    "status": "ONLINE",
+                    "latency_ms": ms,
+                    "summary": f"LTP: ₹{item.get('ltp')} | Chg: {item.get('change')} ({item.get('per_change')}%) | Vol: {int(item.get('last_volume', 0)):,}",
+                }
+            else:
+                results["2_quotes"] = {"name": "Quotes & Market Depth", "status": "NO_DATA", "latency_ms": ms, "summary": str(q)[:80]}
+        except Exception as e:
+            results["2_quotes"] = {"name": "Quotes & Market Depth", "status": "ERROR", "summary": str(e)}
+
+        # 3. Historical Data (Candle Feed)
+        try:
+            t0 = _t.time()
+            from datetime import date
+            today = date.today()
+            df = self.fetch_historical_candles(symbol, f"nse_fo|{token}", 1, today, today)
+            ms = int((_t.time() - t0) * 1000)
+            if df is not None and not df.empty:
+                results["3_historical_data"] = {
+                    "name": "Historical Intraday Candles (OHLCV Feed)",
+                    "status": "ONLINE",
+                    "latency_ms": ms,
+                    "summary": f"Loaded {len(df)} 1m candles today | Latest Close: ₹{df.iloc[-1]['close']:.2f} ({str(df.iloc[-1]['timestamp'])[-8:]})",
+                }
+            else:
+                results["3_historical_data"] = {"name": "Historical Intraday Candles", "status": "NO_DATA", "latency_ms": ms, "summary": "No candles returned"}
+        except Exception as e:
+            results["3_historical_data"] = {"name": "Historical Intraday Candles", "status": "ERROR", "summary": str(e)}
+
+        # 4. Positions (Open Position Book)
+        try:
+            t0 = _t.time()
+            pos = self._client.positions()
+            ms = int((_t.time() - t0) * 1000)
+            is_ok = isinstance(pos, dict) and (pos.get("stat") == "Ok" or pos.get("stCode") == 5203)
+            results["4_positions"] = {
+                "name": "Positions Book (F&O / Equity)",
+                "status": "ONLINE" if is_ok else "ERROR",
+                "latency_ms": ms,
+                "summary": "Clear Book (0 Open Positions)" if isinstance(pos, dict) and pos.get("stCode") == 5203 else ("Active Positions Found" if isinstance(pos, list) and pos else str(pos)[:60]),
+            }
+        except Exception as e:
+            results["4_positions"] = {"name": "Positions Book", "status": "ERROR", "summary": str(e)}
+
+        # 5. Order Report (Order Book)
+        try:
+            t0 = _t.time()
+            ord_rep = self._client.order_report()
+            ms = int((_t.time() - t0) * 1000)
+            is_ok = isinstance(ord_rep, dict) and (ord_rep.get("stat") == "Ok" or ord_rep.get("stCode") == 5203)
+            results["5_order_report"] = {
+                "name": "Order Report (Order Book & History)",
+                "status": "ONLINE" if is_ok else "ERROR",
+                "latency_ms": ms,
+                "summary": "Clear Order Book (0 orders today)" if isinstance(ord_rep, dict) and ord_rep.get("stCode") == 5203 else ("Orders found" if isinstance(ord_rep, list) and ord_rep else str(ord_rep)[:60]),
+            }
+        except Exception as e:
+            results["5_order_report"] = {"name": "Order Report", "status": "ERROR", "summary": str(e)}
+
+        return results
 
     def get_expiries(self, underlying: str = "NIFTY", exchange: str = "nse_fo") -> List[str]:
         """Fetches dynamic live rolling expiry dates for NSE FO instruments from Kotak."""
@@ -429,6 +552,34 @@ class KotakGateway(BaseBrokerGateway):
         fill_price = reference_price if reference_price and reference_price > 0 else self.get_ltp(symbol, instrument_key)
         if fill_price <= 0:
             fill_price = 100.0
+
+        # In live real-money execution mode, route order through official Kotak Neo SDK endpoint
+        if getattr(self, "live_order_routing", False) and self._client and self._authenticated:
+            try:
+                seg = "nse_fo" if ("fo" in str(instrument_key or isin).lower() or len(symbol) > 10) else "nse_cm"
+                tx_type = "B" if side.upper() == "BUY" else "S"
+                resp = self._client.place_order(
+                    exchange_segment=seg,
+                    product="MIS",
+                    price="0",
+                    order_type="MKT",
+                    quantity=str(quantity),
+                    validity="DAY",
+                    trading_symbol=symbol,
+                    transaction_type=tx_type,
+                    amo="NO",
+                    disclosed_quantity="0",
+                    trigger_price="0",
+                    tag="KOTAKLIVE"
+                )
+                if isinstance(resp, dict) and "nOrdNo" in resp:
+                    live_broker_order_id = resp["nOrdNo"]
+                    order_id = f"KOTAK-LIVE-{live_broker_order_id}"
+                    logger.info("Kotak Live order placed via SDK: Order ID %s (%s)", live_broker_order_id, resp)
+                elif isinstance(resp, dict) and "message" in resp:
+                    logger.warning("Kotak Live order rejected by broker: %s", resp["message"])
+            except Exception as e:
+                logger.error("Kotak Live broker order placement call error: %s", e)
 
         # Apply market slippage
         adjusted_price = apply_slippage(fill_price, side, self._cost_cfg.slippage_pct)

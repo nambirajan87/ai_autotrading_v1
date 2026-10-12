@@ -231,7 +231,12 @@ def render_live_trade_module():
     st.session_state.live_execution_mode = sel_mode
 
     if "Real Money" in sel_mode:
+        if hasattr(gateway, "live_order_routing"):
+            gateway.live_order_routing = True
         st.sidebar.error("⚠️ REAL MONEY MODE ACTIVE! Verified market orders will route to exchange upon candle close.")
+    else:
+        if hasattr(gateway, "live_order_routing"):
+            gateway.live_order_routing = False
 
     st.sidebar.markdown("---")
 
@@ -424,48 +429,173 @@ def render_live_trade_module():
 
             st.markdown("---")
 
-            # Live Candle Stepper & Streaming Simulator Controls
-            st.markdown("#### 📡 Real-Time Candle Listener & Execution Trigger")
-            c_step1, c_step2, c_step3 = st.columns([2, 2, 3])
+            # 1. Auto-load candle feed immediately upon Cockpit load if not yet populated
+            if st.session_state.live_candles is None or st.session_state.live_candles.empty:
+                tf = engine.timeframe
+                inst = st.session_state.live_instrument_key
+                today = date.today()
+                raw = None
+                try:
+                    raw = gateway.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
+                except Exception as e:
+                    logger.debug("Gateway live candle fetch note: %s", e)
 
-            with c_step1:
-                if st.button("⚡ Simulate Completed Candle Close", type="secondary", use_container_width=True):
-                    # Load candle feed if not loaded
-                    if st.session_state.live_candles is None:
-                        tf = engine.timeframe
-                        inst = st.session_state.live_instrument_key
-                        today = date.today()
-                        # Try fetching live / today's data or fall back to October test session
-                        try:
-                            raw = gateway.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
-                        except Exception:
-                            raw = None
-                        if raw is None or raw.empty or raw[pd.to_datetime(raw["timestamp"]).dt.date == today].empty:
-                            alt_gw_key = "KOTAK" if gw_key == "UPSTOX" else "UPSTOX"
-                            try:
-                                alt_gw = get_gateway(alt_gw_key)
-                                alt_raw = alt_gw.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
-                                if alt_raw is not None and not alt_raw.empty:
-                                    raw = alt_raw
-                            except Exception:
-                                pass
-                        if raw is None or raw.empty:
-                            # Fallback to local cached data
-                            fallbacks = [
-                                f"data/{engine.symbol.lower()}_{tf}m.csv",
-                                f"data/nifty26oct22500pe_1m.csv",
-                                f"data/reliance_5m.csv",
-                            ]
-                            for fb in fallbacks:
-                                if os.path.exists(fb):
-                                    raw = load_csv(fb)
-                                    break
-                        st.session_state.live_candles = raw
-                        warm_cursor = max(0, len(raw) - 1) if raw is not None and len(raw) > 1 else 0
-                        st.session_state.live_candle_cursor = warm_cursor
-                        if raw is not None and warm_cursor > 0:
-                            engine.warmup(raw.iloc[:warm_cursor])
+                if raw is None or raw.empty or raw[pd.to_datetime(raw["timestamp"]).dt.date == today].empty:
+                    alt_gw_key = "KOTAK" if gw_key == "UPSTOX" else "UPSTOX"
+                    try:
+                        alt_gw = get_gateway(alt_gw_key)
+                        alt_raw = alt_gw.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=5), today)
+                        if alt_raw is not None and not alt_raw.empty:
+                            raw = alt_raw
+                    except Exception:
+                        pass
 
+                if raw is None or raw.empty:
+                    fallbacks = [
+                        f"data/{engine.symbol.lower()}_{tf}m.csv",
+                        f"data/nifty26oct22500pe_1m.csv",
+                        f"data/reliance_5m.csv",
+                    ]
+                    for fb in fallbacks:
+                        if os.path.exists(fb):
+                            raw = load_csv(fb)
+                            break
+
+                if raw is not None and not raw.empty:
+                    st.session_state.live_candles = raw
+                    warm_cursor = max(0, len(raw) - 1)
+                    st.session_state.live_candle_cursor = warm_cursor
+                    if warm_cursor > 0:
+                        engine.warmup(raw.iloc[:warm_cursor])
+
+            # 2. Real-time Live Market Quote & Ticker Bar
+            ltp = 0.0
+            try:
+                ltp = gateway.get_ltp(engine.symbol, st.session_state.live_instrument_key)
+            except Exception:
+                pass
+            if ltp <= 0 and st.session_state.live_candles is not None and not st.session_state.live_candles.empty:
+                ltp = float(st.session_state.live_candles.iloc[-1]["close"])
+
+            c_q1, c_q2, c_q3, c_q4, c_q5 = st.columns([3, 2, 2, 2, 3])
+            c_q1.metric("Live Tick (LTP)", f"₹{ltp:,.2f}", f"{engine.symbol}")
+            if st.session_state.live_candles is not None and not st.session_state.live_candles.empty:
+                today_df = st.session_state.live_candles
+                c_q2.metric("Day High", f"₹{today_df['high'].max():,.2f}")
+                c_q3.metric("Day Low", f"₹{today_df['low'].min():,.2f}")
+                c_q4.metric("Session Volume", f"{int(today_df['volume'].sum()):,}")
+            else:
+                c_q2.metric("Day High", "₹--")
+                c_q3.metric("Day Low", "₹--")
+                c_q4.metric("Session Volume", "--")
+
+            last_sig = engine.engine.latest_signal
+            sig_score = last_sig.score if last_sig else 0
+            sig_dec = last_sig.decision if last_sig else "HOLD"
+            c_q5.metric("Consensus Score", f"{sig_score:+d} pts", f"Stance: {sig_dec}")
+
+            # 3. Interactive Plotly Candlestick + Volume Chart
+            if st.session_state.live_candles is not None and not st.session_state.live_candles.empty and HAS_PLOTLY:
+                candles_all = st.session_state.live_candles
+                cursor = st.session_state.live_candle_cursor
+                if cursor <= 0:
+                    cursor = len(candles_all)
+                    st.session_state.live_candle_cursor = cursor
+
+                display_df = candles_all.iloc[max(0, cursor - 60):cursor]
+                if display_df.empty:
+                    display_df = candles_all.tail(60)
+
+                ema9 = display_df["close"].ewm(span=9, adjust=False).mean()
+                ema21 = display_df["close"].ewm(span=21, adjust=False).mean()
+
+                fig = make_subplots(
+                    rows=2, cols=1,
+                    shared_xaxes=True,
+                    vertical_spacing=0.04,
+                    subplot_titles=(f"📈 Live Candle Stream: {engine.symbol} ({engine.timeframe}m)", "📊 Volume"),
+                    row_heights=[0.75, 0.25],
+                )
+
+                fig.add_trace(go.Candlestick(
+                    x=display_df["timestamp"].astype(str),
+                    open=display_df["open"],
+                    high=display_df["high"],
+                    low=display_df["low"],
+                    close=display_df["close"],
+                    name=engine.symbol,
+                    increasing_line_color="#00e676",
+                    decreasing_line_color="#ff5252",
+                ), row=1, col=1)
+
+                fig.add_trace(go.Scatter(
+                    x=display_df["timestamp"].astype(str),
+                    y=ema9,
+                    mode="lines",
+                    name="EMA 9 (Fast)",
+                    line=dict(color="#00e5ff", width=1.5),
+                ), row=1, col=1)
+
+                fig.add_trace(go.Scatter(
+                    x=display_df["timestamp"].astype(str),
+                    y=ema21,
+                    mode="lines",
+                    name="EMA 21 (Slow)",
+                    line=dict(color="#ffd600", width=1.5),
+                ), row=1, col=1)
+
+                bar_colors = ["#00e676" if c >= o else "#ff5252" for c, o in zip(display_df["close"], display_df["open"])]
+                fig.add_trace(go.Bar(
+                    x=display_df["timestamp"].astype(str),
+                    y=display_df["volume"],
+                    marker_color=bar_colors,
+                    name="Volume",
+                    opacity=0.7,
+                ), row=2, col=1)
+
+                if engine.open_position:
+                    entry_p = engine.open_position["entry_price"]
+                    side = engine.open_position["side"]
+                    fig.add_hline(y=entry_p, line_dash="dash", line_color="#2979ff", annotation_text=f"Entry: ₹{entry_p}", row=1, col=1)
+                    if engine.open_position.get("stop_loss"):
+                        fig.add_hline(y=engine.open_position["stop_loss"], line_dash="dot", line_color="#ff5252", annotation_text="SL", row=1, col=1)
+                    if engine.open_position.get("target"):
+                        fig.add_hline(y=engine.open_position["target"], line_dash="dot", line_color="#00e676", annotation_text="TP", row=1, col=1)
+
+                fig.update_layout(
+                    template="plotly_dark",
+                    height=450,
+                    margin=dict(l=10, r=10, t=30, b=10),
+                    xaxis_rangeslider_visible=False,
+                    xaxis2_rangeslider_visible=False,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 4. Action Hub (Fast Manual Orders & Automated Stepping)
+            st.markdown("#### ⚡ Real-Time Execution Actions & Controls")
+            c_act1, c_act2, c_act3, c_act4 = st.columns(4)
+
+            with c_act1:
+                if st.button("🟢 Force Instant BUY (1 Lot)", type="primary", use_container_width=True, help="Executes an immediate BUY Market order through the active Gateway"):
+                    res = engine.force_manual_entry("BUY")
+                    if res.get("status") == "SUCCESS":
+                        st.success(f"✅ Immediate BUY Order Filled at ₹{res.get('fill_price')}!")
+                        st.rerun()
+                    else:
+                        st.error(res.get("message"))
+
+            with c_act2:
+                if st.button("🔴 Force Instant SELL (1 Lot)", type="secondary", use_container_width=True, help="Executes an immediate SELL Market order through the active Gateway"):
+                    res = engine.force_manual_entry("SELL")
+                    if res.get("status") == "SUCCESS":
+                        st.success(f"✅ Immediate SELL Order Filled at ₹{res.get('fill_price')}!")
+                        st.rerun()
+                    else:
+                        st.error(res.get("message"))
+
+            with c_act3:
+                if st.button("⚡ Step Next Candle Close", use_container_width=True, help="Feeds the next completed candle into VOL_Consensus rules engine"):
                     candles_df = st.session_state.live_candles
                     if candles_df is not None and st.session_state.live_candle_cursor < len(candles_df):
                         next_candle = candles_df.iloc[st.session_state.live_candle_cursor]
@@ -476,12 +606,16 @@ def render_live_trade_module():
                     else:
                         st.warning("All available replay candles completed.")
 
-            with c_step2:
-                auto_stream = st.toggle("▶️ Auto Live Poll (Every 3s)", value=st.session_state.live_streaming_active)
-                st.session_state.live_streaming_active = auto_stream
-
-            with c_step3:
-                st.caption("ℹ️ **Signal-Bar Close Policy:** Strategy indicators calculate on the completed candle. Entry order executes instantly at market price; verified fill timestamp & price are recorded.")
+            with c_act4:
+                if engine.open_position:
+                    if st.button("⏹️ Square Off Active Position", use_container_width=True, help="Immediately squares off open position at current market price"):
+                        res = engine.force_manual_exit("MANUAL_SQUARE_OFF")
+                        if res.get("status") == "SUCCESS":
+                            st.info(f"Position squared off! Net P&L: ₹{res.get('net_pnl'):+,.2f}")
+                            st.rerun()
+                else:
+                    auto_stream = st.toggle("▶️ Auto Live Poll (3s)", value=st.session_state.live_streaming_active)
+                    st.session_state.live_streaming_active = auto_stream
 
             # Auto Live Poll Stepper
             if st.session_state.live_streaming_active and engine is not None and engine.is_active:
@@ -507,30 +641,37 @@ def render_live_trade_module():
                             pass
                 st.rerun()
 
-            # Interactive Chart of Recent Candle Feed
-            if st.session_state.live_candles is not None and not st.session_state.live_candles.empty and HAS_PLOTLY:
-                cursor = st.session_state.live_candle_cursor
-                display_df = st.session_state.live_candles.iloc[max(0, cursor - 40):cursor]
+            # 5. Kotak Neo Top 5 Priority Endpoints Diagnostic Panel
+            with st.expander("🩺 Kotak Neo Live Gateway — Top 5 Priority Endpoints Diagnostic", expanded=False):
+                st.markdown("Verify the health, status, and latency of Kotak Neo's **Top 5 critical production API endpoints** live:")
+                diag_c1, diag_c2 = st.columns([2, 5])
+                with diag_c1:
+                    run_diag = st.button("🔍 Run Kotak Live Diagnostic Test", key="run_top5_diag_btn", use_container_width=True)
+                with diag_c2:
+                    st.caption("Tests: 1. Limits (Margin) | 2. Quotes (LTP) | 3. Historical Candles (OHLCV) | 4. Positions Book | 5. Order Report")
 
-                if not display_df.empty:
-                    fig = go.Figure(data=[go.Candlestick(
-                        x=display_df["timestamp"].astype(str),
-                        open=display_df["open"],
-                        high=display_df["high"],
-                        low=display_df["low"],
-                        close=display_df["close"],
-                        name=engine.symbol,
-                    )])
-                    fig.update_layout(
-                        title=f"Live Feed: {engine.symbol} ({engine.timeframe}m Candle View)",
-                        template="plotly_dark",
-                        height=380,
-                        margin=dict(l=10, r=10, t=40, b=10),
-                        xaxis_rangeslider_visible=False,
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                tok = st.session_state.live_instrument_key.split("|")[-1] if "|" in st.session_state.live_instrument_key else "51331"
+                if run_diag or "kotak_diag_results" in st.session_state:
+                    if run_diag:
+                        with st.spinner("Pinging Kotak Neo 5 Priority Endpoints..."):
+                            st.session_state.kotak_diag_results = gateway.test_top5_endpoints(engine.symbol, tok)
 
-            # Live Execution Log Feed
+                    diag = st.session_state.kotak_diag_results
+                    if "error" in diag:
+                        st.error(diag["error"])
+                    else:
+                        d_cols = st.columns(5)
+                        ep_keys = ["1_limits", "2_quotes", "3_historical_data", "4_positions", "5_order_report"]
+                        for idx, k in enumerate(ep_keys):
+                            ep = diag.get(k, {})
+                            with d_cols[idx]:
+                                st_badge = "🟢 ONLINE" if ep.get("status") == "ONLINE" else ("🟡 NO DATA" if ep.get("status") == "NO_DATA" else "🔴 ERROR")
+                                lat = ep.get("latency_ms", 0)
+                                st.markdown(f"**{ep.get('name', k).split('(')[0].strip()}**")
+                                st.markdown(f"{st_badge} (`{lat}ms`)")
+                                st.caption(ep.get("summary", ""))
+
+            # 6. Live Execution Log Feed
             st.markdown("#### 📝 Real-Time Session Audit Trail")
             if engine.logs:
                 for log in engine.logs[:10]:
@@ -538,6 +679,7 @@ def render_live_trade_module():
                     st.markdown(f"<code>[{log['timestamp']}]</code> <b style='color: {lvl_color};'>[{log['level']}]</b> {log['message']}", unsafe_allow_html=True)
             else:
                 st.caption("No log events yet.")
+
 
 
     # ==============================================================================
