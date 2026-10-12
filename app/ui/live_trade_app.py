@@ -63,11 +63,11 @@ def fetch_kotak_expiries(underlying: str = "NIFTY") -> list:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_kotak_option_chain(underlying: str = "NIFTY", expiry: Optional[str] = None) -> dict:
+def fetch_kotak_option_chain(underlying: str = "NIFTY", expiry: Optional[str] = None, count: int = 250) -> dict:
     try:
         gw = get_gateway("KOTAK")
         if hasattr(gw, "get_option_chain"):
-            return gw.get_option_chain(underlying=underlying, expiry=expiry)
+            return gw.get_option_chain(underlying=underlying, expiry=expiry, count=count)
     except Exception as e:
         logger.debug("Kotak option_chain error: %s", e)
     return {}
@@ -501,32 +501,43 @@ def render_live_trade_module():
                     clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
 
                 with col_strk:
-                    oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry) if sel_expiry else {}
+                    oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry, count=250) if sel_expiry else {}
                     spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
                     mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", INDEX_LOT_SIZES.get(underlying_choice, 65)))
 
+                    # Collect all available strikes from both Call and Put chains
+                    all_strikes = set()
+                    for item in oc_data.get("call", []):
+                        s = item.get("inst", {}).get("strkPrc")
+                        if s:
+                            all_strikes.add(s)
+                    for item in oc_data.get("put", []):
+                        s = item.get("inst", {}).get("strkPrc")
+                        if s:
+                            all_strikes.add(s)
+
                     oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
-                    strikes = []
                     strike_to_inst = {}
                     for item in oc_chain:
                         inst = item.get("inst", {})
                         strk = inst.get("strkPrc")
                         if strk:
-                            strikes.append(strk)
                             strike_to_inst[strk] = inst
+
+                    strikes = list(all_strikes) if all_strikes else list(strike_to_inst.keys())
 
                     if not strikes:
                         if underlying_choice == "BANKNIFTY":
-                            strikes = [str(x) for x in range(48000, 53500, 100)]
+                            strikes = [str(x) for x in range(40000, 68100, 100)]
                             spot_val = "50500"
                         elif underlying_choice == "FINNIFTY":
-                            strikes = [str(x) for x in range(22000, 25500, 100)]
+                            strikes = [str(x) for x in range(17000, 32050, 50)]
                             spot_val = "23500"
                         elif underlying_choice == "MIDCPNIFTY":
-                            strikes = [str(x) for x in range(11000, 14000, 100)]
+                            strikes = [str(x) for x in range(8500, 18050, 50)]
                             spot_val = "12500"
                         else:  # NIFTY
-                            strikes = [str(x) for x in range(21500, 24600, 50)]
+                            strikes = [str(x) for x in range(17000, 30050, 50)]
                             spot_val = "22500"
 
                     try:
@@ -534,16 +545,52 @@ def render_live_trade_module():
                     except Exception:
                         strikes = sorted(list(set(strikes)))
 
-                    default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
-                    default_idx = strikes.index(default_strike) if default_strike in strikes else len(strikes) // 2
+                    default_idx = len(strikes) // 2
+                    try:
+                        s_num = float(spot_val)
+                        closest_strike = min(strikes, key=lambda x: abs(float(x) - s_num))
+                        default_idx = strikes.index(closest_strike)
+                    except Exception:
+                        default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
+                        if default_strike in strikes:
+                            default_idx = strikes.index(default_strike)
+
+                    strike_key = f"live_chosen_strike_{underlying_choice}"
+                    if strike_key in st.session_state and st.session_state[strike_key] not in strikes:
+                        st.session_state[strike_key] = strikes[default_idx]
+
                     chosen_strike = st.selectbox(
                         f"Strike Price (Spot: ~{spot_val})",
                         strikes,
                         index=default_idx,
-                        key=f"live_chosen_strike_{underlying_choice}"
+                        key=strike_key
                     )
                     selected_inst = strike_to_inst.get(chosen_strike, {})
                     display_dt, sym_code = parse_expiry_info(sel_expiry)
+
+                    if not selected_inst:
+                        try:
+                            gw = get_gateway("KOTAK")
+                            if hasattr(gw, "search_scrip"):
+                                scrip_res = gw.search_scrip(
+                                    symbol=underlying_choice,
+                                    expiry=sel_expiry,
+                                    option_type=clean_opt_type,
+                                    strike_price=chosen_strike,
+                                    )
+                                if scrip_res and isinstance(scrip_res, list) and len(scrip_res) > 0:
+                                    scrip_item = scrip_res[0]
+                                    p_tok = str(scrip_item.get("pSymbol") or scrip_item.get("token") or "")
+                                    p_sym = str(scrip_item.get("pTrdSymbol") or scrip_item.get("tradingSymbol") or "")
+                                    if p_sym or p_tok:
+                                        selected_inst = {
+                                            "symbol": p_sym or f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}",
+                                            "neoSymbol": f"nse_fo|{p_tok}" if p_tok else f"nse_fo|{chosen_strike}",
+                                            "optType": clean_opt_type,
+                                            "strkPrc": chosen_strike,
+                                        }
+                        except Exception as e:
+                            logger.debug("Scrip search fallback error: %s", e)
 
                     if selected_inst:
                         st.session_state.live_symbol = selected_inst.get("symbol", f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}")

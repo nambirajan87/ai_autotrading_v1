@@ -215,6 +215,22 @@ NIFTY_STANDARD_INSTRUMENTS = [
         "lot_size": 65,
     },
     {
+        "instrument_key": "NSE_FO|51440",
+        "tradingsymbol": "NIFTY26OCT25000CE",
+        "name": "NIFTY 27-OCT-2026 25000 CE",
+        "isin": "INF000514408",
+        "tick_size": 0.05,
+        "lot_size": 65,
+    },
+    {
+        "instrument_key": "NSE_FO|51441",
+        "tradingsymbol": "NIFTY26OCT25000PE",
+        "name": "NIFTY 27-OCT-2026 25000 PE",
+        "isin": "INF000514416",
+        "tick_size": 0.05,
+        "lot_size": 65,
+    },
+    {
         "instrument_key": "NSE_EQ|INF174KA1ZB7",
         "tradingsymbol": "BANKNIFTY",
         "name": "Nifty Bank Index (Kotak Bank Nifty ETF)",
@@ -343,15 +359,15 @@ def search_equities(query: str, df: Optional[pd.DataFrame] = None, limit: int = 
                 return 100
             if sym in ("NIFTY 50", "NIFTY50", "NIFTYBEES"):
                 return 98
-            if any(opt in sym for opt in ("22500", "23000", "22300")):
+            if any(opt in sym for opt in ("22500", "23000", "22300", "25000")):
                 return 96
             if sym in ("SETFNIF50", "NIFTY1", "HDFCNIFTY", "ICICINIFTY", "NIFTYETF"):
                 return 95
             if "NIFTY" in sym and ("50" in sym or "50" in name or "BEES" in sym):
                 return 92
         # 3. Direct strike or token searches
-        if q in ("22500", "22500CE", "22500PE", "51330", "51331", "23000", "23000CE", "44632", "22300", "22300PE", "44599", "CE", "PE"):
-            if any(k in sym for k in ("22500", "23000", "22300")):
+        if q in ("22500", "22500CE", "22500PE", "51330", "51331", "23000", "23000CE", "44632", "22300", "22300PE", "44599", "25000", "25000CE", "25000PE", "51440", "51441", "CE", "PE"):
+            if any(k in sym for k in ("22500", "23000", "22300", "25000")):
                 return 97
             if inst_key.endswith(f"|{q}"):
                 return 97

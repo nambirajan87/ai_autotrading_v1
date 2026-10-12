@@ -281,7 +281,7 @@ class KotakGateway(BaseBrokerGateway):
         underlying: str = "NIFTY",
         expiry: Optional[str] = None,
         exchange: str = "nse_fo",
-        count: int = 40,
+        count: int = 250,
     ) -> Dict[str, Any]:
         """Fetches live option chain with strikes, spot price, and market lot from Kotak."""
         if not self._client:
