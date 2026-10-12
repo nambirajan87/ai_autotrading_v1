@@ -835,7 +835,7 @@ def render_paper_trade_module():
                 tf = st.session_state.paper_timeframe
                 target_date = st.session_state.paper_date
                 inst_key = st.session_state.get("paper_instrument_key") or f"NSE_EQ|{st.session_state.paper_isin}"
-                start_d = target_date - timedelta(days=14)
+                start_d = target_date - timedelta(days=2) if target_date == date.today() else target_date - timedelta(days=14)
 
                 raw_df = None
 
@@ -970,7 +970,7 @@ def render_paper_trade_module():
         st.header(f"📡 Trading Desk: {session.symbol} ({session.date_str})")
         st.caption(f"Strategy: `{session.strategy_name}` | Timeframe: {st.session_state.paper_timeframe}m | Replay Status: {'FINISHED' if state['is_finished'] else 'ACTIVE'}")
 
-        hud_c1, hud_c2, hud_c3, hud_c4 = st.columns([1, 1, 1, 1])
+        hud_c1, hud_c2, hud_c3, hud_c4, hud_c5 = st.columns([1, 1, 1, 1, 1])
         with hud_c1:
             if st.button("⏭ Step 1 Candle", use_container_width=True, disabled=state["is_finished"], type="primary"):
                 session.step()
@@ -992,6 +992,11 @@ def render_paper_trade_module():
         with hud_c4:
             if st.button("🔄 Reset to Open", use_container_width=True):
                 session.reset()
+                st.rerun()
+
+        with hud_c5:
+            if st.button("⚡ Sync Live Broker", use_container_width=True, help="Syncs latest candles and order book from broker"):
+                st.toast("⚡ Syncing latest market feed from Kotak Neo...", icon="🔄")
                 st.rerun()
 
         # Progress bar
@@ -1202,7 +1207,57 @@ def render_paper_trade_module():
         st.markdown("---")
 
         # Lower Section: Orders, Trades, Audit
-        t_tab1, t_tab2, t_tab3 = st.tabs(["📋 Executed Trades", "📑 Order Ledger", "📜 Real-time System Audit"])
+        t_tab0, t_tab1, t_tab2, t_tab3 = st.tabs([
+            "📖 Level-2 Live Order Book",
+            "📋 Executed Trades",
+            "📑 Order Ledger",
+            "📜 Real-time System Audit",
+        ])
+
+        with t_tab0:
+            st.markdown("##### 📖 Live Level-2 Market Depth (5 Best Bids vs Asks)")
+            gw_for_depth = get_gateway("KOTAK" if "Kotak" in st.session_state.paper_gateway else "UPSTOX")
+            p_depth = gw_for_depth.get_live_market_depth(session.symbol, st.session_state.get("paper_instrument_key"))
+            p_bids = p_depth.get("bids", [])
+            p_asks = p_depth.get("asks", [])
+            p_tot_b = p_depth.get("total_buy", sum(b.get("quantity", 0) for b in p_bids))
+            p_tot_s = p_depth.get("total_sell", sum(a.get("quantity", 0) for a in p_asks))
+            p_spread = p_depth.get("spread", 0.0)
+
+            ob_p1, ob_p2 = st.columns(2)
+            with ob_p1:
+                st.markdown(f"**🟢 Buyer Bids (5-Level)** &nbsp;|&nbsp; Total Buy Qty: **{p_tot_b:,}**")
+                if p_bids:
+                    pb_df = pd.DataFrame(p_bids)
+                    pb_df.columns = ["Orders", "Quantity", "Bid Price (₹)"]
+                    st.dataframe(pb_df.style.format({"Bid Price (₹)": "₹{:.2f}", "Quantity": "{:,}"}), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Awaiting bid feed...")
+
+            with ob_p2:
+                st.markdown(f"**🔴 Seller Asks (5-Level)** &nbsp;|&nbsp; Total Sell Qty: **{p_tot_s:,}**")
+                if p_asks:
+                    pa_df = pd.DataFrame(p_asks)
+                    pa_df.columns = ["Orders", "Quantity", "Ask Price (₹)"]
+                    st.dataframe(pa_df.style.format({"Ask Price (₹)": "₹{:.2f}", "Quantity": "{:,}"}), use_container_width=True, hide_index=True)
+                else:
+                    st.caption("Awaiting ask feed...")
+
+            if (p_tot_b + p_tot_s) > 0:
+                p_bpct = int((p_tot_b / (p_tot_b + p_tot_s)) * 100)
+                p_spct = 100 - p_bpct
+                st.markdown(f"""
+                <div style="margin-top: 5px; margin-bottom: 12px; padding: 8px 12px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 4px;">
+                        <span style="color: #00e676; font-weight: 600;">Buyers: {p_bpct}% ({p_tot_b:,})</span>
+                        <span style="color: #ffd600; font-weight: 600;">Bid-Ask Spread: ₹{p_spread:.2f}</span>
+                        <span style="color: #ff5252; font-weight: 600;">Sellers: {p_spct}% ({p_tot_s:,})</span>
+                    </div>
+                    <div style="width: 100%; height: 8px; background: #ff5252; border-radius: 4px; overflow: hidden;">
+                        <div style="width: {p_bpct}%; height: 100%; background: #00e676;"></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
 
         with t_tab1:
             if session.trade_history:

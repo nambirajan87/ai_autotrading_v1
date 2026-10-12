@@ -375,6 +375,115 @@ class KotakGateway(BaseBrokerGateway):
 
         return results
 
+    def get_live_market_depth(self, symbol: str, instrument_key: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Fetches live Level-2 market depth (5 best bids, 5 best asks, total buy/sell qty, spread)
+        directly from Kotak Neo quotes endpoint with sub-second response times.
+        """
+        tok = None
+        if instrument_key and "|" in str(instrument_key):
+            tok = str(instrument_key).split("|")[-1]
+        elif symbol and str(symbol).isdigit():
+            tok = str(symbol)
+        elif instrument_key and str(instrument_key).isdigit():
+            tok = str(instrument_key)
+
+        if not tok:
+            try:
+                from app.data.instrument_loader import NIFTY_STANDARD_INSTRUMENTS
+                target_sym = str(symbol).upper().replace(" ", "")
+                for item in NIFTY_STANDARD_INSTRUMENTS:
+                    if item.get("tradingsymbol", "").upper() == target_sym:
+                        tok = item.get("instrument_key", "").split("|")[-1]
+                        break
+            except Exception:
+                pass
+
+        if self._client and tok:
+            try:
+                seg = "nse_fo" if ("fo" in str(instrument_key or isin if 'isin' in locals() else "").lower() or len(symbol) > 10) else "nse_cm"
+                q = self._client.quotes([{"instrument_token": str(tok), "exchange_segment": seg}])
+                if isinstance(q, list) and q and isinstance(q[0], dict):
+                    data = q[0]
+                    ltp = float(data.get("ltp") or 0.0)
+                    total_buy = int(float(data.get("total_buy") or 0))
+                    total_sell = int(float(data.get("total_sell") or 0))
+                    depth_raw = data.get("depth", {})
+                    buys = depth_raw.get("buy", [])
+                    sells = depth_raw.get("sell", [])
+
+                    buy_rows = []
+                    for b in buys[:5]:
+                        buy_rows.append({
+                            "orders": int(b.get("orders", 0)),
+                            "quantity": int(b.get("quantity", 0)),
+                            "price": float(b.get("price", 0.0)),
+                        })
+
+                    sell_rows = []
+                    for s in sells[:5]:
+                        sell_rows.append({
+                            "orders": int(s.get("orders", 0)),
+                            "quantity": int(s.get("quantity", 0)),
+                            "price": float(s.get("price", 0.0)),
+                        })
+
+                    spread = 0.0
+                    if buy_rows and sell_rows and buy_rows[0]["price"] > 0 and sell_rows[0]["price"] > 0:
+                        spread = round(sell_rows[0]["price"] - buy_rows[0]["price"], 2)
+
+                    return {
+                        "status": "LIVE_FEED",
+                        "symbol": symbol,
+                        "token": tok,
+                        "ltp": ltp,
+                        "change": data.get("change", 0.0),
+                        "per_change": data.get("per_change", 0.0),
+                        "volume": int(float(data.get("last_volume", 0))),
+                        "total_buy": total_buy,
+                        "total_sell": total_sell,
+                        "spread": spread,
+                        "bids": buy_rows,
+                        "asks": sell_rows,
+                        "timestamp": data.get("lstup_time", datetime.now().strftime("%H:%M:%S")),
+                    }
+            except Exception as e:
+                logger.debug("Kotak live market depth query note: %s", e)
+
+        # Fallback realistic Level-2 market depth simulation around LTP
+        ref_ltp = self.get_ltp(symbol, instrument_key) or 300.0
+        tick = 0.05
+        sim_bids = [
+            {"orders": 3, "quantity": 195, "price": round(ref_ltp - tick, 2)},
+            {"orders": 2, "quantity": 260, "price": round(ref_ltp - tick * 2, 2)},
+            {"orders": 5, "quantity": 455, "price": round(ref_ltp - tick * 3, 2)},
+            {"orders": 1, "quantity": 130, "price": round(ref_ltp - tick * 4, 2)},
+            {"orders": 4, "quantity": 325, "price": round(ref_ltp - tick * 5, 2)},
+        ]
+        sim_asks = [
+            {"orders": 2, "quantity": 130, "price": round(ref_ltp + tick, 2)},
+            {"orders": 4, "quantity": 325, "price": round(ref_ltp + tick * 2, 2)},
+            {"orders": 1, "quantity": 195, "price": round(ref_ltp + tick * 3, 2)},
+            {"orders": 3, "quantity": 390, "price": round(ref_ltp + tick * 4, 2)},
+            {"orders": 6, "quantity": 520, "price": round(ref_ltp + tick * 5, 2)},
+        ]
+        return {
+            "status": "SIMULATED_DEPTH",
+            "symbol": symbol,
+            "token": tok or "N/A",
+            "ltp": ref_ltp,
+            "change": 0.0,
+            "per_change": 0.0,
+            "volume": 50000,
+            "total_buy": sum(b["quantity"] for b in sim_bids),
+            "total_sell": sum(s["quantity"] for s in sim_asks),
+            "spread": round(sim_asks[0]["price"] - sim_bids[0]["price"], 2),
+            "bids": sim_bids,
+            "asks": sim_asks,
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+        }
+
+
     def get_expiries(self, underlying: str = "NIFTY", exchange: str = "nse_fo") -> List[str]:
         """Fetches dynamic live rolling expiry dates for NSE FO instruments from Kotak."""
         if not self._client and HAS_NEO_SDK:

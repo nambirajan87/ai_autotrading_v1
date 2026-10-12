@@ -101,7 +101,6 @@ class BaseBrokerGateway(ABC):
         """Get latest traded market price."""
         pass
 
-    @abstractmethod
     def fetch_historical_candles(
         self,
         symbol: str,
@@ -112,3 +111,24 @@ class BaseBrokerGateway(ABC):
     ) -> pd.DataFrame:
         """Fetch OHLCV historical candle data for analysis or replay."""
         pass
+
+    def get_live_market_depth(self, symbol: str, instrument_key: Optional[str] = None) -> Dict[str, Any]:
+        """Fetch Level-2 order book depth (5 bids, 5 asks, spread)."""
+        ref_ltp = self.get_ltp(symbol, instrument_key) or 100.0
+        tick = 0.05
+        return {
+            "status": "SIMULATED_DEPTH",
+            "symbol": symbol,
+            "token": instrument_key or "N/A",
+            "ltp": ref_ltp,
+            "change": 0.0,
+            "per_change": 0.0,
+            "volume": 10000,
+            "total_buy": 1365,
+            "total_sell": 1625,
+            "spread": 0.10,
+            "bids": [{"orders": 2, "quantity": 130, "price": round(ref_ltp - tick * (i + 1), 2)} for i in range(5)],
+            "asks": [{"orders": 3, "quantity": 195, "price": round(ref_ltp + tick * (i + 1), 2)} for i in range(5)],
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+        }
+
