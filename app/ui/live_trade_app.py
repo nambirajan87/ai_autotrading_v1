@@ -580,7 +580,7 @@ def render_live_trade_module():
                 if st.button("🟢 Force Instant BUY (1 Lot)", type="primary", use_container_width=True, help="Executes an immediate BUY Market order through the active Gateway"):
                     res = engine.force_manual_entry("BUY")
                     if res.get("status") == "SUCCESS":
-                        st.success(f"✅ Immediate BUY Order Filled at ₹{res.get('fill_price')}!")
+                        st.toast(f"✅ Immediate BUY Order Filled at ₹{res.get('fill_price')}!", icon="🟢")
                         st.rerun()
                     else:
                         st.error(res.get("message"))
@@ -589,7 +589,7 @@ def render_live_trade_module():
                 if st.button("🔴 Force Instant SELL (1 Lot)", type="secondary", use_container_width=True, help="Executes an immediate SELL Market order through the active Gateway"):
                     res = engine.force_manual_entry("SELL")
                     if res.get("status") == "SUCCESS":
-                        st.success(f"✅ Immediate SELL Order Filled at ₹{res.get('fill_price')}!")
+                        st.toast(f"✅ Immediate SELL Order Filled at ₹{res.get('fill_price')}!", icon="🔴")
                         st.rerun()
                     else:
                         st.error(res.get("message"))
@@ -611,7 +611,7 @@ def render_live_trade_module():
                     if st.button("⏹️ Square Off Active Position", use_container_width=True, help="Immediately squares off open position at current market price"):
                         res = engine.force_manual_exit("MANUAL_SQUARE_OFF")
                         if res.get("status") == "SUCCESS":
-                            st.info(f"Position squared off! Net P&L: ₹{res.get('net_pnl'):+,.2f}")
+                            st.toast(f"⏹️ Position squared off! Net P&L: ₹{res.get('net_pnl'):+,.2f}", icon="⏹️")
                             st.rerun()
                 else:
                     auto_stream = st.toggle("▶️ Auto Live Poll (3s)", value=st.session_state.live_streaming_active)

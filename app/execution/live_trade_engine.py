@@ -6,7 +6,7 @@ import pandas as pd
 from app.backtest.costs import apply_slippage, leg_cost
 from app.config.cost_config import CostConfig
 from app.database.live_database import get_live_db
-from app.execution.streaming_strategy_engine import StreamingStrategyEngine
+from app.execution.streaming_strategy_engine import StreamingSignal, StreamingStrategyEngine
 from app.gateways.base_gateway import BaseBrokerGateway
 from app.strategy.strategy_store import get_strategy
 
@@ -369,13 +369,16 @@ class LiveTradeEngine:
         if not ref_price or ref_price <= 0:
             ref_price = 100.0
 
-        from app.indicators.rules_engine import SignalDecision
         sig_decision = "LONG" if side.upper() in ("BUY", "LONG") else "SHORT"
-        mock_sig = SignalDecision(
+        mock_sig = StreamingSignal(
+            timestamp=datetime.now(),
+            symbol=self.symbol,
             decision=sig_decision,
             score=2 if sig_decision == "LONG" else -2,
-            active_signals={"MANUAL_OVERRIDE": True},
-            timestamp=datetime.now(),
+            components={"MANUAL_OVERRIDE": 2 if sig_decision == "LONG" else -2},
+            indicators={},
+            close=ref_price,
+            reasons=["MANUAL_OVERRIDE"],
         )
         dummy_candle = pd.Series({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
