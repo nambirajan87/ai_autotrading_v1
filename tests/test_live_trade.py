@@ -47,6 +47,15 @@ def test_live_database(tmp_path):
     assert trades[0]["net_pnl"] == 3597.75
     assert trades[0]["entry_time"] == "2026-10-07 12:13:00"
 
+    # Query with session_id
+    trades_by_session = db.get_trades(session_id=session_id)
+    assert len(trades_by_session) == 1
+    assert trades_by_session[0]["session_id"] == session_id
+
+    # Query with non-matching session_id
+    empty_trades = db.get_trades(session_id=999999)
+    assert len(empty_trades) == 0
+
 
 def test_live_trade_engine_step():
     gw = get_gateway("KOTAK")

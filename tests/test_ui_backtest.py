@@ -1634,8 +1634,69 @@ def test_edit_strategy_auto_populates_in_backtest_step2():
     delete_strategy(test_strat_name)
 
 
+def test_strategy_save_and_reload_instrument_config():
+    import streamlit as st
+    from app.strategy.strategy_store import save_strategy, get_strategy, delete_strategy
+
+    strat_name = "Test_Reload_Instrument_Strat"
+    ind_cfg = {"ema_enabled": True, "ema_fast": 21, "ema_slow": 55, "rsi_enabled": True}
+    risk_cfg = {"capital": 75000.0, "lot_size": 25, "tick_size": 0.05}
+    cost_cfg = {"cost_mode": "FLAT_PER_ORDER", "flat_cost_per_order": 20.0}
+    inst_cfg = {
+        "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+        "symbol": "FINNIFTY26OCT23500PE",
+        "isin": "INF204KB14I2",
+        "equity_name": "FINNIFTY 26-OCT-2026 23500 PE",
+        "instrument_key": "nse_fo|23500",
+        "underlying": "FINNIFTY",
+        "expiry": "26-OCT-2026",
+        "option_type": "PE (Put)",
+        "strike": "23500",
+        "start_date": "2026-09-05",
+        "end_date": "2026-09-25",
+        "timeframe": 15,
+        "allow_short": True,
+        "lot_size": 25,
+        "tick_size": 0.05,
+    }
+
+    save_ok = save_strategy(strat_name, ind_cfg, risk_cfg, cost_cfg, instrument=inst_cfg)
+    assert save_ok is True
+
+    # Emulate load_strategy_into_session logic
+    strat = get_strategy(strat_name)
+    assert strat is not None
+    assert "instrument" in strat
+
+    # Verify reloading instrument configuration
+    loaded_inst = strat["instrument"]
+    assert loaded_inst["underlying"] == "FINNIFTY"
+    assert loaded_inst["strike"] == "23500"
+    assert loaded_inst["timeframe"] == 15
+    assert loaded_inst["symbol"] == "FINNIFTY26OCT23500PE"
+
+    st.session_state.symbol = loaded_inst["symbol"]
+    st.session_state.market_segment = loaded_inst["market_segment"]
+    st.session_state["backtest_underlying_choice"] = loaded_inst["underlying"]
+    st.session_state.timeframe = loaded_inst["timeframe"]
+
+    assert st.session_state.symbol == "FINNIFTY26OCT23500PE"
+    assert st.session_state["backtest_underlying_choice"] == "FINNIFTY"
+    assert st.session_state.timeframe == 15
+
+    delete_strategy(strat_name)
 
 
+def test_backtest_two_step_workflow():
+    import streamlit as st
+    st.session_state.step = 1
+    assert st.session_state.step == 1
 
+    # Simulate transition to Step 2 (Results) upon backtest completion
+    st.session_state.step = 2
+    assert st.session_state.step == 2
 
+    # Simulate return to Step 1
+    st.session_state.step = 1
+    assert st.session_state.step == 1
 

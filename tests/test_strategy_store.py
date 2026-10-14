@@ -53,6 +53,42 @@ def test_strategy_store_save_load_delete(tmp_path):
     assert test_name not in list_strategy_names()
 
 
+def test_strategy_store_save_load_instrument():
+    test_name = "Unit_Test_FO_Instrument_Strategy"
+    test_ind = {"ema_enabled": True, "ema_fast": 20, "ema_slow": 50, "rsi_enabled": True}
+    test_risk = {"capital": 100000.0, "fixed_target_pct": 3.0}
+    test_cost = {"cost_mode": "FLAT_PER_ORDER", "flat_cost_per_order": 20.0}
+    test_inst = {
+        "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+        "symbol": "BANKNIFTY26OCT50000CE",
+        "isin": "INF204KB14I2",
+        "equity_name": "BANKNIFTY 26-OCT-2026 50000 CE",
+        "instrument_key": "nse_fo|50000",
+        "underlying": "BANKNIFTY",
+        "expiry": "26-OCT-2026",
+        "option_type": "CE (Call)",
+        "strike": "50000",
+        "start_date": "2026-09-01",
+        "end_date": "2026-09-30",
+        "timeframe": 15,
+        "allow_short": True,
+        "lot_size": 30,
+        "tick_size": 0.05,
+    }
+
+    save_strategy(test_name, test_ind, test_risk, test_cost, instrument=test_inst)
+
+    loaded = get_strategy(test_name)
+    assert loaded is not None
+    assert "instrument" in loaded
+    assert loaded["instrument"]["underlying"] == "BANKNIFTY"
+    assert loaded["instrument"]["strike"] == "50000"
+    assert loaded["instrument"]["timeframe"] == 15
+    assert loaded["instrument"]["lot_size"] == 30
+
+    delete_strategy(test_name)
+
+
 def test_database_strategy_filtering(tmp_path):
     db_file = str(tmp_path / "test_strat_filter.db")
     db = BacktestDatabase(path=db_file)

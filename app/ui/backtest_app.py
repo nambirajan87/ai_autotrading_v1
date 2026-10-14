@@ -209,6 +209,119 @@ def render_backtest_module():
             st.session_state.risk = r
         if "cost" in strat:
             st.session_state.cost = dict(strat["cost"])
+        if "instrument" in strat and isinstance(strat["instrument"], dict):
+            inst_cfg = strat["instrument"]
+            mkt_seg = inst_cfg.get("market_segment")
+            if mkt_seg:
+                st.session_state.market_segment = mkt_seg
+                try:
+                    st.session_state["backtest_market_segment_radio"] = mkt_seg
+                except Exception:
+                    pass
+
+            if inst_cfg.get("symbol"):
+                st.session_state.symbol = inst_cfg["symbol"]
+            if inst_cfg.get("isin"):
+                st.session_state.isin = inst_cfg["isin"]
+                try:
+                    st.session_state["backtest_input_isin"] = inst_cfg["isin"]
+                except Exception:
+                    pass
+            if inst_cfg.get("equity_name"):
+                st.session_state.equity_name = inst_cfg["equity_name"]
+            if inst_cfg.get("instrument_key"):
+                st.session_state.instrument_key = inst_cfg["instrument_key"]
+
+            und = inst_cfg.get("underlying")
+            if und:
+                try:
+                    st.session_state["backtest_underlying_choice"] = und
+                except Exception:
+                    pass
+                if inst_cfg.get("expiry"):
+                    try:
+                        st.session_state[f"backtest_sel_expiry_{und}"] = inst_cfg["expiry"]
+                    except Exception:
+                        pass
+                if inst_cfg.get("strike"):
+                    try:
+                        st.session_state[f"backtest_chosen_strike_{und}"] = str(inst_cfg["strike"])
+                    except Exception:
+                        pass
+
+            if inst_cfg.get("option_type"):
+                opt_str = "PE (Put)" if "PE" in str(inst_cfg["option_type"]).upper() else "CE (Call)"
+                try:
+                    st.session_state["backtest_opt_type_choice"] = opt_str
+                except Exception:
+                    pass
+
+            if inst_cfg.get("start_date"):
+                try:
+                    sd = inst_cfg["start_date"]
+                    d_obj = date.fromisoformat(sd) if isinstance(sd, str) else sd
+                    st.session_state.start_date = d_obj
+                    st.session_state["backtest_start_date"] = d_obj
+                except Exception:
+                    pass
+
+            if inst_cfg.get("end_date"):
+                try:
+                    ed = inst_cfg["end_date"]
+                    d_obj = date.fromisoformat(ed) if isinstance(ed, str) else ed
+                    st.session_state.end_date = d_obj
+                    st.session_state["backtest_end_date"] = d_obj
+                except Exception:
+                    pass
+
+            if inst_cfg.get("timeframe"):
+                try:
+                    tf = int(inst_cfg["timeframe"])
+                    st.session_state.timeframe = tf
+                    st.session_state["backtest_timeframe_select"] = tf
+                except Exception:
+                    pass
+
+            if "allow_short" in inst_cfg:
+                try:
+                    as_val = bool(inst_cfg["allow_short"])
+                    st.session_state.allow_short = as_val
+                    st.session_state["backtest_allow_short"] = as_val
+                except Exception:
+                    pass
+
+            if "lot_size" in inst_cfg and inst_cfg["lot_size"] is not None:
+                try:
+                    st.session_state.risk["lot_size"] = int(inst_cfg["lot_size"])
+                except Exception:
+                    pass
+
+            if "tick_size" in inst_cfg and inst_cfg["tick_size"] is not None:
+                try:
+                    st.session_state.risk["tick_size"] = float(inst_cfg["tick_size"])
+                except Exception:
+                    pass
+
+    def get_current_instrument_config() -> dict:
+        """Collects current instrument configuration and environment parameters from session state."""
+        und = st.session_state.get("backtest_underlying_choice", "NIFTY")
+        return {
+            "market_segment": st.session_state.get("market_segment", "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]"),
+            "symbol": st.session_state.get("symbol", "NIFTY"),
+            "isin": st.session_state.get("isin", ""),
+            "equity_name": st.session_state.get("equity_name", ""),
+            "instrument_key": st.session_state.get("instrument_key", ""),
+            "underlying": und,
+            "expiry": st.session_state.get(f"backtest_sel_expiry_{und}", ""),
+            "option_type": st.session_state.get("backtest_opt_type_choice", "PE (Put)"),
+            "strike": str(st.session_state.get(f"backtest_chosen_strike_{und}", "")),
+            "start_date": str(st.session_state.get("start_date", "2026-09-01")),
+            "end_date": str(st.session_state.get("end_date", "2026-09-30")),
+            "timeframe": int(st.session_state.get("timeframe", 5)),
+            "allow_short": bool(st.session_state.get("allow_short", True)),
+            "lot_size": int(st.session_state.risk.get("lot_size", 1)),
+            "tick_size": float(st.session_state.risk.get("tick_size", 0.05)),
+        }
 
     def reset_to_default_strategy():
         """Resets to standard clean configuration with auto-suggested name."""
@@ -230,7 +343,7 @@ def render_backtest_module():
 
     # ---------------- Session State Helpers ----------------
     def init_session_state():
-        if "step" not in st.session_state:
+        if "step" not in st.session_state or st.session_state.step not in (1, 2):
             st.session_state.step = 1
 
         saved_strats = list_strategy_names()
@@ -456,7 +569,7 @@ def render_backtest_module():
                 "in_sample": None,
                 "out_sample": None,
             }
-            st.session_state.step = 3
+            st.session_state.step = 2
             st.rerun()
 
         if col_btn2.button("Re-run Config", use_container_width=True):
@@ -480,10 +593,6 @@ def render_backtest_module():
                     st.session_state["step1_load_strat_select"] = strat_to_reload
                 except Exception:
                     pass
-                try:
-                    st.session_state["step2_strat_selector"] = strat_to_reload
-                except Exception:
-                    pass
             if "risk" in cfg_dict:
                 r = cfg_dict["risk"]
                 for k in ["entry_start", "entry_end", "square_off_time"]:
@@ -493,8 +602,8 @@ def render_backtest_module():
                 st.session_state.risk = r
             if "cost" in cfg_dict:
                 st.session_state.cost = cfg_dict["cost"]
-            st.session_state.step = 2
-            st.sidebar.success("Config reloaded! Redirecting to Step 2...")
+            st.session_state.step = 1
+            st.sidebar.success("Config reloaded! Redirecting to Step 1...")
             st.rerun()
     else:
         st.sidebar.info(f"No executions found for '{selected_strat_filter}'. Complete a backtest to see history.")
@@ -549,34 +658,12 @@ def render_backtest_module():
 
 
     # ---------------- Wizard Steps ----------------
-    steps = ["1. Strategy Config", "2. Instrument & Run", "3. Results"]
-    st.progress(min(st.session_state.step / 3.0, 1.0))
-    col_tabs = st.columns(3)
+    steps = ["1. Strategy Config & Rules", "2. Results"]
+    st.progress(min(st.session_state.step / 2.0, 1.0))
+    col_tabs = st.columns(2)
     for i, name in enumerate(steps, 1):
-        disabled = (i == 3 and st.session_state.active_run is None)
+        disabled = (i == 2 and st.session_state.active_run is None)
         if col_tabs[i - 1].button(name, key=f"nav_tab_{i}", disabled=disabled):
-            if i == 2:
-                active_sname = (st.session_state.get("step1_strat_name_input_field") or st.session_state.get("strategy_name_input") or st.session_state.get("selected_strategy_name", "")).strip()
-                if active_sname:
-                    st.session_state.selected_strategy_name = active_sname
-                    st.session_state.strategy_name_input = active_sname
-                    try:
-                        st.session_state["step2_strat_selector"] = active_sname
-                    except Exception:
-                        pass
-            elif i == 1:
-                active_sname = (st.session_state.get("step2_strat_selector") or st.session_state.get("selected_strategy_name") or st.session_state.get("strategy_name_input", "")).strip()
-                if active_sname:
-                    st.session_state.selected_strategy_name = active_sname
-                    st.session_state.strategy_name_input = active_sname
-                    try:
-                        st.session_state["step1_strat_name_input_field"] = active_sname
-                    except Exception:
-                        pass
-                    try:
-                        st.session_state["step1_load_strat_select"] = active_sname
-                    except Exception:
-                        pass
             st.session_state.step = i
             st.rerun()
 
@@ -838,7 +925,7 @@ def render_backtest_module():
                 "raw_df": raw_df,
                 "custom_cfg": custom_cfg,
             }
-            st.session_state.step = 3
+            st.session_state.step = 2
             st.rerun()
 
         except Exception as e:
@@ -846,14 +933,14 @@ def render_backtest_module():
             logger.exception("Backtest execution error: %s", e)
             st.error(f"❌ Execution Failed: {str(e)}")
             st.info("Check your Upstox access token in .env, verify date ranges, and ensure network access.")
-            if st.button("⬅️ Return to Step 2"):
-                st.session_state.step = 2
+            if st.button("⬅️ Return to Step 1"):
+                st.session_state.step = 1
                 st.rerun()
 
 
-    def render_step_1_strategy_config():
+    def render_step_1_strategy_config(equities_df):
         st.header("Step 1: Strategy Configuration & Rules")
-        st.caption("Configure technical indicators, scoring weights, and risk guardrails. Save your configuration as a named Strategy in your Strategies-List.")
+        st.caption("Configure technical indicators, scoring weights, risk guardrails, and instrument selection. Save your complete strategy in your Strategies-List.")
 
         # Strategy Selection & Management Toolbar
         saved_strategies = list_strategy_names()
@@ -1443,143 +1530,11 @@ def render_backtest_module():
                 else:
                     cost["slippage_pct"] = st.number_input("Slippage Percent (0.0005 = 0.05%)", min_value=0.0, max_value=0.05, value=float(cost["slippage_pct"]), format="%.5f")
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        b_col1, b_col2 = st.columns([1, 2])
-        strat_save_name = (st.session_state.strategy_name_input or "").strip() or suggested_name
-
-        if b_col1.button("💾 Save Strategy", use_container_width=True):
-            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
-            st.session_state.selected_strategy_name = strat_save_name
-            st.session_state.strategy_name_input = strat_save_name
-            try:
-                st.session_state["step2_strat_selector"] = strat_save_name
-            except Exception:
-                pass
-            try:
-                st.session_state["step1_load_strat_select"] = strat_save_name
-            except Exception:
-                pass
-            try:
-                st.session_state["step1_strat_name_input_field"] = strat_save_name
-            except Exception:
-                pass
-            st.success(f"✅ Strategy '{strat_save_name}' saved to Strategies-List!")
-
-        if b_col2.button("💾 Save & Proceed to Instrument Selection ➡️", type="primary", use_container_width=True):
-            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost)
-            st.session_state.selected_strategy_name = strat_save_name
-            st.session_state.strategy_name_input = strat_save_name
-            try:
-                st.session_state["step2_strat_selector"] = strat_save_name
-            except Exception:
-                pass
-            try:
-                st.session_state["step1_load_strat_select"] = strat_save_name
-            except Exception:
-                pass
-            try:
-                st.session_state["step1_strat_name_input_field"] = strat_save_name
-            except Exception:
-                pass
-            st.session_state.step = 2
-            st.rerun()
-
-
-    def render_step_2_instrument_and_run(equities_df):
-        st.header("Step 2: Instrument & Period Selection")
-        st.caption("Select an active Strategy from your Strategies-List, choose the NSE equity, date range, and execute the backtest.")
-
-        saved_strats = list_strategy_names()
-        target_strat = (
-            st.session_state.get("selected_strategy_name")
-            or st.session_state.get("strategy_name_input")
-            or st.session_state.get("step1_strat_name_input_field")
-            or (saved_strats[0] if saved_strats else "EMA_RSI_MACD_Balanced")
-        ).strip()
-        if target_strat not in saved_strats:
-            saved_strats.insert(0, target_strat)
-        st.session_state["step2_strat_selector"] = target_strat
-        curr_idx = saved_strats.index(target_strat) if target_strat in saved_strats else 0
-        current_strat = target_strat
-
-        st.markdown("#### 🎯 Active Strategy Selection")
-        c_s1, c_s2, c_s3 = st.columns([3, 1, 1])
-
-        def on_step2_strategy_change():
-            chosen = st.session_state.get("step2_strat_selector")
-            if chosen:
-                load_strategy_into_session(chosen)
-                st.session_state.strategy_name_input = chosen
-                try:
-                    st.session_state["step1_strat_name_input_field"] = chosen
-                except Exception:
-                    pass
-
-        with c_s1:
-            chosen_strat = st.selectbox(
-                "Strategy Name (Strategies-List)",
-                saved_strats,
-                index=curr_idx,
-                key="step2_strat_selector",
-                on_change=on_step2_strategy_change,
-                help="Choose which saved strategy to test against historical data.",
-            )
-            if chosen_strat != current_strat:
-                load_strategy_into_session(chosen_strat)
-                st.session_state.strategy_name_input = chosen_strat
-                try:
-                    st.session_state["step1_strat_name_input_field"] = chosen_strat
-                except Exception:
-                    pass
-                st.rerun()
-        with c_s2:
-            st.write("")
-            st.write("")
-            if st.button("✏️ Edit Strategy", use_container_width=True, help="Modify indicator weights and risk parameters in Step 1"):
-                active_to_edit = chosen_strat or current_strat
-                load_strategy_into_session(active_to_edit)
-                st.session_state.selected_strategy_name = active_to_edit
-                st.session_state.strategy_name_input = active_to_edit
-                try:
-                    st.session_state["step1_strat_name_input_field"] = active_to_edit
-                except Exception:
-                    pass
-                try:
-                    st.session_state["step1_load_strat_select"] = active_to_edit
-                except Exception:
-                    pass
-                try:
-                    st.session_state["step2_strat_selector"] = active_to_edit
-                except Exception:
-                    pass
-                st.session_state.step = 1
-                st.rerun()
-        with c_s3:
-            st.write("")
-            st.write("")
-            if st.button("➕ New Strategy", use_container_width=True, help="Create a new strategy from scratch"):
-                reset_to_default_strategy()
-                suggested = auto_suggest_strategy_name(st.session_state.indicators)
-                st.session_state.strategy_name_input = suggested
-                try:
-                    st.session_state["step1_strat_name_input_field"] = suggested
-                except Exception:
-                    pass
-                st.session_state.step = 1
-                st.rerun()
-
-        active_inds = [k.replace('_enabled', '').upper() for k, v in st.session_state.indicators.items() if k.endswith('_enabled') and v]
-        cap = st.session_state.risk.get('capital', 100000.0)
-        tp = st.session_state.indicators.get('fixed_target_pct', st.session_state.risk.get('fixed_target_pct', 3))
-        sl = st.session_state.indicators.get('fixed_stoploss_pct', st.session_state.risk.get('fixed_stoploss_pct', 2))
-        st.info(
-            f"📌 **Active Strategy:** `{current_strat}` | "
-            f"**Active Indicators ({len(active_inds)}):** {', '.join(active_inds) if active_inds else 'None'} | "
-            f"**Capital:** ₹{cap:,.0f} | **Target / SL:** {tp}% / {sl}%"
-        )
+        # ==============================================================================
+        # LAST SECTION OF STEP 1: Instrument Configuration & Environment
+        # ==============================================================================
         st.markdown("---")
-
-        st.markdown("#### 🏢 2. Instrument Configuration")
+        st.markdown("#### 🏢 Instrument Configuration")
 
         seg_choice = st.radio(
             "Market Segment",
@@ -1845,14 +1800,71 @@ def render_backtest_module():
         with d4:
             st.session_state.allow_short = st.toggle("Allow Intraday Shorting", value=st.session_state.allow_short, key="backtest_allow_short")
 
+        # Proactive cache inspection to prevent date mismatch confusion
+        sym_clean = str(st.session_state.symbol).lower().replace(" ", "").replace("_", "")
+        possible_csvs = [
+            f"data/{st.session_state.symbol.lower()}_{st.session_state.timeframe}m.csv",
+            f"data/{sym_clean}_{st.session_state.timeframe}m.csv",
+            f"data/{st.session_state.symbol.lower()}_1m.csv",
+            f"data/{sym_clean}_1m.csv",
+            f"data/{st.session_state.symbol.lower()}_5m.csv",
+            f"data/{sym_clean}_5m.csv",
+        ]
+        found_cache = next((p for p in possible_csvs if os.path.exists(p)), None)
+        if found_cache:
+            try:
+                cdf_tail = pd.read_csv(found_cache)
+                if "timestamp" in cdf_tail.columns:
+                    c_dates_all = pd.to_datetime(cdf_tail["timestamp"]).dt.date
+                    min_d = c_dates_all.min()
+                    max_d = c_dates_all.max()
+                    req_start = st.session_state.start_date
+                    req_end = st.session_state.end_date
+                    if req_end < min_d or req_start > max_d:
+                        st.warning(
+                            f"⚠️ **Cache Range Alert**: Local cached file `{os.path.basename(found_cache)}` covers **{min_d}** to **{max_d}**. "
+                            f"Your requested date span (**{req_start}** to **{req_end}**) is outside local cache. "
+                            f"Live broker data will be queried, or adjust your dates to {min_d} to {max_d} for offline replay.",
+                            icon="⚠️",
+                        )
+                    else:
+                        st.caption(f"📁 Local cache available for {st.session_state.symbol}: **{min_d}** to **{max_d}** ({len(cdf_tail):,} candles).")
+            except Exception as _e:
+                pass
+
         st.markdown("<br>", unsafe_allow_html=True)
         b_col1, b_col2 = st.columns([1, 2])
-        if b_col1.button("⬅️ Back to Strategy Config (Step 1)", use_container_width=True, key="backtest_btn_step1"):
-            st.session_state.step = 1
-            st.rerun()
-
+        strat_save_name = (st.session_state.strategy_name_input or "").strip() or suggested_name
         can_run_backtest = bool(st.session_state.symbol) if is_fo else is_valid_isin
-        if b_col2.button("🚀 Run Backtest Now", type="primary", use_container_width=True, disabled=not can_run_backtest, key="backtest_btn_run"):
+
+        if b_col1.button("💾 Save Strategy", use_container_width=True, key="backtest_btn_save_strat"):
+            inst_cfg = get_current_instrument_config()
+            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost, instrument=inst_cfg)
+            st.session_state.selected_strategy_name = strat_save_name
+            st.session_state.strategy_name_input = strat_save_name
+            try:
+                st.session_state["step1_load_strat_select"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_strat_name_input_field"] = strat_save_name
+            except Exception:
+                pass
+            st.success(f"✅ Strategy '{strat_save_name}' saved with Instrument Configuration to Strategies-List!")
+
+        if b_col2.button("🚀 Save & Proceed to Run Backtest Now", type="primary", use_container_width=True, disabled=not can_run_backtest, key="backtest_btn_save_run"):
+            inst_cfg = get_current_instrument_config()
+            save_strategy(strat_save_name, st.session_state.indicators, st.session_state.risk, st.session_state.cost, instrument=inst_cfg)
+            st.session_state.selected_strategy_name = strat_save_name
+            st.session_state.strategy_name_input = strat_save_name
+            try:
+                st.session_state["step1_load_strat_select"] = strat_save_name
+            except Exception:
+                pass
+            try:
+                st.session_state["step1_strat_name_input_field"] = strat_save_name
+            except Exception:
+                pass
             execute_backtest_simulation()
 
 
@@ -1861,18 +1873,16 @@ def render_backtest_module():
     # STEP ROUTING & DISPATCH
     # ==============================================================================
     if st.session_state.step == 1:
-        render_step_1_strategy_config()
+        render_step_1_strategy_config(equities_df)
+    # ==============================================================================
+    # STEP 2: Results Screen (formerly Step 3)
+    # ==============================================================================
     elif st.session_state.step == 2:
-        render_step_2_instrument_and_run(equities_df)
-    # ==============================================================================
-    # STEP 3: Results Screen
-    # ==============================================================================
-    elif st.session_state.step == 3:
         res = st.session_state.active_run
         if not res:
             st.warning("No run results loaded.")
             if st.button("Start New Backtest"):
-                st.session_state.step = 2
+                st.session_state.step = 1
                 st.rerun()
             return
 
@@ -1939,6 +1949,8 @@ def render_backtest_module():
         if ind_cfg.get("bollinger_enabled", False): max_score_cfg += ind_cfg.get("bollinger_weight", 1)
         if ind_cfg.get("stoch_enabled", False): max_score_cfg += ind_cfg.get("stoch_weight", 1)
         if ind_cfg.get("obv_enabled", False): max_score_cfg += ind_cfg.get("obv_weight", 1)
+        if ind_cfg.get("higher_high_enabled", False): max_score_cfg += ind_cfg.get("higher_high_weight", 1)
+        if ind_cfg.get("lower_low_enabled", False): max_score_cfg += ind_cfg.get("lower_low_weight", 1)
         max_score_cfg = max(max_score_cfg, 1)
 
         long_th = ind_cfg.get("long_threshold", 5)
@@ -2441,16 +2453,12 @@ def render_backtest_module():
         st.markdown("<br>", unsafe_allow_html=True)
         res_b1, res_b2 = st.columns(2)
         run_strat = run_data.get("strategy_name") or run_data.get("strategy_version") or st.session_state.get("selected_strategy_name", "")
-        if res_b1.button("⬅️ Run Another Backtest (Step 2)", use_container_width=True):
+        if res_b1.button("⬅️ Run Another Backtest (Step 1)", use_container_width=True):
             if run_strat:
                 load_strategy_into_session(run_strat)
                 st.session_state.selected_strategy_name = run_strat
                 st.session_state.strategy_name_input = run_strat
-                try:
-                    st.session_state["step2_strat_selector"] = run_strat
-                except Exception:
-                    pass
-            st.session_state.step = 2
+            st.session_state.step = 1
             st.rerun()
         if res_b2.button("⚙️ Edit Strategy (Step 1)", use_container_width=True):
             if run_strat:
@@ -2463,10 +2471,6 @@ def render_backtest_module():
                     pass
                 try:
                     st.session_state["step1_load_strat_select"] = run_strat
-                except Exception:
-                    pass
-                try:
-                    st.session_state["step2_strat_selector"] = run_strat
                 except Exception:
                     pass
             st.session_state.step = 1

@@ -26,6 +26,7 @@ A professional algorithmic intraday trading, paper-trading, and backtesting syst
   - Step 5: Execution, KPI Dashboard (CAGR, Sharpe, Max Drawdown, Win Rate, Expectancy, Profit Factor, Total Costs), equity curves, trade audit tables, and CSV exports.
   - Sidebar: SQLite-backed execution history (last 10 runs stored in `data/backtest_runs.db`), with 1-click config reload.
 - **Execution & Paper Broker**: Complete SQLite audit trail for signals, orders, positions, and trades.
+- **Kotak Neo Live Trading & Gateway**: Full live execution with Kotak Neo API, including bracket orders (Market Entry, Limit Target, Stop-Loss), live 5-level market depth, real-time risk checks, and emergency square-off. Detailed in [docs/KOTAK_LIVE_TRADE_USE_CASES.md](docs/KOTAK_LIVE_TRADE_USE_CASES.md).
 - **Zero Lookahead Bias & Strict Intraday Risk Management**: ATR dynamic stop-losses, daily loss limits, exposure limits, and auto square-off at 15:15 IST.
 
 ---

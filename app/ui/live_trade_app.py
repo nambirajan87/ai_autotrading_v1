@@ -1,12 +1,12 @@
 import logging
 import os
 import sys
-import time as time_module
+import time as _time
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
-# Ensure project root is in sys.path
+# Ensure project root is in sys.path when executed via 'streamlit run'
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -24,6 +24,7 @@ try:
     HAS_PLOTLY = True
 except ImportError:
     go = None
+    make_subplots = None
     HAS_PLOTLY = False
 
 from app.data.historical_data import load_csv
@@ -31,1093 +32,1197 @@ from app.data.instrument_loader import (
     DEFAULT_INDEX_EXPIRIES,
     INDEX_LOT_SIZES,
     NIFTY_STANDARD_INSTRUMENTS,
-    find_equity_by_isin,
-    find_equity_by_symbol,
     load_nse_equities,
-    parse_expiry_info,
-    search_equities,
-    validate_isin,
 )
 from app.database.live_database import get_live_db
-from app.execution.live_trade_engine import LiveTradeEngine
-from app.gateways.gateway_factory import get_gateway, list_supported_gateways
+from app.gateways.gateway_factory import get_gateway
 from app.monitoring.audit_logger import log_audit_event, record_session_visit
-from app.strategy.custom_strategy import CustomStrategyConfig, calculate_custom_indicators
-from app.strategy.strategy_store import get_strategy, list_strategy_names
+from app.strategy.custom_strategy import (
+    CustomStrategyConfig,
+    calculate_custom_indicators,
+    score_custom_row,
+)
+from app.strategy.strategy_store import get_strategy, list_strategy_names, save_strategy
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_kotak_expiries(underlying: str = "NIFTY") -> list:
-    try:
-        gw = get_gateway("KOTAK")
-        if hasattr(gw, "get_expiries"):
-            exps = gw.get_expiries(underlying=underlying)
-            if exps:
-                return exps
-    except Exception as e:
-        logger.debug("Kotak expiries error: %s", e)
-    return DEFAULT_INDEX_EXPIRIES.get(underlying.upper(), DEFAULT_INDEX_EXPIRIES["NIFTY"])
+def check_market_trading_hours() -> tuple:
+    """
+    Validates regular Indian stock market hours (NSE/BSE).
+    Market hours: Monday to Friday, 09:15:00 to 15:30:00 IST.
+    Returns (is_open: bool, message: str).
+    """
+    now = datetime.now()
+    if now.weekday() >= 5:
+        day_name = "Saturday" if now.weekday() == 5 else "Sunday"
+        return False, f"Market Closed ({day_name} - Weekend). Regular market hours: 09:15 to 15:30 IST (Mon - Fri)."
+    now_time = now.time()
+    if now_time < time(9, 15, 0):
+        return False, f"Market Closed (Pre-market). Regular trading starts at 09:15:00 IST (Current time: {now.strftime('%H:%M:%S')})."
+    if now_time > time(15, 30, 0):
+        return False, f"Market Closed (Post-market). Regular trading ended at 15:30:00 IST (Current time: {now.strftime('%H:%M:%S')})."
+    return True, "Market Open (09:15:00 to 15:30:00 IST)."
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_kotak_option_chain(underlying: str = "NIFTY", expiry: Optional[str] = None, count: int = 250) -> dict:
-    try:
-        gw = get_gateway("KOTAK")
-        if hasattr(gw, "get_option_chain"):
-            return gw.get_option_chain(underlying=underlying, expiry=expiry, count=count)
-    except Exception as e:
-        logger.debug("Kotak option_chain error: %s", e)
-    return {}
+def parse_time_param(val, default_time: time) -> time:
+    """Safely parses a string or time object into datetime.time."""
+    if isinstance(val, time):
+        return val
+    if isinstance(val, str) and val.strip():
+        try:
+            parts = [int(p) for p in val.strip().split(":")]
+            return time(parts[0], parts[1], parts[2] if len(parts) > 2 else 0)
+        except Exception:
+            return default_time
+    return default_time
 
-
-@st.cache_data(ttl=60, show_spinner=False)
-def search_kotak_instruments(query: str, segment: str = "nse_fo") -> list:
-    try:
-        gw = get_gateway("KOTAK")
-        if hasattr(gw, "smart_search_instruments"):
-            return gw.smart_search_instruments(query=query, exchange_segment=segment)
-    except Exception as e:
-        logger.debug("Kotak smart_search error: %s", e)
-    return []
 
 def render_live_trade_module():
+    # Record visit for auditing
     record_session_visit()
 
-    # ---------------- Custom Styling ----------------
+    live_db = get_live_db()
+    gw = get_gateway("KOTAK")
+
+    # ---------------- Custom CSS ----------------
     st.markdown("""
     <style>
-        .live-card {
+        .metric-card {
             background: rgba(255, 255, 255, 0.04);
             border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 16px;
-            margin-bottom: 12px;
+            border-radius: 10px;
+            padding: 14px;
+            margin-bottom: 10px;
         }
-        .neon-pill-green {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 14px;
-            font-size: 0.85rem;
-            font-weight: 700;
-            background-color: rgba(0, 230, 118, 0.18);
-            color: #00e676;
-            border: 1px solid #00e676;
+        .active-trade-box {
+            background: linear-gradient(135deg, rgba(0, 230, 118, 0.15), rgba(38, 166, 154, 0.22));
+            border: 2px solid #00e676;
+            border-radius: 10px;
+            padding: 14px 18px;
+            margin-bottom: 16px;
+            animation: pulse-border 2s infinite;
         }
-        .neon-pill-red {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 14px;
-            font-size: 0.85rem;
-            font-weight: 700;
-            background-color: rgba(255, 82, 82, 0.18);
-            color: #ff5252;
-            border: 1px solid #ff5252;
+        .active-trade-box-short {
+            background: linear-gradient(135deg, rgba(255, 82, 82, 0.15), rgba(239, 83, 80, 0.22));
+            border: 2px solid #ff5252;
+            border-radius: 10px;
+            padding: 14px 18px;
+            margin-bottom: 16px;
+            animation: pulse-border-red 2s infinite;
         }
-        .neon-pill-blue {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 14px;
-            font-size: 0.85rem;
-            font-weight: 700;
-            background-color: rgba(0, 176, 255, 0.18);
-            color: #00b0ff;
-            border: 1px solid #00b0ff;
+        @keyframes pulse-border {
+            0% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(0, 230, 118, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(0, 230, 118, 0); }
         }
-        .neon-pill-purple {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 14px;
-            font-size: 0.85rem;
-            font-weight: 700;
-            background-color: rgba(124, 77, 255, 0.18);
-            color: #b388ff;
-            border: 1px solid #7c4dff;
-        }
-        .pnl-big-profit {
-            font-size: 2.2rem;
-            font-weight: 800;
-            color: #00e676;
-            letter-spacing: -0.5px;
-        }
-        .pnl-big-loss {
-            font-size: 2.2rem;
-            font-weight: 800;
-            color: #ff5252;
-            letter-spacing: -0.5px;
-        }
-        .pnl-big-neutral {
-            font-size: 2.2rem;
-            font-weight: 800;
-            color: #bdbdbd;
-            letter-spacing: -0.5px;
+        @keyframes pulse-border-red {
+            0% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0.4); }
+            70% { box-shadow: 0 0 0 10px rgba(255, 82, 82, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(255, 82, 82, 0); }
         }
     </style>
     """, unsafe_allow_html=True)
 
-
-    # ---------------- State Initialization ----------------
-    def init_live_state():
-        if "live_gateway" not in st.session_state:
-            st.session_state.live_gateway = "🟢 Upstox Pro"
-        if "live_execution_mode" not in st.session_state:
-            st.session_state.live_execution_mode = "🛡️ Live Paper Sandbox"
-        if "live_strategy_name" not in st.session_state:
-            strats = list_strategy_names()
-            st.session_state.live_strategy_name = strats[0] if strats else "EMA_RSI_MACD_Balanced"
-        if "live_symbol" not in st.session_state:
-            st.session_state.live_symbol = "NIFTY26OCT22500PE"
-        if "live_isin" not in st.session_state:
-            st.session_state.live_isin = "INF000513319"
-        if "live_instrument_key" not in st.session_state:
-            st.session_state.live_instrument_key = "NSE_FO|51331"
-        if "live_equity_name" not in st.session_state:
-            st.session_state.live_equity_name = "NIFTY 27-OCT-2026 22500 PE"
-        if "live_timeframe" not in st.session_state:
-            st.session_state.live_timeframe = 1
-        if "live_capital" not in st.session_state:
-            st.session_state.live_capital = 100_000.0
-        if "live_max_daily_loss" not in st.session_state:
-            st.session_state.live_max_daily_loss = 2_000.0
-        if "live_lot_size" not in st.session_state:
-            st.session_state.live_lot_size = 65
-        if "live_engine" not in st.session_state:
-            st.session_state.live_engine = None
-        if "live_streaming_active" not in st.session_state:
-            st.session_state.live_streaming_active = False
-        if "live_candles" not in st.session_state:
-            st.session_state.live_candles = None
-        if "live_candle_cursor" not in st.session_state:
-            st.session_state.live_candle_cursor = 0
-
-
-    init_live_state()
-
-    try:
-        equities_df = load_nse_equities()
-    except Exception:
-        equities_df = pd.DataFrame()
-
-    live_db = get_live_db()
-
-    # ---------------- Sidebar ----------------
+    # ---------------- 1. Sidebar Navigation Panel ----------------
     st.sidebar.title("⚡ Live Trading Terminal")
-    st.sidebar.caption("Signal-Bar Close Execution Engine")
+    st.sidebar.caption("Kotak Neo Live Algorithmic Execution Terminal")
 
-    # Gateway Toggle
-    st.sidebar.markdown("### 🌐 Broker Gateway")
-    gw_opts = ["🟢 Upstox Pro", "🔵 Kotak Neo"]
-    cur_gw_idx = 0 if "Upstox" in st.session_state.live_gateway else 1
-    sel_gw = st.sidebar.radio("Active Broker Gateway", gw_opts, index=cur_gw_idx, key="live_gw_radio")
-    st.session_state.live_gateway = sel_gw
+    st.sidebar.markdown("### 🎯 Strategy Filter")
+    saved_strats = list_strategy_names()
+    db_strats = live_db.get_all_strategy_names()
+    all_strats = sorted(list(set(saved_strats + db_strats)))
+    if not all_strats:
+        all_strats = ["ADX", "EMA_RSI_MACD_Balanced"]
 
-    gw_key = "KOTAK" if "Kotak" in sel_gw else "UPSTOX"
-    gateway = get_gateway(gw_key)
-    gw_info = gateway.get_connection_info()
+    if "live_selected_strategy" not in st.session_state or st.session_state.live_selected_strategy not in all_strats:
+        st.session_state.live_selected_strategy = "ADX" if "ADX" in all_strats else all_strats[0]
 
-    if gw_info["connected"]:
-        st.sidebar.success(f"**{gw_info['gateway']}**: Online ({gw_info['latency_ms']}ms)")
-    else:
-        st.sidebar.warning(f"**{gw_info['gateway']}**: Sandbox / Paper Ready")
+    selected_strat = st.sidebar.selectbox(
+        "Strategy Name",
+        all_strats,
+        index=all_strats.index(st.session_state.live_selected_strategy),
+        key="live_sidebar_strat_select",
+    )
+    st.session_state.live_selected_strategy = selected_strat
 
-    st.sidebar.markdown("---")
-
-    # Execution Mode Toggle (Paper Sandbox vs Real Money)
-    st.sidebar.markdown("### 🛡️ Order Routing Mode")
-    mode_opts = ["🛡️ Live Paper Sandbox", "⚠️ Live Broker API (Real Money)"]
-    sel_mode = st.sidebar.radio("Routing Mode", mode_opts, index=0 if "Paper" in st.session_state.live_execution_mode else 1)
-    st.session_state.live_execution_mode = sel_mode
-
-    is_real = "Real Money" in sel_mode
-    if hasattr(gateway, "live_order_routing"):
-        gateway.live_order_routing = is_real
-    if st.session_state.live_engine is not None and hasattr(st.session_state.live_engine.gateway, "live_order_routing"):
-        st.session_state.live_engine.gateway.live_order_routing = is_real
-
-    if is_real:
-        st.sidebar.error("⚠️ REAL MONEY MODE ACTIVE! Verified market orders will route directly to Kotak Neo exchange.")
-    else:
-        st.sidebar.info("🛡️ PAPER SANDBOX MODE: Simulated orders with zero capital risk.")
-
-    if "Kotak" in sel_gw:
-        if st.sidebar.button("🔐 Re-authenticate Kotak 2FA", use_container_width=True, help="Refreshes 2FA TOTP session token with Kotak Neo"):
-            with st.sidebar:
-                with st.spinner("Connecting to Kotak Neo 2FA..."):
-                    if gateway.login():
-                        st.success("✅ Kotak Neo Authenticated & Session Token Active!")
-                    else:
-                        st.error("❌ 2FA Login failed. Verify credentials in .env")
+    if st.sidebar.button("👁️ View Run", type="primary", use_container_width=True, key="live_btn_view_run"):
+        st.session_state.live_selected_strategy = selected_strat
+        st.rerun()
 
     st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔵 Kotak Neo Live Broker")
+    gw_info = gw.get_connection_info()
+    if gw_info.get("connected"):
+        st.sidebar.success(f"**Kotak Neo API**: Connected & Ready ({gw_info.get('latency_ms', 38)}ms)")
+    else:
+        st.sidebar.warning("**Kotak Neo API**: Session Ready / Sandbox Mode")
 
-
-    # ---------------- Top Navigation & Status Bar ----------------
-    t_col1, t_col2, t_col3, t_col4 = st.columns([3, 2, 2, 2])
-    with t_col1:
-        st.title("⚡ AI Live Trading Terminal")
-        st.caption("High-frequency candle listener with instant Signal-Bar Close market order routing.")
-
-    with t_col2:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.metric("System Clock (IST)", now_str)
-
-    with t_col3:
-        is_live = st.session_state.live_engine is not None and st.session_state.live_engine.is_active
-        st.metric("Engine State", "🟢 ARMED & SCANNING" if is_live else "⚪ STANDBY")
-
-    with t_col4:
-        gw_pill = "neon-pill-blue" if "Upstox" in sel_gw else "neon-pill-purple"
-        st.markdown(f"<div style='margin-top: 15px;'><span class='{gw_pill}'>{sel_gw}</span></div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-
-
-    # ---------------- Tab Layout ----------------
-    tab_desk, tab_config, tab_history = st.tabs([
-        "🖥️ Live Trading Cockpit",
-        "⚙️ Strategy & Gateway Setup",
-        "📜 Live Executed Journal",
-    ])
-
-
-    # ==============================================================================
-    # TAB 1: LIVE TRADING COCKPIT
-    # ==============================================================================
-    with tab_desk:
-        engine: Optional[LiveTradeEngine] = st.session_state.live_engine
-
-        if engine is None:
-            st.markdown("### 🚀 Arm Live Algorithmic Session")
-            st.caption("Select your strategy and configure order parameters before engaging the live execution engine.")
-
-            available_strats = list_strategy_names()
-            cur_strat_idx = available_strats.index(st.session_state.live_strategy_name) if st.session_state.live_strategy_name in available_strats else 0
-
-            launch_c1, launch_c2 = st.columns(2)
-            with launch_c1:
-                sel_strat = st.selectbox("Strategy to Engage", available_strats, index=cur_strat_idx, key="live_cockpit_strat_select")
-                st.session_state.live_strategy_name = sel_strat
-                strat_dict = get_strategy(sel_strat) or {}
-                ind_cfg = strat_dict.get("indicators", {})
-                tp_pct = float(ind_cfg.get("fixed_target_pct", 30.0))
-                sl_pct = float(ind_cfg.get("fixed_stoploss_pct", 5.0))
-                side_rule = ind_cfg.get("trade_side", "BOTH")
-                tsl_on = bool(ind_cfg.get("trailing_sl_enabled", False))
-                st.info(
-                    f"🎯 Target: **{tp_pct}%** | Stop Loss: **{sl_pct}%** | Side: **{side_rule}** | Trailing SL: **{'Model B Active' if tsl_on else 'Off'}**"
-                )
-
-            with launch_c2:
-                st.markdown(f"**🌐 Active Gateway:** `{gateway.gateway_name}`")
-                st.markdown(f"**🛡️ Execution Mode:** `{st.session_state.live_execution_mode}`")
-                st.markdown(f"**📈 Active Instrument:** `{st.session_state.live_symbol}` ({st.session_state.live_equity_name})")
-                st.caption(f"Timeframe: **{st.session_state.live_timeframe}m** | Lot Size: **{st.session_state.live_lot_size}** | Key: `{st.session_state.live_instrument_key}`")
-
-            if st.button("🚀 Arm & Launch Live Trading Engine Now", type="primary", use_container_width=True):
-                strat_name = st.session_state.live_strategy_name
-                strat_dict = get_strategy(strat_name) or {}
-                ind_cfg = strat_dict.get("indicators", {})
-                tp_pct = float(ind_cfg.get("fixed_target_pct", 30.0))
-                sl_pct = float(ind_cfg.get("fixed_stoploss_pct", 5.0))
-                tsl_on = bool(ind_cfg.get("trailing_sl_enabled", False))
-                trail_beyond = bool(ind_cfg.get("trail_beyond_target", False))
-
-                new_engine = LiveTradeEngine(
-                    gateway=gateway,
-                    strategy_name=strat_name,
-                    symbol=st.session_state.live_symbol,
-                    isin=st.session_state.live_isin,
-                    timeframe=st.session_state.live_timeframe,
-                    capital=st.session_state.live_capital,
-                    lot_size=st.session_state.live_lot_size,
-                    target_pct=tp_pct,
-                    stoploss_pct=sl_pct,
-                    trailing_sl_enabled=tsl_on,
-                    trail_beyond_target=trail_beyond,
-                    max_daily_loss=float(st.session_state.get("live_max_daily_loss", 2_000.0)),
-                )
-
-                # Fetch and pre-warm engine with recent history
-                try:
-                    tf = new_engine.timeframe
-                    inst = st.session_state.live_instrument_key
-                    today = date.today()
-                    raw = gateway.fetch_historical_candles(new_engine.symbol, inst, tf, today - timedelta(days=5), today)
-                    if raw is not None and not raw.empty:
-                        st.session_state.live_candles = raw
-                        warm_cursor = max(0, len(raw) - 1)
-                        st.session_state.live_candle_cursor = warm_cursor
-                        new_engine.warmup(raw.iloc[:warm_cursor])
-                except Exception as e:
-                    logger.debug("Live engine initial warmup error: %s", e)
-
-                st.session_state.live_engine = new_engine
-                st.rerun()
-
-        else:
-            # Emergency Controls & KPI Bar
-            kpi_s, kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns([3, 2, 2, 2, 2, 2])
-            kpi_s.metric("Active Strategy", engine.strategy_name)
-            kpi1.metric("Gateway", engine.gateway.gateway_name)
-            kpi2.metric("Symbol", engine.symbol, f"{engine.timeframe}m Timeframe")
-            kpi3.metric("Trades Executed", engine.total_trades)
-            kpi4.metric("Realized P&L", f"₹{engine.daily_pnl:+,.2f}")
-
-            with kpi5:
-                if st.button("🚨 KILL SWITCH", type="primary", use_container_width=True, help="Instantly exits all positions and halts engine"):
-                    engine.emergency_square_off()
-                    st.warning("⚠️ KILL SWITCH TRIGGERED: All positions closed at market, engine halted!")
-                    st.rerun()
-                if st.button("🔄 Disarm / Switch", use_container_width=True, help="Disarm engine and select a different strategy"):
-                    st.session_state.live_engine = None
-                    st.session_state.live_streaming_active = False
-                    st.rerun()
-
-            strat_dict = get_strategy(engine.strategy_name) or {}
-            ind_cfg = strat_dict.get("indicators", {})
-            long_th = ind_cfg.get("long_threshold", 1)
-            short_th = ind_cfg.get("short_threshold", -1)
-            side_rule = ind_cfg.get("trade_side", "BOTH")
-            last_sig = engine.engine.latest_signal
-            sig_disp = f"Latest Bar: <b>{last_sig.score:+d} pts</b> (<code>{last_sig.decision}</code>)" if last_sig else "Awaiting candle evaluation"
-
-            st.markdown(
-                f"<div style='background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 10px 16px; margin-top: 6px; margin-bottom: 12px; font-size: 0.88rem; display: flex; justify-content: space-between; align-items: center;'>"
-                f"<div>⚡ <b>Rules:</b> LONG Entry ≥ <b>+{long_th}</b> pts | SHORT Entry ≤ <b>{short_th}</b> pts | Side: <b>{side_rule}</b> | Target: <b>+{engine.target_pct}%</b> | SL: <b>-{engine.stoploss_pct}%</b></div>"
-                f"<div>📡 <b>Mode:</b> <span style='color: #00e676;'><b>{st.session_state.live_execution_mode}</b></span> | {sig_disp}</div>"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-
-            # Active Position Cockpit
-            pos = engine.open_position
-            if pos:
-                side = pos["side"]
-                qty = pos["quantity"]
-                entry_p = pos["entry_price"]
-                entry_t = pos["entry_time"]
-                sl_p = pos["stop_loss"]
-                tp_p = pos["target"]
-                current_p = entry_p  # fallback
-
-                # Current price from last candle or LTP
-                if st.session_state.live_candles is not None and not st.session_state.live_candles.empty:
-                    current_p = float(st.session_state.live_candles.iloc[-1]["close"])
-
-                unrealized = round(qty * (current_p - entry_p) if side == "LONG" else qty * (entry_p - current_p), 2)
-                pnl_class = "pnl-big-profit" if unrealized > 0 else ("pnl-big-loss" if unrealized < 0 else "pnl-big-neutral")
-
-                st.markdown(f"""
-                <div class="live-card" style="border-left: 5px solid {'#00e676' if side == 'LONG' else '#ff5252'};">
-                    <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <div>
-                            <span class="{ 'neon-pill-green' if side == 'LONG' else 'neon-pill-red' }">{side} {qty} QTY</span>
-                            &nbsp;&nbsp;<b>{engine.symbol}</b> | Signal Time: <code>{pos['signal_time']}</code>
-                            <div style="margin-top: 5px; color: #bdbdbd; font-size: 0.9rem;">
-                                Verified Fill Price: <b>₹{entry_p:.2f}</b> | Fill Time: <b>{entry_t}</b>
-                            </div>
-                        </div>
-                        <div style="text-align: right;">
-                            <div style="font-size: 0.85rem; color: #888;">UNREALIZED MTM P&L</div>
-                            <div class="{pnl_class}">₹{unrealized:+,.2f}</div>
-                        </div>
-                    </div>
-                    <div style="margin-top: 15px; display: flex; gap: 20px; font-size: 0.9rem;">
-                        <div>🎯 Target: <b>₹{tp_p:.2f}</b> (+{engine.target_pct}%)</div>
-                        <div>🛑 Stop Loss: <b>₹{sl_p:.2f}</b> (-{engine.stoploss_pct}%)</div>
-                        <div>📈 Current Market: <b>₹{current_p:.2f}</b></div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                last_trades = live_db.get_trades(session_id=engine.session_id)
-                if last_trades:
-                    lt = last_trades[-1]
-                    pnl_col = "#00e676" if float(lt.get("net_pnl", 0)) >= 0 else "#ff5252"
-                    st.markdown(f"""
-                    <div class="live-card" style="padding: 18px 24px; border-left: 5px solid {pnl_col};">
-                        <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>
-                                <span style="background: rgba(255,255,255,0.08); padding: 3px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">LAST TRADE SQUARED OFF</span>
-                                &nbsp;&nbsp;<b>{lt.get('side')} {lt.get('quantity')} QTY</b> ({lt.get('symbol')})
-                                <div style="margin-top: 4px; color: #bdbdbd; font-size: 0.85rem;">
-                                    Fill: ₹{float(lt.get('entry_price', 0)):.2f} &rarr; Exit: ₹{float(lt.get('exit_price', 0)):.2f} ({lt.get('exit_reason')}) | Exit Time: {lt.get('exit_time')}
-                                </div>
-                            </div>
-                            <div style="text-align: right;">
-                                <div style="font-size: 0.8rem; color: #888;">REALIZED NET P&L</div>
-                                <div style="font-size: 1.25rem; font-weight: 700; color: {pnl_col};">₹{float(lt.get('net_pnl', 0)):+,.2f}</div>
-                            </div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
+    if st.sidebar.button("🔐 Re-authenticate Kotak 2FA", use_container_width=True, help="Refreshes 2FA TOTP session token with Kotak Neo"):
+        with st.sidebar:
+            with st.spinner("Connecting to Kotak Neo 2FA..."):
+                if gw.login():
+                    st.success("✅ Kotak Neo Authenticated & Session Token Active!")
                 else:
-                    st.markdown("""
-                    <div class="live-card" style="text-align: center; padding: 25px;">
-                        <h4 style="color: #bdbdbd; margin: 0;">⚪ No Open Position</h4>
-                        <p style="color: #757575; margin: 5px 0 0 0;">Scanning completed candles. Market order will execute immediately upon Signal-Bar Close or Manual Buy.</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-            st.markdown("---")
-
-            # 1. Real-Time Live Candle Synchronizer (Zero-Lag Direct Broker Query)
-            tf = engine.timeframe
-            inst = st.session_state.live_instrument_key
-            today = date.today()
-
-            # Always fetch real-time fresh intraday candles from broker
-            try:
-                fresh = gateway.fetch_historical_candles(engine.symbol, inst, tf, today - timedelta(days=2), today)
-                if fresh is not None and not fresh.empty:
-                    old_df = st.session_state.live_candles
-                    old_len = len(old_df) if old_df is not None else 0
-                    st.session_state.live_candles = fresh
-                    st.session_state.live_candle_cursor = len(fresh)
-                    # Automatically evaluate any newly closed candles in strategy engine
-                    if old_len == 0 and len(fresh) > 1:
-                        engine.warmup(fresh.iloc[:-1])
-                    elif len(fresh) > old_len > 0:
-                        for i in range(old_len, len(fresh)):
-                            engine.on_candle_close(fresh.iloc[i])
-            except Exception as e:
-                logger.debug("Live sync note: %s", e)
-
-            if st.session_state.live_candles is None or st.session_state.live_candles.empty:
-                # Fallback to local cached data if broker feed unavailable
-                fallbacks = [
-                    f"data/{engine.symbol.lower()}_{tf}m.csv",
-                    f"data/nifty26oct22500pe_1m.csv",
-                    f"data/reliance_5m.csv",
-                ]
-                for fb in fallbacks:
-                    if os.path.exists(fb):
-                        raw = load_csv(fb)
-                        st.session_state.live_candles = raw
-                        st.session_state.live_candle_cursor = len(raw)
-                        engine.warmup(raw.iloc[:-1])
-                        break
-
-            # 2. Level-2 Live Market Depth & Order Book Feed (Direct from Broker)
-            depth_data = gateway.get_live_market_depth(engine.symbol, inst)
-            live_ltp = float(depth_data.get("ltp") or 0.0)
-            if live_ltp <= 0 and st.session_state.live_candles is not None and not st.session_state.live_candles.empty:
-                live_ltp = float(st.session_state.live_candles.iloc[-1]["close"])
-
-            # 3. Real-Time HUD Ticker Bar
-            c_q1, c_q2, c_q3, c_q4, c_q5 = st.columns([3, 2, 2, 2, 3])
-            tick_time = depth_data.get("timestamp", datetime.now().strftime("%H:%M:%S"))
-            c_q1.metric("Live Tick (LTP)", f"₹{live_ltp:,.2f}", f"Feed: {depth_data.get('status')} @ {tick_time}")
-            if st.session_state.live_candles is not None and not st.session_state.live_candles.empty:
-                today_df = st.session_state.live_candles
-                c_q2.metric("Day High", f"₹{max(today_df['high'].max(), live_ltp):,.2f}")
-                c_q3.metric("Day Low", f"₹{min(today_df['low'].min(), live_ltp):,.2f}")
-                c_q4.metric("Session Volume", f"{int(depth_data.get('volume', today_df['volume'].sum())):,}")
-            else:
-                c_q2.metric("Day High", "₹--")
-                c_q3.metric("Day Low", "₹--")
-                c_q4.metric("Session Volume", "--")
-
-            last_sig = engine.engine.latest_signal
-            sig_score = last_sig.score if last_sig else 0
-            sig_dec = last_sig.decision if last_sig else "HOLD"
-            c_q5.metric("Consensus Score", f"{sig_score:+d} pts", f"Stance: {sig_dec}")
-
-            # 4. Interactive Plotly Candlestick + Volume Chart with Synthesized Forming Bar
-            if st.session_state.live_candles is not None and not st.session_state.live_candles.empty and HAS_PLOTLY:
-                candles_all = st.session_state.live_candles.copy()
-
-                # Synthesize live forming candle from real-time tick to eliminate 10+ min lag!
-                if live_ltp > 0 and not candles_all.empty:
-                    last_c = candles_all.iloc[-1]
-                    now_min_str = datetime.now().strftime("%Y-%m-%d %H:%M:00")
-                    if str(last_c["timestamp"])[:16] == now_min_str[:16]:
-                        candles_all.iloc[-1, candles_all.columns.get_loc("close")] = live_ltp
-                        candles_all.iloc[-1, candles_all.columns.get_loc("high")] = max(float(candles_all.iloc[-1]["high"]), live_ltp)
-                        candles_all.iloc[-1, candles_all.columns.get_loc("low")] = min(float(candles_all.iloc[-1]["low"]), live_ltp)
-                    else:
-                        forming_row = pd.DataFrame([{
-                            "timestamp": now_min_str,
-                            "open": float(last_c["close"]),
-                            "high": max(float(last_c["close"]), live_ltp),
-                            "low": min(float(last_c["close"]), live_ltp),
-                            "close": live_ltp,
-                            "volume": int(depth_data.get("volume", 500)),
-                        }])
-                        candles_all = pd.concat([candles_all, forming_row], ignore_index=True)
-
-                display_df = candles_all.tail(60).copy()
-
-                ema9 = display_df["close"].ewm(span=9, adjust=False).mean()
-                ema21 = display_df["close"].ewm(span=21, adjust=False).mean()
-
-                fig = make_subplots(
-                    rows=2, cols=1,
-                    shared_xaxes=True,
-                    vertical_spacing=0.04,
-                    subplot_titles=(f"📈 Live Zero-Lag Stream: {engine.symbol} ({engine.timeframe}m)", "📊 Real-Time Volume"),
-                    row_heights=[0.75, 0.25],
-                )
-
-                fig.add_trace(go.Candlestick(
-                    x=display_df["timestamp"].astype(str),
-                    open=display_df["open"],
-                    high=display_df["high"],
-                    low=display_df["low"],
-                    close=display_df["close"],
-                    name=engine.symbol,
-                    increasing_line_color="#00e676",
-                    decreasing_line_color="#ff5252",
-                ), row=1, col=1)
-
-                fig.add_trace(go.Scatter(
-                    x=display_df["timestamp"].astype(str),
-                    y=ema9,
-                    mode="lines",
-                    name="EMA 9 (Fast)",
-                    line=dict(color="#00e5ff", width=1.5),
-                ), row=1, col=1)
-
-                fig.add_trace(go.Scatter(
-                    x=display_df["timestamp"].astype(str),
-                    y=ema21,
-                    mode="lines",
-                    name="EMA 21 (Slow)",
-                    line=dict(color="#ffd600", width=1.5),
-                ), row=1, col=1)
-
-                bar_colors = ["#00e676" if c >= o else "#ff5252" for c, o in zip(display_df["close"], display_df["open"])]
-                fig.add_trace(go.Bar(
-                    x=display_df["timestamp"].astype(str),
-                    y=display_df["volume"],
-                    marker_color=bar_colors,
-                    name="Volume",
-                    opacity=0.7,
-                ), row=2, col=1)
-
-                if engine.open_position:
-                    entry_p = engine.open_position["entry_price"]
-                    side = engine.open_position["side"]
-                    fig.add_hline(y=entry_p, line_dash="dash", line_color="#2979ff", annotation_text=f"Entry: ₹{entry_p}", row=1, col=1)
-                    if engine.open_position.get("stop_loss"):
-                        fig.add_hline(y=engine.open_position["stop_loss"], line_dash="dot", line_color="#ff5252", annotation_text="SL", row=1, col=1)
-                    if engine.open_position.get("target"):
-                        fig.add_hline(y=engine.open_position["target"], line_dash="dot", line_color="#00e676", annotation_text="TP", row=1, col=1)
-
-                fig.update_layout(
-                    template="plotly_dark",
-                    height=450,
-                    margin=dict(l=10, r=10, t=30, b=10),
-                    xaxis_rangeslider_visible=False,
-                    xaxis2_rangeslider_visible=False,
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                )
-                st.plotly_chart(fig, use_container_width=True)
-
-            # 5. Live Level-2 Order Book (Market Depth & Orders)
-            st.markdown("#### 📖 Live Level-2 Order Book (Market Depth & Real-Time Orders)")
-            bids = depth_data.get("bids", [])
-            asks = depth_data.get("asks", [])
-            tot_b = depth_data.get("total_buy", sum(b.get("quantity", 0) for b in bids))
-            tot_s = depth_data.get("total_sell", sum(a.get("quantity", 0) for a in asks))
-            spread_val = depth_data.get("spread", 0.0)
-
-            ob_c1, ob_c2 = st.columns(2)
-            with ob_c1:
-                st.markdown(f"**🟢 Buyer Bids (5-Level)** &nbsp;|&nbsp; Total Buy Qty: **{tot_b:,}**")
-                if bids:
-                    b_df = pd.DataFrame(bids)
-                    b_df.columns = ["Orders", "Quantity", "Bid Price (₹)"]
-                    st.dataframe(b_df.style.format({"Bid Price (₹)": "₹{:.2f}", "Quantity": "{:,}"}), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Awaiting bid feed...")
-
-            with ob_c2:
-                st.markdown(f"**🔴 Seller Asks (5-Level)** &nbsp;|&nbsp; Total Sell Qty: **{tot_s:,}**")
-                if asks:
-                    a_df = pd.DataFrame(asks)
-                    a_df.columns = ["Orders", "Quantity", "Ask Price (₹)"]
-                    st.dataframe(a_df.style.format({"Ask Price (₹)": "₹{:.2f}", "Quantity": "{:,}"}), use_container_width=True, hide_index=True)
-                else:
-                    st.caption("Awaiting ask feed...")
-
-            # Depth Ratio & Spread Bar
-            if (tot_b + tot_s) > 0:
-                b_pct = int((tot_b / (tot_b + tot_s)) * 100)
-                s_pct = 100 - b_pct
-                st.markdown(f"""
-                <div style="margin-top: 5px; margin-bottom: 15px; padding: 10px 14px; background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;">
-                    <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 5px;">
-                        <span style="color: #00e676; font-weight: 600;">Buyers: {b_pct}% ({tot_b:,})</span>
-                        <span style="color: #ffd600; font-weight: 600;">Bid-Ask Spread: ₹{spread_val:.2f}</span>
-                        <span style="color: #ff5252; font-weight: 600;">Sellers: {s_pct}% ({tot_s:,})</span>
-                    </div>
-                    <div style="width: 100%; height: 8px; background: #ff5252; border-radius: 4px; overflow: hidden;">
-                        <div style="width: {b_pct}%; height: 100%; background: #00e676;"></div>
-                    </div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # Session Order Book (Executed and Open Orders)
-            if hasattr(gateway, "sync_live_broker_records"):
-                gateway.sync_live_broker_records()
-
-            db_orders = live_db.get_orders(session_id=engine.session_id)
-            gw_orders = engine.gateway.get_orders() if engine.gateway else gateway.get_orders()
-
-            merged_orders = []
-            seen_ids = set()
-            for o in gw_orders:
-                if o.order_id not in seen_ids:
-                    seen_ids.add(o.order_id)
-                    merged_orders.append({
-                        "Order ID": o.order_id,
-                        "Time": str(o.timestamp)[-8:] if o.timestamp else "-",
-                        "Side": o.side,
-                        "Quantity": o.quantity,
-                        "Price": f"₹{o.price:.2f}",
-                        "Status": o.status,
-                        "Charges": f"₹{o.charges:.2f}",
-                        "Fill Time": str(o.fill_time)[-8:] if o.fill_time else "-",
-                        "Reason": o.reason or "Broker Fill",
-                    })
-
-            for do in db_orders:
-                oid = do.get("order_id", "")
-                if oid and oid not in seen_ids:
-                    seen_ids.add(oid)
-                    merged_orders.append({
-                        "Order ID": oid,
-                        "Time": str(do.get("timestamp", ""))[-8:] if do.get("timestamp") else "-",
-                        "Side": do.get("side", ""),
-                        "Quantity": do.get("quantity", 0),
-                        "Price": f"₹{float(do.get('price', 0)):.2f}",
-                        "Status": do.get("status", "FILLED"),
-                        "Charges": "₹0.00",
-                        "Fill Time": str(do.get("timestamp", ""))[-8:] if do.get("timestamp") else "-",
-                        "Reason": do.get("reason", ""),
-                    })
-
-            st.markdown("##### 📋 Broker Order Book & Real-Time Fills")
-            if merged_orders:
-                st.dataframe(pd.DataFrame(merged_orders), use_container_width=True, hide_index=True)
-            else:
-                st.info("⚪ No orders placed yet in this session. Orders executed or rejected will be logged here in real time.")
-
-            # 6. Action Hub & High-Frequency Stream Controls
-            st.markdown("#### ⚡ Real-Time Execution Actions & Controls")
-            c_act1, c_act2, c_act3, c_act4, c_act5 = st.columns([2, 2, 2, 2, 2])
-
-            with c_act1:
-                if st.button("🟢 Force Instant BUY (1 Lot)", type="primary", use_container_width=True, help="Executes an immediate BUY Market order through the active Gateway"):
-                    res = engine.force_manual_entry("BUY")
-                    if res.get("status") == "SUCCESS":
-                        st.toast(f"✅ Immediate BUY Order Filled at ₹{res.get('fill_price')}!", icon="🟢")
-                        st.rerun()
-                    else:
-                        st.error(res.get("message"))
-
-            with c_act2:
-                if st.button("🔴 Force Instant SELL (1 Lot)", type="secondary", use_container_width=True, help="Executes an immediate SELL Market order through the active Gateway"):
-                    res = engine.force_manual_entry("SELL")
-                    if res.get("status") == "SUCCESS":
-                        st.toast(f"✅ Immediate SELL Order Filled at ₹{res.get('fill_price')}!", icon="🔴")
-                        st.rerun()
-                    else:
-                        st.error(res.get("message"))
-
-            with c_act3:
-                if st.button("⚡ Step / Evaluate Next Bar", use_container_width=True, help="Feeds the next completed candle into VOL_Consensus rules engine"):
-                    candles_df = st.session_state.live_candles
-                    if candles_df is not None and st.session_state.live_candle_cursor < len(candles_df):
-                        next_candle = candles_df.iloc[st.session_state.live_candle_cursor]
-                        st.session_state.live_candle_cursor += 1
-                        result = engine.on_candle_close(next_candle)
-                        st.success(f"Processed Candle: `{next_candle['timestamp']}` | Close: ₹{next_candle['close']} | Signal: `{result.get('signal')}` (Score: {result.get('score')})")
-                        st.rerun()
-                    else:
-                        st.warning("All available replay candles completed.")
-
-            with c_act4:
-                if engine.open_position:
-                    if st.button("⏹️ Square Off Position Now", use_container_width=True, help="Immediately squares off open position at current market price"):
-                        res = engine.force_manual_exit("MANUAL_SQUARE_OFF")
-                        if res.get("status") == "SUCCESS":
-                            st.toast(f"⏹️ Position squared off! Net P&L: ₹{res.get('net_pnl'):+,.2f}", icon="⏹️")
-                            st.rerun()
-                else:
-                    if st.button("🔄 Sync Live Broker Feeds", use_container_width=True, help="Forces an instant fetch of the newest live candles from Kotak Neo"):
-                        st.toast("⚡ Syncing latest candles from broker...", icon="🔄")
-                        st.rerun()
-
-            with c_act5:
-                auto_stream = st.toggle("▶️ Auto Stream (2s)", value=st.session_state.live_streaming_active)
-                st.session_state.live_streaming_active = auto_stream
-
-            # Auto Live Poll Stepper
-            if st.session_state.live_streaming_active and engine is not None and engine.is_active:
-                import time as _t
-                _t.sleep(2.0)
-                st.rerun()
-
-
-            # 5. Kotak Neo Top 5 Priority Endpoints Diagnostic Panel
-            with st.expander("🩺 Kotak Neo Live Gateway — Top 5 Priority Endpoints Diagnostic", expanded=False):
-                st.markdown("Verify the health, status, and latency of Kotak Neo's **Top 5 critical production API endpoints** live:")
-                diag_c1, diag_c2 = st.columns([2, 5])
-                with diag_c1:
-                    run_diag = st.button("🔍 Run Kotak Live Diagnostic Test", key="run_top5_diag_btn", use_container_width=True)
-                with diag_c2:
-                    st.caption("Tests: 1. Limits (Margin) | 2. Quotes (LTP) | 3. Historical Candles (OHLCV) | 4. Positions Book | 5. Order Report")
-
-                tok = st.session_state.live_instrument_key.split("|")[-1] if "|" in st.session_state.live_instrument_key else "51331"
-                if run_diag or "kotak_diag_results" in st.session_state:
-                    if run_diag:
-                        with st.spinner("Pinging Kotak Neo 5 Priority Endpoints..."):
-                            st.session_state.kotak_diag_results = gateway.test_top5_endpoints(engine.symbol, tok)
-
-                    diag = st.session_state.kotak_diag_results
-                    if "error" in diag:
-                        st.error(diag["error"])
-                    else:
-                        d_cols = st.columns(5)
-                        ep_keys = ["1_limits", "2_quotes", "3_historical_data", "4_positions", "5_order_report"]
-                        for idx, k in enumerate(ep_keys):
-                            ep = diag.get(k, {})
-                            with d_cols[idx]:
-                                st_badge = "🟢 ONLINE" if ep.get("status") == "ONLINE" else ("🟡 NO DATA" if ep.get("status") == "NO_DATA" else "🔴 ERROR")
-                                lat = ep.get("latency_ms", 0)
-                                st.markdown(f"**{ep.get('name', k).split('(')[0].strip()}**")
-                                st.markdown(f"{st_badge} (`{lat}ms`)")
-                                st.caption(ep.get("summary", ""))
-
-            # 6. Live Execution Log Feed
-            st.markdown("#### 📝 Real-Time Session Audit Trail")
-            if engine.logs:
-                for log in engine.logs[:10]:
-                    lvl_color = "#00e676" if log["level"] == "INFO" else ("#ff5252" if log["level"] in ("WARNING", "CRITICAL") else "#bdbdbd")
-                    st.markdown(f"<code>[{log['timestamp']}]</code> <b style='color: {lvl_color};'>[{log['level']}]</b> {log['message']}", unsafe_allow_html=True)
-            else:
-                st.caption("No log events yet.")
-
-
-
-    # ==============================================================================
-    # TAB 2: STRATEGY & GATEWAY SETUP
-    # ==============================================================================
-    with tab_config:
-        st.markdown("### ⚙️ Live Trading Configuration")
-
-        cfg_c1, cfg_c2 = st.columns(2)
-        with cfg_c1:
-            st.markdown("#### 1. Strategy Selection")
-            available_strats = list_strategy_names()
-            cur_strat_idx = available_strats.index(st.session_state.live_strategy_name) if st.session_state.live_strategy_name in available_strats else 0
-            sel_strat = st.selectbox("Select Strategy from Store", available_strats, index=cur_strat_idx)
-            st.session_state.live_strategy_name = sel_strat
-
-            strat_data = get_strategy(sel_strat) or {}
-            strat_ind = strat_data.get("indicators", {})
-            st.markdown(
-                f"**Indicators:** {', '.join([k for k, v in strat_ind.items() if v is True]) or 'Default'} | "
-                f"**Target:** {strat_ind.get('fixed_target_pct', 30)}% | **Stop Loss:** {strat_ind.get('fixed_stoploss_pct', 5)}%"
-            )
-
-            st.markdown("#### 2. Instrument Configuration")
-
-            seg_choice = st.radio(
-                "Market Segment",
-                ["🎯 NSE F&O (Options & Futures) [Kotak Live Priority]", "🏢 NSE Cash Equity"],
-                index=0,
-                horizontal=True,
-                help="NSE F&O dynamically queries live rolling contracts, weekly/monthly expiries, and strikes directly from Kotak Neo endpoints."
-            )
-
-            if "F&O" in seg_choice:
-                col_und, col_exp = st.columns(2)
-                with col_und:
-                    underlying_choice = st.selectbox(
-                        "Underlying Index / Stock",
-                        ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
-                        index=0,
-                        key="live_underlying_choice"
-                    )
-                with col_exp:
-                    live_expiries = fetch_kotak_expiries(underlying_choice)
-                    sel_expiry = st.selectbox(
-                        "Rolling Expiry Date (Kotak Live)",
-                        live_expiries,
-                        index=0,
-                        help="Live weekly and monthly rolling expiries from Kotak Neo.",
-                        key=f"live_sel_expiry_{underlying_choice}"
-                    )
-
-                col_typ, col_strk = st.columns(2)
-                with col_typ:
-                    opt_type_choice = st.radio("Option Type", ["PE (Put)", "CE (Call)"], horizontal=True, key="live_opt_type_choice")
-                    clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
-
-                with col_strk:
-                    oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry, count=250) if sel_expiry else {}
-                    spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
-                    mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", INDEX_LOT_SIZES.get(underlying_choice, 65)))
-
-                    # Collect all available strikes from both Call and Put chains
-                    all_strikes = set()
-                    for item in oc_data.get("call", []):
-                        s = item.get("inst", {}).get("strkPrc")
-                        if s:
-                            all_strikes.add(s)
-                    for item in oc_data.get("put", []):
-                        s = item.get("inst", {}).get("strkPrc")
-                        if s:
-                            all_strikes.add(s)
-
-                    oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
-                    strike_to_inst = {}
-                    for item in oc_chain:
-                        inst = item.get("inst", {})
-                        strk = inst.get("strkPrc")
-                        if strk:
-                            strike_to_inst[strk] = inst
-
-                    strikes = list(all_strikes) if all_strikes else list(strike_to_inst.keys())
-
-                    if not strikes:
-                        if underlying_choice == "BANKNIFTY":
-                            strikes = [str(x) for x in range(40000, 68100, 100)]
-                            spot_val = "50500"
-                        elif underlying_choice == "FINNIFTY":
-                            strikes = [str(x) for x in range(17000, 32050, 50)]
-                            spot_val = "23500"
-                        elif underlying_choice == "MIDCPNIFTY":
-                            strikes = [str(x) for x in range(8500, 18050, 50)]
-                            spot_val = "12500"
-                        else:  # NIFTY
-                            strikes = [str(x) for x in range(17000, 30050, 50)]
-                            spot_val = "22500"
-
-                    try:
-                        strikes = sorted(list(set(strikes)), key=lambda x: float(x))
-                    except Exception:
-                        strikes = sorted(list(set(strikes)))
-
-                    default_idx = len(strikes) // 2
-                    try:
-                        s_num = float(spot_val)
-                        closest_strike = min(strikes, key=lambda x: abs(float(x) - s_num))
-                        default_idx = strikes.index(closest_strike)
-                    except Exception:
-                        default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
-                        if default_strike in strikes:
-                            default_idx = strikes.index(default_strike)
-
-                    strike_key = f"live_chosen_strike_{underlying_choice}"
-                    if strike_key in st.session_state and st.session_state[strike_key] not in strikes:
-                        st.session_state[strike_key] = strikes[default_idx]
-
-                    chosen_strike = st.selectbox(
-                        f"Strike Price (Spot: ~{spot_val})",
-                        strikes,
-                        index=default_idx,
-                        key=strike_key
-                    )
-                    selected_inst = strike_to_inst.get(chosen_strike, {})
-                    display_dt, sym_code = parse_expiry_info(sel_expiry)
-
-                    if not selected_inst:
-                        try:
-                            gw = get_gateway("KOTAK")
-                            target_sym = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
-                            if hasattr(gw, "smart_search_instruments"):
-                                scrips = gw.smart_search_instruments(target_sym)
-                                for sc in scrips:
-                                    p_tok = str(sc.get("pSymbol") or "")
-                                    if p_tok:
-                                        selected_inst = {
-                                            "symbol": sc.get("tradingsymbol", target_sym),
-                                            "neoSymbol": f"nse_fo|{p_tok}",
-                                            "optType": clean_opt_type,
-                                            "strkPrc": chosen_strike,
-                                        }
-                                        break
-                            if not selected_inst and hasattr(gw, "search_scrip"):
-                                scrip_res = gw.search_scrip(
-                                    symbol=underlying_choice,
-                                    expiry=sel_expiry,
-                                    option_type=clean_opt_type,
-                                    strike_price=chosen_strike,
-                                )
-                                if scrip_res and isinstance(scrip_res, list) and len(scrip_res) > 0:
-                                    scrip_item = scrip_res[0]
-                                    p_tok = str(scrip_item.get("pSymbol") or scrip_item.get("token") or "")
-                                    p_sym = str(scrip_item.get("pTrdSymbol") or scrip_item.get("tradingSymbol") or "")
-                                    if p_sym or p_tok:
-                                        selected_inst = {
-                                            "symbol": p_sym or f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}",
-                                            "neoSymbol": f"nse_fo|{p_tok}" if p_tok else f"nse_fo|{chosen_strike}",
-                                            "optType": clean_opt_type,
-                                            "strkPrc": chosen_strike,
-                                        }
-                        except Exception as e:
-                            logger.debug("Scrip search fallback error: %s", e)
-
-                    if selected_inst:
-                        st.session_state.live_symbol = selected_inst.get("symbol", f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}")
-                        st.session_state.live_isin = selected_inst.get("neoSymbol", "").split("|")[-1]
-                        st.session_state.live_instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
-                        st.session_state.live_equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
-                        st.session_state.live_lot_size = mkt_lot
-                    else:
-                        target_symbol = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
-                        found_std = None
-                        for s_inst in NIFTY_STANDARD_INSTRUMENTS:
-                            if s_inst["tradingsymbol"] == target_symbol:
-                                found_std = s_inst
-                                break
-                        if found_std:
-                            st.session_state.live_symbol = found_std["tradingsymbol"]
-                            st.session_state.live_isin = found_std["isin"]
-                            st.session_state.live_instrument_key = found_std["instrument_key"]
-                            st.session_state.live_equity_name = found_std["name"]
-                            st.session_state.live_lot_size = int(found_std.get("lot_size", mkt_lot))
-                        else:
-                            st.session_state.live_symbol = target_symbol
-                            st.session_state.live_isin = f"INF00{chosen_strike}1"
-                            st.session_state.live_instrument_key = f"NSE_FO|{chosen_strike}"
-                            st.session_state.live_equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
-                            st.session_state.live_lot_size = mkt_lot
-
-                st.caption(f"🎯 **Active Selection:** `{st.session_state.live_symbol}` | Expiry: `{display_dt}` | Key: `{st.session_state.live_instrument_key}` | Lot: `{st.session_state.live_lot_size}`")
-
-            else:
-                search_sym = st.text_input("Search Cash Equity", value=st.session_state.live_symbol)
-                matched = search_equities(search_sym, equities_df, limit=10) if not equities_df.empty else pd.DataFrame()
-                if not matched.empty:
-                    match_opts = [f"{r['tradingsymbol']} - {r['name']} ({r['isin']})" for _, r in matched.iterrows()]
-                    chosen_inst = st.selectbox("Matching Instruments", match_opts, index=0)
-                    if chosen_inst:
-                        sym_sel = chosen_inst.split(" - ")[0].strip()
-                        f_eq = find_equity_by_symbol(sym_sel, equities_df)
-                        if f_eq:
-                            st.session_state.live_symbol = f_eq["tradingsymbol"]
-                            st.session_state.live_isin = f_eq["isin"]
-                            st.session_state.live_instrument_key = f_eq.get("instrument_key", f"NSE_EQ|{f_eq['isin']}")
-                            st.session_state.live_equity_name = f_eq["name"]
-                            st.session_state.live_lot_size = 1
-
-        with cfg_c2:
-            st.markdown("#### 3. Execution Parameters")
-            tf_options = [1, 3, 5, 15]
-            cur_tf = tf_options.index(st.session_state.live_timeframe) if st.session_state.live_timeframe in tf_options else 0
-            st.session_state.live_timeframe = st.selectbox("Candle Timeframe", tf_options, index=cur_tf, format_func=lambda x: f"{x} Minute" if x == 1 else f"{x} Minutes")
-
-            c_lot, c_cap, c_loss = st.columns(3)
-            with c_lot:
-                st.session_state.live_lot_size = st.number_input("Order Lot Size (Qty)", min_value=1, max_value=5000, value=int(st.session_state.live_lot_size), step=65)
-            with c_cap:
-                st.session_state.live_capital = st.number_input("Allocated Capital (₹)", min_value=10_000.0, max_value=10_000_000.0, value=float(st.session_state.live_capital), step=10_000.0)
-            with c_loss:
-                st.session_state.live_max_daily_loss = st.number_input("Max Daily Loss Limit (₹)", min_value=500.0, max_value=500_000.0, value=float(st.session_state.get("live_max_daily_loss", 2_000.0)), step=500.0, help="Trading halts immediately if daily realized loss hits this limit.")
-
-            st.markdown("#### 4. Active Broker Gateway Info")
-            st.json(gateway.get_connection_info())
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("💾 Apply & Arm Live Session", type="primary", use_container_width=True):
-            strat_name = st.session_state.live_strategy_name
-            strat_dict = get_strategy(strat_name) or {}
-            ind_cfg = strat_dict.get("indicators", {})
-
-            st.session_state.live_engine = LiveTradeEngine(
-                gateway=gateway,
-                strategy_name=strat_name,
-                symbol=st.session_state.live_symbol,
-                isin=st.session_state.live_isin,
-                timeframe=st.session_state.live_timeframe,
-                capital=st.session_state.live_capital,
-                lot_size=st.session_state.live_lot_size,
-                target_pct=float(ind_cfg.get("fixed_target_pct", 30.0)),
-                stoploss_pct=float(ind_cfg.get("fixed_stoploss_pct", 5.0)),
-                trailing_sl_enabled=bool(ind_cfg.get("trailing_sl_enabled", False)),
-                trail_beyond_target=bool(ind_cfg.get("trail_beyond_target", False)),
-                max_daily_loss=float(st.session_state.get("live_max_daily_loss", 2_000.0)),
-            )
-            st.success(f"Live Trading Engine successfully armed with {gateway.gateway_name} Gateway!")
+                    st.error("❌ 2FA Login failed. Verify credentials in .env")
+
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("⚠️ Danger Zone", expanded=False):
+        confirm_clear = st.checkbox("Confirm deletion of this live history", key="confirm_clear_strat_live")
+        if st.button("🗑️ Clear History for this Strategy", disabled=not confirm_clear, use_container_width=True):
+            live_db.clear_history_for_strategy(selected_strat)
+            st.success(f"Cleared live history for {selected_strat}!")
             st.rerun()
 
+    # ---------------- 2. Main Page: Cloned PaperTrade Results View ----------------
+    # Load strategy configuration
+    strat_def = get_strategy(selected_strat) or {}
+    ind_cfg = strat_def.get("indicators", {})
+    risk_cfg = strat_def.get("risk", {})
+    cost_cfg = strat_def.get("cost", {})
+    inst_cfg = strat_def.get("instrument", {})
+
+    capital = float(risk_cfg.get("capital", 100_000.0))
+    strategy_sq_time = parse_time_param(risk_cfg.get("square_off_time"), time(15, 15))
+    strategy_entry_start = parse_time_param(risk_cfg.get("entry_start"), time(9, 20))
+    strategy_entry_end = parse_time_param(risk_cfg.get("entry_end"), time(15, 0))
+
+    # Resolve active instrument
+    active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
+    if active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
+        active_instrument = "NIFTY26OCT22500PE"
+
+    # Current date and previous 1 month date window (strictly 30 days)
+    today = date.today()
+    today_str = str(today)
+    one_month_ago = today - timedelta(days=30)
+    one_month_ago_str = str(one_month_ago)
+
+    # Strategy dates
+    strat_from = str(inst_cfg.get("start_date") or inst_cfg.get("from_date") or inst_cfg.get("date_from") or today_str)
+    strat_to = str(inst_cfg.get("end_date") or inst_cfg.get("to_date") or inst_cfg.get("date_to") or today_str)
+
+    # Trailing Stoploss indicator text
+    tsl_on = ind_cfg.get("trailing_sl_enabled") or risk_cfg.get("trailing_sl_enabled")
+    tsl_runner = ind_cfg.get("trail_beyond_target") or risk_cfg.get("trail_beyond_target")
+    tsl_info = " | Trailing SL: Model B Active" + (" (Runner)" if tsl_runner else "") if tsl_on else ""
+
+    # Page Heading: Display "Strategy Name" as Heading
+    st.header(f"Results: {selected_strat} ({active_instrument})")
+    st.caption(f"Strategy: `{selected_strat}` | Period: {one_month_ago_str} to {today_str} | Live Kotak Trade Engine{tsl_info} | Square-off Time: **{strategy_sq_time.strftime('%H:%M')} IST**")
+
+    # Notice
+    st.warning("⚠️ **Notice:** Past results do not predict future results. Changing parameters after seeing results turns this data into in-sample data.")
+
+    # Fetch accumulated live trades for this strategy within previous 1 month
+    accumulated_trades_list = live_db.get_accumulated_trades_for_strategy(selected_strat, max_days=30)
+    trades = pd.DataFrame(accumulated_trades_list) if accumulated_trades_list else pd.DataFrame()
+
+    real_trades = (
+        trades[trades["status"] != "NO_TRADE"].copy()
+        if not trades.empty and "status" in trades.columns
+        else trades.copy()
+    )
+
+    # Compute KPI performance metrics across accumulated trades
+    num_trades = len(real_trades)
+    net_pnl = float(real_trades["net_pnl"].sum()) if not real_trades.empty else 0.0
+    gross_pnl = float(real_trades["gross_pnl"].sum()) if not real_trades.empty else 0.0
+    total_costs = float(real_trades["charges"].sum()) if not real_trades.empty else 0.0
+    return_pct = (net_pnl / capital * 100.0) if capital > 0 else 0.0
+
+    wins = real_trades[real_trades["gross_pnl"] > 0] if not real_trades.empty else pd.DataFrame()
+    losses = real_trades[real_trades["gross_pnl"] < 0] if not real_trades.empty else pd.DataFrame()
+    win_rate = (len(wins) / num_trades * 100.0) if num_trades > 0 else 0.0
+
+    sum_gains = float(wins["gross_pnl"].sum()) if not wins.empty else 0.0
+    sum_losses = abs(float(losses["gross_pnl"].sum())) if not losses.empty else 0.0
+    profit_factor = (sum_gains / sum_losses) if sum_losses > 0 else (99.0 if sum_gains > 0 else 0.0)
+    pf_str = f"{profit_factor:.2f}" if sum_losses > 0 else ("∞ (No Losses)" if gross_pnl > 0 else "0.00")
+
+    # Drawdown and Secondary Metrics
+    if not real_trades.empty:
+        cum_pnl = real_trades.sort_values("id")["net_pnl"].cumsum()
+        peaks = np.maximum.accumulate(cum_pnl)
+        dd = peaks - cum_pnl
+        max_dd = float(dd.max()) if len(dd) > 0 else 0.0
+        max_dd_pct = (max_dd / capital * 100.0) if capital > 0 else 0.0
+    else:
+        max_dd = 0.0
+        max_dd_pct = 0.0
+
+    tot_slip = float(real_trades["slippage_cost"].sum()) if "slippage_cost" in real_trades.columns else 0.0
+    avg_tr = (net_pnl / num_trades) if num_trades > 0 else 0.0
+    avg_win = float(wins["net_pnl"].mean()) if not wins.empty else 0.0
+    avg_loss = abs(float(losses["net_pnl"].mean())) if not losses.empty else 0.0
+    rr = (avg_win / avg_loss) if avg_loss > 0 else (avg_win if avg_win > 0 else None)
+    rr_str = f"{rr:.2f}" if rr is not None else "N/A"
+
+    # Loss streak
+    loss_streak = 0
+    cur_streak = 0
+    if not real_trades.empty:
+        for p in real_trades.sort_values("id")["net_pnl"]:
+            if p < 0:
+                cur_streak += 1
+                loss_streak = max(loss_streak, cur_streak)
+            else:
+                cur_streak = 0
+
+    # Sharpe ratio
+    if len(real_trades) >= 3 and real_trades["net_pnl"].std() > 0:
+        sh = (real_trades["net_pnl"].mean() / real_trades["net_pnl"].std()) * np.sqrt(252)
+        sh_str = f"{sh:.2f}"
+    else:
+        sh_str = "N/A"
+
+    # KPI Metrics Row 1
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Trades", num_trades)
+    k2.metric("Net P&L (₹)", f"{net_pnl:,.2f}", f"{return_pct:.2f}%")
+    k3.metric("Gross P&L (₹)", f"{gross_pnl:,.2f}")
+    k4.metric("Total Costs (₹)", f"{total_costs:,.2f}")
+    k5.metric("Win Rate", f"{win_rate:.1f}%")
+    k6.metric("Profit Factor", pf_str)
+
+    # KPI Metrics Row 2
+    k7, k8, k9, k10, k11, k12 = st.columns(6)
+    k7.metric("Max Drawdown", f"₹{max_dd:,.0f}", f"-{max_dd_pct:.1f}%")
+    k8.metric("Total Slippage (₹)", f"{tot_slip:,.2f}")
+    k9.metric("Avg Trade (₹)", f"{avg_tr:,.2f}")
+    k10.metric("Reward/Risk", rr_str)
+    k11.metric("Max Loss Streak", loss_streak)
+    k12.metric("Sharpe Ratio", sh_str)
+
+    # Strategy Calculated_Score Profile Metrics
+    max_score_cfg = 0
+    if ind_cfg.get("ema_enabled", False): max_score_cfg += ind_cfg.get("ema_weight", 2)
+    if ind_cfg.get("rsi_enabled", False): max_score_cfg += ind_cfg.get("rsi_weight", 1)
+    if ind_cfg.get("macd_enabled", False): max_score_cfg += ind_cfg.get("macd_weight", 2)
+    if ind_cfg.get("vwap_enabled", False): max_score_cfg += ind_cfg.get("vwap_weight", 1)
+    if ind_cfg.get("adx_enabled", False): max_score_cfg += ind_cfg.get("adx_weight", 1)
+    if ind_cfg.get("volume_enabled", False): max_score_cfg += ind_cfg.get("volume_weight", 1)
+    if ind_cfg.get("bollinger_enabled", False): max_score_cfg += ind_cfg.get("bollinger_weight", 1)
+    if ind_cfg.get("stoch_enabled", False): max_score_cfg += ind_cfg.get("stoch_weight", 1)
+    if ind_cfg.get("obv_enabled", False): max_score_cfg += ind_cfg.get("obv_weight", 1)
+    if ind_cfg.get("higher_high_enabled", False): max_score_cfg += ind_cfg.get("higher_high_weight", 1)
+    if ind_cfg.get("lower_low_enabled", False): max_score_cfg += ind_cfg.get("lower_low_weight", 1)
+    max_score_cfg = max(max_score_cfg, 1)
+
+    long_th = ind_cfg.get("long_threshold", 4)
+    short_th = ind_cfg.get("short_threshold", -4)
+    avg_score = real_trades["score"].mean() if not real_trades.empty and "score" in real_trades.columns else 0.0
+
+    st.markdown("##### ⚡ Strategy Calculated_Score Profile")
+    cs1, cs2, cs3, cs4 = st.columns(4)
+    cs1.metric("Calculated_Score (Max)", f"{max_score_cfg} pts", help="Maximum possible consensus score from active indicators.")
+    cs2.metric("LONG Threshold", f"≥ {long_th} pts", help="Score threshold that triggers LONG entries.")
+    cs3.metric("SHORT Threshold", f"≤ {short_th} pts", help="Score threshold that triggers SHORT entries.")
+    cs4.metric("Avg Trade Score", f"{avg_score:+.2f} pts" if not real_trades.empty else "N/A", help="Average Calculated_Score at entry across executed trades.")
+
+    tgt_val = ind_cfg.get("fixed_target_pct", 3)
+    sl_val = ind_cfg.get("fixed_stoploss_pct", 2)
+    side_val = ind_cfg.get("trade_side", "BOTH")
+    snooze_val = ind_cfg.get("snooze_minutes", 0)
+    tsl_flag = ind_cfg.get("trailing_sl_enabled", False)
+    runner_flag = ind_cfg.get("trail_beyond_target", False)
+    tsl_disp = f" | Trailing SL = **Model B Active{' (Runner)' if runner_flag else ''}**" if tsl_flag else ""
+    short_lot_size = int(ind_cfg.get("short_lot_size", 1))
+    short_lot_disp = f" | Short Lot Size = **{short_lot_size} Lot**" if side_val != "LONG" else ""
+    snooze_disp = f" | Snooze = **{snooze_val} min**" if snooze_val > 0 else ""
+    st.caption(f"🎯 **Trade Levels:** Fixed Target = **{tgt_val}%** | Fixed Stoploss = **{sl_val}%**{tsl_disp} | Side = **{side_val}**{short_lot_disp}{snooze_disp}")
 
     # ==============================================================================
-    # TAB 3: LIVE EXECUTED JOURNAL
+    # SECTION: Current Date Live Trade (Kotak Neo Live Engine)
     # ==============================================================================
-    with tab_history:
-        st.markdown("### 📜 Live Executed Trades Journal")
+    st.markdown("---")
+    st.subheader("🔴 Current Date Live Trade (Kotak Neo Live Engine)")
 
-        f_col1, f_col2, f_col3 = st.columns(3)
-        with f_col1:
-            f_strat = st.selectbox("Filter Strategy", ["ALL"] + list_strategy_names(), index=0)
-        with f_col2:
-            f_sym = st.selectbox("Filter Symbol", ["ALL", "NIFTY26OCT22500PE", "RELIANCE", "NIFTY", "BANKNIFTY"], index=0)
-        with f_col3:
-            f_gw = st.selectbox("Filter Gateway", ["ALL", "UPSTOX", "KOTAK"], index=0)
+    # Check date settings against current date
+    date_is_current = (strat_from == today_str and strat_to == today_str)
+    is_mkt_open, mkt_msg = check_market_trading_hours()
 
-        strat_arg = None if f_strat == "ALL" else f_strat
-        sym_arg = None if f_sym == "ALL" else f_sym
-        gw_arg = None if f_gw == "ALL" else f_gw
+    pt_col1, pt_col2, pt_col3 = st.columns([3, 2, 2])
+    with pt_col1:
+        st.markdown(f"**Active Instrument:** `{active_instrument}` &nbsp;|&nbsp; **Gateway:** `🔵 Kotak Neo Live API`")
+        st.caption(f"Strategy Dates: **{strat_from}** to **{strat_to}** | Today's Date: **{today_str}**")
+    with pt_col2:
+        date_badge = "🟢 Strategy Dates Validated (Current Date)" if date_is_current else "🔴 Date Mismatch (Update to Current Date)"
+        st.markdown(f"**Validation Status:** {date_badge}")
+        mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
+        st.markdown(f"**Market Status:** {mkt_badge}")
+        st.caption(f"🛡️ **Auto Square-off Time:** `{strategy_sq_time.strftime('%H:%M')} IST` (RiskConfig)")
+    with pt_col3:
+        if not date_is_current:
+            if st.button(f"📅 Set Dates to Current Date ({today_str})", key="quick_set_current_date_live", use_container_width=True):
+                inst_cfg["start_date"] = today_str
+                inst_cfg["end_date"] = today_str
+                save_strategy(selected_strat, ind_cfg, risk_cfg, cost_cfg, instrument=inst_cfg)
+                st.success(f"Updated {selected_strat} dates to current date ({today_str})!")
+                st.rerun()
 
-        trades = live_db.get_trades(strategy_name=strat_arg, symbol=sym_arg, gateway=gw_arg)
-        orders = live_db.get_orders()
+    exec_col1, exec_col2, exec_col3 = st.columns([2, 3, 2])
+    is_live_running = st.session_state.get("live_kotak_executing", False)
 
-        if trades:
-            trades_df = pd.DataFrame(trades)
-            total_pnl = trades_df["net_pnl"].sum()
-            win_count = len(trades_df[trades_df["net_pnl"] > 0])
-            win_rate = (win_count / len(trades_df)) * 100.0
-
-            j_kpi1, j_kpi2, j_kpi3, j_kpi4 = st.columns(4)
-            j_kpi1.metric("Total Live Trades", len(trades_df))
-            j_kpi2.metric("Win Rate", f"{win_rate:.1f}%", f"{win_count}W / {len(trades_df) - win_count}L")
-            j_kpi3.metric("Net Realized P&L", f"₹{total_pnl:+,.2f}")
-            j_kpi4.metric("Total Charges", f"₹{trades_df['charges'].sum():,.2f}")
-
-            st.markdown("---")
-            st.markdown("#### 📋 Executed Trades Ledger")
-            st.dataframe(
-                trades_df[[
-                    "id", "gateway", "strategy_name", "symbol", "side", "quantity",
-                    "signal_time", "entry_time", "entry_price", "exit_time", "exit_price",
-                    "exit_reason", "gross_pnl", "charges", "net_pnl"
-                ]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # Export buttons
-            exp_col1, exp_col2 = st.columns(2)
-            with exp_col1:
-                csv_data = trades_df.to_csv(index=False).encode("utf-8")
-                st.download_button("📥 Download Live Trades (CSV)", csv_data, "live_trades.csv", "text/csv")
-            with exp_col2:
-                json_data = trades_df.to_json(orient="records", indent=2)
-                st.download_button("📥 Download Audit Trail (JSON)", json_data, "live_audit.json", "application/json")
+    with exec_col1:
+        if not is_live_running:
+            if st.button("🚀 Execute Live Trade", type="primary", use_container_width=True, key="btn_run_kotak_live"):
+                now_curr_time = datetime.now().time()
+                if not date_is_current:
+                    st.error(
+                        f"❌ Date Validation Error: Strategy From Date ('{strat_from}') and To Date ('{strat_to}') "
+                        f"must be set to current date ('{today_str}') for Live Trade execution. "
+                        "Please click 'Set Dates to Current Date' above before executing."
+                    )
+                elif not is_mkt_open:
+                    st.error(
+                        f"🛑 **Market Hours Validation Failed:** {mkt_msg} "
+                        "Live execution cannot be started after market hours (Regular trading: 09:15:00 to 15:30:00 IST)."
+                    )
+                elif now_curr_time >= strategy_sq_time:
+                    st.error(
+                        f"🛑 **Square-off Time Validation Failed:** Current time ({datetime.now().strftime('%H:%M:%S')}) is at/past the strategy Square-off Time ({strategy_sq_time.strftime('%H:%M')} IST) defined in Risk Parameters. "
+                        "Live trade execution cannot be started past square-off time."
+                    )
+                else:
+                    st.session_state.live_kotak_executing = True
+                    st.session_state.live_kotak_start_time = datetime.now().strftime("%H:%M:%S")
+                    st.rerun()
         else:
-            st.info("No live trades recorded yet in the database. Arm the engine and run trades in Cockpit.")
+            if st.button("⏹️ Stop Live Trade Session", type="secondary", use_container_width=True, key="btn_stop_kotak_live"):
+                st.session_state.live_kotak_executing = False
+                st.rerun()
 
-        if orders:
-            st.markdown("---")
-            st.markdown("#### 📑 Order Book Audit")
-            orders_df = pd.DataFrame(orders)
+    with exec_col2:
+        if is_live_running:
+            st.info(
+                f"⚡ **Kotak Live Trade Active:** Watching **{active_instrument}** with **Kotak Neo Live Priority** | "
+                f"Auto-refresh: **2 seconds** | Session Started: **{st.session_state.get('live_kotak_start_time', '')}**"
+            )
+        else:
+            st.caption("Engine in Standby. Click **Execute Live Trade** during market hours (09:15 to 15:30 IST) to engage consensus signal scanner and live bracket order placement.")
+
+    with exec_col3:
+        # Emergency Square Off Button
+        if st.button("🚨 EMERGENCY SQUARE OFF", type="secondary", help="Immediately squares off all Kotak live positions via broker API", use_container_width=True, key="btn_emergency_sqoff_live"):
+            with st.spinner("Triggering Emergency Square Off to Kotak Neo Live API..."):
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                sq_resp = gw.emergency_square_off_all()
+
+                # Close active trade in live database if open
+                open_trades = live_db.get_trades(strategy_name=selected_strat)
+                for tr in open_trades:
+                    if tr.get("status") == "ACTIVE":
+                        ep = float(tr.get("entry_price", 0.0))
+                        ltp = gw.get_ltp(active_instrument) or ep
+                        qty = int(tr.get("quantity", 65))
+                        sd = tr.get("side", "LONG")
+                        gross = (ltp - ep) * qty if sd == "LONG" else (ep - ltp) * qty
+                        live_db.close_active_trade(
+                            trade_id_or_row_id=tr["id"],
+                            exit_time=now_ts,
+                            exit_price=ltp,
+                            exit_reason="EMERGENCY_SQUARE_OFF",
+                            gross_pnl=round(gross, 2),
+                            charges=20.0,
+                            peak_gain_pct=round(max(0.0, (ltp - ep) / ep * 100.0) if ep > 0 else 0.0, 2),
+                        )
+                st.toast("🚨 Kotak Live Emergency Square Off executed successfully!", icon="🚨")
+                st.success(f"Emergency Square Off Triggered: {sq_resp.get('count', 0)} position(s) closed.")
+                st.rerun()
+
+    # ---------------- Active Execution Engine & Live Kotak Chart ----------------
+    active_open_trade = None
+    if not trades.empty and "status" in trades.columns:
+        open_rows = trades[trades["status"] == "ACTIVE"]
+        if not open_rows.empty:
+            active_open_trade = open_rows.iloc[0].to_dict()
+
+    depth = gw.get_live_market_depth(active_instrument, inst_cfg.get("instrument_key"))
+    live_ltp = float(depth.get("ltp") or 0.0)
+
+    # Fetch today's intraday candles
+    timeframe_m = int(inst_cfg.get("timeframe", 5))
+    candles_df = gw.fetch_historical_candles(
+        symbol=active_instrument,
+        instrument_key=inst_cfg.get("instrument_key", ""),
+        timeframe_minutes=timeframe_m,
+        start_date=today,
+        end_date=today,
+    )
+
+    if candles_df is None or candles_df.empty:
+        # Fallback to local files for testing/offline replay
+        fallbacks = [
+            f"data/{active_instrument.lower()}_{timeframe_m}m.csv",
+            f"data/{active_instrument.lower()}_5m.csv",
+            "data/nifty26oct22500pe_5m.csv",
+            "data/nifty26oct22500pe_1m.csv",
+        ]
+        for fb in fallbacks:
+            if os.path.exists(fb):
+                candles_df = load_csv(fb)
+                break
+
+    # Strictly filter candles to regular market trading hours (09:15:00 to 15:30:00 IST)
+    if candles_df is not None and not candles_df.empty:
+        candles_df["timestamp"] = pd.to_datetime(candles_df["timestamp"])
+        if candles_df["timestamp"].dt.tz is not None:
+            candles_df["timestamp"] = candles_df["timestamp"].dt.tz_localize(None)
+        candles_df = candles_df[
+            (candles_df["timestamp"].dt.time >= time(9, 15, 0)) &
+            (candles_df["timestamp"].dt.time <= time(15, 30, 0))
+        ].reset_index(drop=True)
+
+    if live_ltp <= 0 and candles_df is not None and not candles_df.empty:
+        live_ltp = float(candles_df.iloc[-1]["close"])
+
+    # Display Live Ticker & Order Book metrics
+    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
+    m_col1.metric("Live Tick (LTP)", f"₹{live_ltp:,.2f}", f"Kotak: {depth.get('status', 'LIVE')}")
+    if candles_df is not None and not candles_df.empty:
+        m_col2.metric("Day High", f"₹{max(float(candles_df['high'].max()), live_ltp):,.2f}")
+        m_col3.metric("Day Low", f"₹{min(float(candles_df['low'].min()), live_ltp):,.2f}")
+        m_col4.metric("Candles Today", f"{len(candles_df)} bars ({timeframe_m}m, capped @ 15:30)")
+
+    # Evaluate Strategy Consensus on Candles
+    custom_cfg = CustomStrategyConfig(
+        name=selected_strat,
+        ema_enabled=ind_cfg.get("ema_enabled", True), ema_fast=ind_cfg.get("ema_fast", 20), ema_slow=ind_cfg.get("ema_slow", 50), ema_weight=ind_cfg.get("ema_weight", 2),
+        rsi_enabled=ind_cfg.get("rsi_enabled", True), rsi_period=ind_cfg.get("rsi_period", 14), rsi_bull_low=ind_cfg.get("rsi_bull_low", 55.0),
+        rsi_bull_high=ind_cfg.get("rsi_bull_high", 70.0), rsi_bear_low=ind_cfg.get("rsi_bear_low", 30.0), rsi_bear_high=ind_cfg.get("rsi_bear_high", 45.0), rsi_weight=ind_cfg.get("rsi_weight", 1),
+        macd_enabled=ind_cfg.get("macd_enabled", True), macd_fast=ind_cfg.get("macd_fast", 12), macd_slow=ind_cfg.get("macd_slow", 26), macd_signal=ind_cfg.get("macd_signal", 9), macd_weight=ind_cfg.get("macd_weight", 2),
+        vwap_enabled=ind_cfg.get("vwap_enabled", True), vwap_weight=ind_cfg.get("vwap_weight", 1),
+        atr_enabled=ind_cfg.get("atr_enabled", True), atr_period=ind_cfg.get("atr_period", 14), atr_stop_multiplier=risk_cfg.get("atr_stop_multiplier", 1.5), atr_reward_risk_ratio=risk_cfg.get("reward_risk_ratio", 2.0),
+        adx_enabled=ind_cfg.get("adx_enabled", True), adx_period=ind_cfg.get("adx_period", 14), adx_min=ind_cfg.get("adx_min", 20.0), adx_weight=ind_cfg.get("adx_weight", 1),
+        volume_enabled=ind_cfg.get("volume_enabled", True), volume_period=ind_cfg.get("volume_period", 20), volume_ratio_min=ind_cfg.get("volume_ratio_min", 1.0),
+        volume_consecutive=int(ind_cfg.get("volume_consecutive", 3)), volume_weight=ind_cfg.get("volume_weight", 1),
+        bollinger_enabled=ind_cfg.get("bollinger_enabled", False), bollinger_period=ind_cfg.get("bollinger_period", 20), bollinger_std_dev=ind_cfg.get("bollinger_std_dev", 2.0), bollinger_weight=ind_cfg.get("bollinger_weight", 1),
+        stoch_enabled=ind_cfg.get("stoch_enabled", False), stoch_k=ind_cfg.get("stoch_k", 14), stoch_d=ind_cfg.get("stoch_d", 3), stoch_low=ind_cfg.get("stoch_low", 20.0), stoch_high=ind_cfg.get("stoch_high", 80.0), stoch_weight=ind_cfg.get("stoch_weight", 1),
+        obv_enabled=ind_cfg.get("obv_enabled", False), obv_ma_period=ind_cfg.get("obv_ma_period", 20), obv_weight=ind_cfg.get("obv_weight", 1),
+        higher_high_enabled=bool(ind_cfg.get("higher_high_enabled", False)), higher_high_period=int(ind_cfg.get("higher_high_period", 5)), higher_high_weight=int(ind_cfg.get("higher_high_weight", 1)),
+        lower_low_enabled=bool(ind_cfg.get("lower_low_enabled", False)), lower_low_period=int(ind_cfg.get("lower_low_period", 5)), lower_low_weight=int(ind_cfg.get("lower_low_weight", 1)),
+        long_threshold=long_th, short_threshold=short_th,
+    )
+
+    latest_score = 0
+    scored_candles = pd.DataFrame()
+    if candles_df is not None and not candles_df.empty:
+        scored_candles = calculate_custom_indicators(candles_df, custom_cfg)
+        if not scored_candles.empty:
+            scored_candles["consensus_score"] = [
+                int(sum(score_custom_row(r, custom_cfg).values())) for _, r in scored_candles.iterrows()
+            ]
+            latest_score = int(scored_candles.iloc[-1]["consensus_score"])
+
+    # If live running, check market hours and strategy square-off time; if past square-off or market closed, auto square off and stop
+    if is_live_running:
+        now_time = datetime.now().time()
+        if now_time >= strategy_sq_time or not is_mkt_open:
+            st.session_state.live_kotak_executing = False
+            if active_open_trade is not None:
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                e_p = float(active_open_trade.get("entry_price", live_ltp))
+                e_side = active_open_trade.get("side", "LONG")
+                gross = (live_ltp - e_p) * int(active_open_trade.get("quantity", 65)) if e_side == "LONG" else (e_p - live_ltp) * int(active_open_trade.get("quantity", 65))
+                exit_reason = "SQUARE_OFF" if now_time >= strategy_sq_time else "MARKET_CLOSE_SQUARE_OFF"
+                gw.emergency_square_off_all()
+                live_db.close_active_trade(
+                    trade_id_or_row_id=active_open_trade.get("id"),
+                    exit_time=now_ts,
+                    exit_price=live_ltp,
+                    exit_reason=exit_reason,
+                    gross_pnl=round(gross, 2),
+                    charges=20.0,
+                    peak_gain_pct=0.0,
+                )
+            if now_time >= strategy_sq_time:
+                st.warning(f"🔔 Strategy Square-off Time ({strategy_sq_time.strftime('%H:%M')} IST) reached from Risk Parameters. Live session ended and open positions squared off.")
+            else:
+                st.warning("🔔 Market closed at 15:30:00 IST. Live session ended and open positions squared off.")
+            st.rerun()
+
+        # Live Signal Check & Kotak Live Trade Execution
+        lot_size = int(inst_cfg.get("lot_size", 65))
+        now_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # ---------------- RISK PARAMETERS CHECK AGAINST KOTAK LIVE API ----------------
+        max_open_pos = int(risk_cfg.get("max_open_positions", 3))
+        cur_open_pos = gw.get_open_positions_count()
+        max_losses_today = int(risk_cfg.get("max_consecutive_losses", 3))
+        loss_trades_today = gw.get_loss_trades_today()
+        max_daily_loss = float(risk_cfg.get("max_daily_loss", 2000.0))
+        today_net_pnl = net_pnl
+
+        risk_blocked = False
+        if cur_open_pos >= max_open_pos and active_open_trade is None:
+            st.warning(f"⚠️ **Risk Parameter Limit:** Max Open Positions ({max_open_pos}) reached on Kotak Live API. New entries blocked.")
+            risk_blocked = True
+        elif loss_trades_today >= max_losses_today and active_open_trade is None:
+            st.error(f"🛑 **Risk Parameter Limit:** Max Consecutive Losses ({max_losses_today}) reached on Kotak Live API today. New entries blocked.")
+            risk_blocked = True
+        elif today_net_pnl <= -max_daily_loss and active_open_trade is None:
+            st.error(f"🛑 **Risk Parameter Limit:** Max Daily Loss Limit (-₹{max_daily_loss:,.2f}) hit. New entries blocked.")
+            risk_blocked = True
+        elif (now_time >= strategy_sq_time or now_time > strategy_entry_end) and active_open_trade is None:
+            st.info(f"⏳ Current time ({now_time.strftime('%H:%M:%S')}) is past Strategy Entry End ({strategy_entry_end.strftime('%H:%M')}) / Square-off ({strategy_sq_time.strftime('%H:%M')}) from Risk Parameters. New entries are blocked.")
+            risk_blocked = True
+
+        if active_open_trade is None and not risk_blocked:
+            # Check for new entry signal strictly within market hours & strategy entry window
+            if latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                entry_p = live_ltp
+                tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                next_tid = 6000 + len(real_trades) + 1
+
+                # Trigger Live Orders on Kotak
+                entry_order = gw.place_market_order(
+                    symbol=active_instrument,
+                    side="BUY",
+                    quantity=lot_size,
+                    reference_price=entry_p,
+                )
+                entry_fill_time = entry_order.fill_time or now_time_str
+                entry_fill_price = float(entry_order.fill_price or entry_p)
+
+                # Place Target limit order
+                gw.place_target_order(
+                    symbol=active_instrument,
+                    side="SELL",
+                    quantity=lot_size,
+                    target_price=tgt_p,
+                )
+
+                # Place Stop Loss SL-M order
+                gw.place_stoploss_order(
+                    symbol=active_instrument,
+                    side="SELL",
+                    quantity=lot_size,
+                    stoploss_price=sl_p,
+                )
+
+                # Add active record in Live Trade database
+                live_db.save_active_trade(
+                    strategy_name=selected_strat,
+                    symbol=active_instrument,
+                    session_date=today_str,
+                    trade_id=next_tid,
+                    side="LONG",
+                    quantity=lot_size,
+                    entry_time=entry_fill_time,
+                    entry_price=entry_fill_price,
+                    stop_loss=sl_p,
+                    target=tgt_p,
+                    score=latest_score,
+                    regime="TRENDING",
+                )
+                st.toast(f"🟢 Kotak Live: Executed LONG Trade #{next_tid} on {active_instrument} @ ₹{entry_fill_price:.2f}!", icon="🟢")
+                st.rerun()
+
+            elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                entry_p = live_ltp
+                tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
+                sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
+                next_tid = 6000 + len(real_trades) + 1
+
+                # Trigger Live Orders on Kotak
+                entry_order = gw.place_market_order(
+                    symbol=active_instrument,
+                    side="SELL",
+                    quantity=lot_size,
+                    reference_price=entry_p,
+                )
+                entry_fill_time = entry_order.fill_time or now_time_str
+                entry_fill_price = float(entry_order.fill_price or entry_p)
+
+                # Place Target limit order
+                gw.place_target_order(
+                    symbol=active_instrument,
+                    side="BUY",
+                    quantity=lot_size,
+                    target_price=tgt_p,
+                )
+
+                # Place Stop Loss SL-M order
+                gw.place_stoploss_order(
+                    symbol=active_instrument,
+                    side="BUY",
+                    quantity=lot_size,
+                    stoploss_price=sl_p,
+                )
+
+                # Add active record in Live Trade database
+                live_db.save_active_trade(
+                    strategy_name=selected_strat,
+                    symbol=active_instrument,
+                    session_date=today_str,
+                    trade_id=next_tid,
+                    side="SHORT",
+                    quantity=lot_size,
+                    entry_time=entry_fill_time,
+                    entry_price=entry_fill_price,
+                    stop_loss=sl_p,
+                    target=tgt_p,
+                    score=latest_score,
+                    regime="TRENDING",
+                )
+                st.toast(f"🔴 Kotak Live: Executed SHORT Trade #{next_tid} on {active_instrument} @ ₹{entry_fill_price:.2f}!", icon="🔴")
+                st.rerun()
+
+        elif active_open_trade is not None:
+            # Active trade is running: watch for Square-off Time, Target, or Stop Loss execution
+            e_side = active_open_trade.get("side", "LONG")
+            e_p = float(active_open_trade.get("entry_price", live_ltp))
+            tgt = float(active_open_trade.get("target") or 0.0)
+            sl = float(active_open_trade.get("stop_loss") or 0.0)
+            row_db_id = active_open_trade.get("id")
+
+            now_time = datetime.now().time()
+            exit_triggered = None
+            if now_time >= strategy_sq_time:
+                exit_triggered = "SQUARE_OFF"
+            elif not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time:
+                exit_triggered = "SQUARE_OFF"
+            elif e_side == "LONG":
+                if tgt > 0 and live_ltp >= tgt:
+                    exit_triggered = "TARGET"
+                elif sl > 0 and live_ltp <= sl:
+                    exit_triggered = "STOP_LOSS"
+            else:
+                if tgt > 0 and live_ltp <= tgt:
+                    exit_triggered = "TARGET"
+                elif sl > 0 and live_ltp >= sl:
+                    exit_triggered = "STOP_LOSS"
+
+            if exit_triggered:
+                opp_exit_side = "SELL" if e_side == "LONG" else "BUY"
+                try:
+                    exit_order = gw.place_market_order(
+                        symbol=active_instrument,
+                        side=opp_exit_side,
+                        quantity=lot_size,
+                        reference_price=live_ltp,
+                    )
+                    exit_fill_time = exit_order.fill_time or now_time_str
+                    exit_fill_price = float(exit_order.fill_price or live_ltp)
+                except Exception as ex:
+                    logger.warning("Kotak Live exit market order note: %s", ex)
+                    exit_fill_time = now_time_str
+                    exit_fill_price = live_ltp
+
+                gross = (exit_fill_price - e_p) * lot_size if e_side == "LONG" else (e_p - exit_fill_price) * lot_size
+                peak_pct = max(0.0, (exit_fill_price - e_p) / e_p * 100.0) if e_side == "LONG" else max(0.0, (e_p - exit_fill_price) / e_p * 100.0)
+
+                live_db.close_active_trade(
+                    trade_id_or_row_id=row_db_id,
+                    exit_time=exit_fill_time,
+                    exit_price=exit_fill_price,
+                    exit_reason=exit_triggered,
+                    gross_pnl=round(gross, 2),
+                    charges=20.0,
+                    peak_gain_pct=round(peak_pct, 2),
+                )
+                if exit_triggered == "SQUARE_OFF":
+                    st.session_state.live_kotak_executing = False
+                    st.toast(f"🔔 Kotak Live: Strategy Square-off ({strategy_sq_time.strftime('%H:%M')}) triggered! Position closed.", icon="⏹️")
+                else:
+                    st.toast(f"⏹️ Kotak Live: Trade exited via {exit_triggered} at ₹{exit_fill_price:.2f}! Net P&L: ₹{gross - 20:,.2f}", icon="⏹️")
+                st.rerun()
+
+    # Display Interactive Plotly Candlestick Chart (Current Date - strictly up to 15:30)
+    if candles_df is not None and not candles_df.empty and HAS_PLOTLY:
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.04,
+            subplot_titles=(f"📈 Live Current Date Kotak Chart: {active_instrument} ({timeframe_m}m - Market Hours 09:15 to 15:30)", "📊 Volume"),
+            row_heights=[0.75, 0.25],
+        )
+        plot_slice = candles_df.tail(60).copy()
+        fig.add_trace(go.Candlestick(
+            x=plot_slice["timestamp"].astype(str),
+            open=plot_slice["open"],
+            high=plot_slice["high"],
+            low=plot_slice["low"],
+            close=plot_slice["close"],
+            name=active_instrument,
+            increasing_line_color="#00e676",
+            decreasing_line_color="#ff5252",
+        ), row=1, col=1)
+
+        # Fast / Slow EMA overlays
+        fig.add_trace(go.Scatter(
+            x=plot_slice["timestamp"].astype(str),
+            y=plot_slice["close"].ewm(span=9, adjust=False).mean(),
+            mode="lines",
+            name="EMA 9",
+            line=dict(color="#00e5ff", width=1.5),
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=plot_slice["timestamp"].astype(str),
+            y=plot_slice["close"].ewm(span=21, adjust=False).mean(),
+            mode="lines",
+            name="EMA 21",
+            line=dict(color="#ffd600", width=1.5),
+        ), row=1, col=1)
+
+        # If active trade open, draw entry, target, and stop loss lines
+        if active_open_trade:
+            ep = float(active_open_trade.get("entry_price", 0.0))
+            fig.add_hline(y=ep, line_dash="dash", line_color="#2979ff", annotation_text=f"Entry: ₹{ep:.2f}", row=1, col=1)
+            if active_open_trade.get("stop_loss"):
+                fig.add_hline(y=float(active_open_trade["stop_loss"]), line_dash="dot", line_color="#ff5252", annotation_text="SL", row=1, col=1)
+            if active_open_trade.get("target"):
+                fig.add_hline(y=float(active_open_trade["target"]), line_dash="dot", line_color="#00e676", annotation_text="TP", row=1, col=1)
+
+        bar_colors = ["#00e676" if c >= o else "#ff5252" for c, o in zip(plot_slice["close"], plot_slice["open"])]
+        fig.add_trace(go.Bar(
+            x=plot_slice["timestamp"].astype(str),
+            y=plot_slice["volume"],
+            marker_color=bar_colors,
+            name="Volume",
+            opacity=0.6,
+        ), row=2, col=1)
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=420,
+            margin=dict(l=10, r=10, t=30, b=10),
+            xaxis_rangeslider_visible=False,
+            xaxis2_rangeslider_visible=False,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    # ---------------- Active Open Trade Highlight Card ----------------
+    if active_open_trade:
+        side_act = active_open_trade.get("side", "LONG")
+        box_class = "active-trade-box" if side_act == "LONG" else "active-trade-box-short"
+        entry_p = float(active_open_trade.get("entry_price", 0.0))
+        cur_ltp = float(gw.get_live_market_depth(active_instrument).get("ltp") or entry_p)
+        qty = int(active_open_trade.get("quantity", 65))
+        unrealized_pnl = (cur_ltp - entry_p) * qty if side_act == "LONG" else (entry_p - cur_ltp) * qty
+        gain_pct = (unrealized_pnl / (entry_p * qty) * 100.0) if entry_p > 0 else 0.0
+
+        st.markdown(f"""
+        <div class="{box_class}">
+            <div style="font-size: 1.15rem; font-weight: 800; color: {'#00e676' if side_act=='LONG' else '#ff5252'};">
+                ⚡ ACTIVE OPEN LIVE {side_act} TRADE #{active_open_trade.get('trade_id')} &nbsp;|&nbsp; Symbol: {active_open_trade.get('symbol')}
+            </div>
+            <div style="margin-top: 6px; font-size: 0.95rem; color: #fff;">
+                Entry Price: <b>₹{entry_p:.2f}</b> &nbsp;|&nbsp; Current LTP: <b>₹{cur_ltp:.2f}</b> &nbsp;|&nbsp;
+                Live MTM P&L: <b style="color: {'#00e676' if unrealized_pnl>=0 else '#ff5252'};">₹{unrealized_pnl:+,.2f} ({gain_pct:+.2f}%)</b> &nbsp;|&nbsp;
+                Target: <b>₹{float(active_open_trade.get('target', 0)):.2f}</b> &nbsp;|&nbsp; Stop Loss: <b>₹{float(active_open_trade.get('stop_loss', 0)):.2f}</b>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        btn_c1, btn_c2 = st.columns([2, 3])
+        with btn_c1:
+            if st.button("⏹️ Force Square Off Active Trade Now", key="force_sq_off_btn_live", use_container_width=True):
+                now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                opp_side = "SELL" if side_act == "LONG" else "BUY"
+                try:
+                    gw.place_market_order(symbol=active_instrument, side=opp_side, quantity=qty, reference_price=cur_ltp)
+                except Exception as e:
+                    logger.warning("Square off order error: %s", e)
+
+                live_db.close_active_trade(
+                    trade_id_or_row_id=active_open_trade.get("id"),
+                    exit_time=now_ts,
+                    exit_price=cur_ltp,
+                    exit_reason="MANUAL_SQUARE_OFF",
+                    gross_pnl=round(unrealized_pnl, 2),
+                    charges=20.0,
+                    peak_gain_pct=round(max(0.0, gain_pct), 2),
+                )
+                st.toast(f"⏹️ Squared off Trade #{active_open_trade.get('trade_id')} on Kotak Live!", icon="⏹️")
+                st.rerun()
+
+        with btn_c2:
+            if not is_mkt_open or datetime.now().time() >= strategy_sq_time:
+                sq_btn_label = f"⏹️ Auto Square-off Position (Past {strategy_sq_time.strftime('%H:%M')} Square-off Time)" if datetime.now().time() >= strategy_sq_time else "⏹️ Close Position (Market Closed at 15:30)"
+                if st.button(sq_btn_label, key="mkt_closed_sq_off_live_btn", type="primary", use_container_width=True):
+                    opp_side = "SELL" if side_act == "LONG" else "BUY"
+                    try:
+                        gw.place_market_order(symbol=active_instrument, side=opp_side, quantity=qty, reference_price=cur_ltp)
+                    except Exception as e:
+                        logger.warning("Square off order note: %s", e)
+
+                    exit_reason = "SQUARE_OFF" if datetime.now().time() >= strategy_sq_time else "MARKET_CLOSE_SQUARE_OFF"
+                    live_db.close_active_trade(
+                        trade_id_or_row_id=active_open_trade.get("id"),
+                        exit_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        exit_price=cur_ltp,
+                        exit_reason=exit_reason,
+                        gross_pnl=round(unrealized_pnl, 2),
+                        charges=20.0,
+                        peak_gain_pct=round(max(0.0, gain_pct), 2),
+                    )
+                    st.success(f"Live Position #{active_open_trade.get('trade_id')} squared off successfully!")
+                    st.rerun()
+
+    # ==============================================================================
+    # Equity Curve and Daily Net P&L Charts
+    # ==============================================================================
+    if not real_trades.empty:
+        ch_l, ch_r = st.columns(2)
+        with ch_l:
+            st.subheader("Equity Curve")
+            eq = pd.concat([pd.Series([capital]), capital + real_trades.sort_values("id")["net_pnl"].cumsum()], ignore_index=True)
+            st.line_chart(eq.rename("Equity (₹)"))
+
+        with ch_r:
+            st.subheader("Daily Net P&L")
+            if "session_date" in real_trades.columns:
+                daily_pnl = real_trades.groupby("session_date")["net_pnl"].sum()
+                st.bar_chart(daily_pnl)
+            elif "exit_time" in real_trades.columns:
+                real_trades["day"] = pd.to_datetime(real_trades["exit_time"]).dt.date
+                daily_pnl = real_trades.groupby("day")["net_pnl"].sum()
+                st.bar_chart(daily_pnl)
+
+        # Breakdowns
+        b_l, b_r = st.columns(2)
+        with b_l:
+            st.subheader("By Exit Reason")
+            by_exit = real_trades.groupby("exit_reason")["net_pnl"].agg(
+                Trades="count", Net_PnL="sum", Avg_Trade="mean"
+            ).round(2)
+            st.dataframe(by_exit, use_container_width=True)
+
+        with b_r:
+            st.subheader("By Side & Regime")
+            if "regime" in real_trades.columns and (real_trades["regime"] != "").any():
+                by_regime = real_trades.groupby("regime")["net_pnl"].agg(
+                    Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                ).round(2)
+                st.dataframe(by_regime, use_container_width=True)
+            else:
+                by_side = real_trades.groupby("side")["net_pnl"].agg(
+                    Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                ).round(2)
+                st.dataframe(by_side, use_container_width=True)
+
+    # ==============================================================================
+    # Trade Audit Trail (All Executions)
+    # ==============================================================================
+    st.markdown("---")
+    st.subheader("Trade Audit Trail (All Executions)")
+
+    if not trades.empty:
+        df_trail = trades.copy()
+
+        # Format Calculated_Score and Margin used
+        if "score" in df_trail.columns and "Calculated_Score" not in df_trail.columns:
+            df_trail["Calculated_Score"] = df_trail["score"]
+        if "quantity" in df_trail.columns and "entry_price" in df_trail.columns:
+            df_trail["Margin used"] = (df_trail["quantity"] * df_trail["entry_price"]).round(2)
+
+        # Peak gain calculation
+        if "peak_gain_pct" in df_trail.columns:
+            df_trail["peak_gain"] = df_trail.apply(
+                lambda r: f"{int(float(r['peak_gain_pct']) // 5) * 5}% (+{float(r['peak_gain_pct']):.1f}%)"
+                if float(r.get("peak_gain_pct", 0.0) or 0.0) >= 5.0
+                else f"0% (+{float(r.get('peak_gain_pct', 0.0) or 0.0):.1f}%)",
+                axis=1,
+            )
+        else:
+            df_trail["peak_gain"] = "0% (+0.0%)"
+
+        # Slabs 5%, 10%, 15%, 20%, 25%, 30%
+        slabs = [5, 10, 15, 20, 25, 30]
+        slab_cols = [f"{s}%" for s in slabs]
+        for c in slab_cols:
+            df_trail[c] = "-"
+
+        for idx, r_tr in df_trail.iterrows():
+            if str(r_tr.get("status")) == "NO_TRADE":
+                continue
+            pk = float(r_tr.get("peak_gain_pct", 0.0) or 0.0)
+            sc = int(r_tr.get("score", 0) or 0)
+            sc_str = f"+{sc}" if sc > 0 else str(sc)
+            for s, c_name in zip(slabs, slab_cols):
+                if pk >= s:
+                    df_trail.at[idx, c_name] = sc_str
+
+        # Format Trade id column for presentation (e.g. Trade id-5000)
+        def format_trade_id_display(r):
+            tid = r.get("trade_id")
+            s_date = str(r.get("session_date") or str(r.get("entry_time", ""))[:10])
+            side = str(r.get("side", ""))
+            if str(r.get("status")) == "NO_TRADE" or side == "No Trade":
+                return f"No Trade ({s_date})"
+            return f"Trade id-{tid}"
+
+        df_trail["Display_ID"] = df_trail.apply(format_trade_id_display, axis=1)
+
+        cols_wanted = [
+            "Display_ID", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
+            "quantity", "entry_price", "Margin used", "peak_gain",
+            "5%", "10%", "15%", "20%", "25%", "30%",
+            "exit_price", "stop_loss", "target",
+            "exit_reason", "gross_pnl", "charges", "net_pnl", "status",
+        ]
+        display_cols = [c for c in cols_wanted if c in df_trail.columns]
+
+        # Row highlighting logic: Highlight active records alone with colors!
+        def highlight_active_rows(row):
+            st_val = str(row.get("status", "")).upper()
+            sd_val = str(row.get("side", "")).upper()
+            if st_val == "ACTIVE":
+                if "LONG" in sd_val or "BUY" in sd_val:
+                    return ["background-color: rgba(0, 230, 118, 0.35); color: #00e676; font-weight: 700; border-left: 5px solid #00e676;"] * len(row)
+                else:
+                    return ["background-color: rgba(255, 82, 82, 0.35); color: #ff5252; font-weight: 700; border-left: 5px solid #ff5252;"] * len(row)
+            elif st_val == "NO_TRADE" or "NO TRADE" in sd_val:
+                return ["color: #888888; font-style: italic; background-color: rgba(255, 255, 255, 0.02);"] * len(row)
+            return [""] * len(row)
+
+        styled_trail = df_trail[display_cols].style.apply(highlight_active_rows, axis=1).format({
+            "entry_price": "₹{:.2f}",
+            "exit_price": "₹{:.2f}",
+            "gross_pnl": "₹{:+,.2f}",
+            "charges": "₹{:.2f}",
+            "net_pnl": "₹{:+,.2f}",
+            "Margin used": "₹{:,.2f}",
+            "stop_loss": "₹{:.2f}",
+            "target": "₹{:.2f}",
+        }, na_rep="-")
+
+        st.dataframe(
+            styled_trail,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
+                "session_date": st.column_config.TextColumn("Session Date"),
+                "status": st.column_config.TextColumn("Status", help="ACTIVE (Open), CLOSED, or NO_TRADE"),
+                "Margin used": st.column_config.TextColumn("Margin used", help="Margin used per trade = Quantity × Entry Price"),
+                "peak_gain": st.column_config.TextColumn("peak_gain", help="Crossed profit slab reached before reversing to exit / Stop."),
+            },
+        )
+
+        # ==============================================================================
+        # Trade Audit Trail-2 (Candle Progression: C1 to C360)
+        # Dynamic Auto-Increment Population for each 1m/3m/5m candle at live market
+        # ==============================================================================
+        st.markdown("---")
+        st.subheader("Trade Audit Trail-2 (Candle Progression: C1 to C360)")
+        st.caption(
+            "Candle-by-candle multi-factor confluence score and percentage gain from entry until exit. "
+            "Format: Score(Gain%) e.g. +5(+10.0%), +4(+1.3%). "
+            "Auto-increments for each 1m/3m candle in real time; active records highlighted in color."
+        )
+
+        c_cols = [f"C{i}" for i in range(1, 361)]
+        c_data = {col: ["-"] * len(df_trail) for col in c_cols}
+
+        for row_i, (_, r_tr) in enumerate(df_trail.iterrows()):
+            if str(r_tr.get("status")) == "NO_TRADE":
+                continue
+
+            e_str = str(r_tr.get("entry_time", ""))
+            x_str = str(r_tr.get("exit_time", ""))
+            e_p = float(r_tr.get("entry_price", 0.0) or 0.0)
+            side = str(r_tr.get("side", "LONG")).upper()
+            tr_status = str(r_tr.get("status", "CLOSED")).upper()
+
+            candles_matched = []
+            if scored_candles is not None and not scored_candles.empty and e_str:
+                try:
+                    e_dt = pd.to_datetime(e_str)
+                    if e_dt.tzinfo is not None:
+                        e_dt = e_dt.tz_localize(None)
+
+                    # Match candles after entry_time
+                    m = scored_candles["timestamp"] >= e_dt
+                    if tr_status == "CLOSED" and x_str:
+                        x_dt = pd.to_datetime(x_str)
+                        if x_dt.tzinfo is not None:
+                            x_dt = x_dt.tz_localize(None)
+                        m = m & (scored_candles["timestamp"] <= x_dt)
+
+                    sub_candles = scored_candles[m]
+                    if not sub_candles.empty:
+                        candles_matched = sub_candles.to_dict("records")
+                except Exception as ex:
+                    logger.debug("Candle match error for trade %s: %s", r_tr.get("trade_id"), ex)
+
+            if candles_matched:
+                for k, c_row in enumerate(candles_matched[:360]):
+                    c_close = float(c_row.get("close", e_p))
+                    c_score = int(c_row.get("consensus_score", r_tr.get("score", 0)))
+                    sc_str = f"+{c_score}" if c_score > 0 else str(c_score)
+                    if e_p > 0:
+                        if "LONG" in side or "BUY" in side:
+                            pct = round((c_close - e_p) / e_p * 100.0, 1)
+                        else:
+                            pct = round((e_p - c_close) / e_p * 100.0, 1)
+                    else:
+                        pct = 0.0
+                    pct_str = f"+{pct:.1f}%" if pct >= 0 else f"{pct:.1f}%"
+                    c_data[f"C{k+1}"][row_i] = f"{sc_str}({pct_str})"
+            else:
+                # Fallback synthesized progression based on peak gain and entry score
+                pk_val = float(r_tr.get("peak_gain_pct", 0.0) or 0.0)
+                sc_val = int(r_tr.get("score", 0) or 0)
+                sc_txt = f"+{sc_val}" if sc_val > 0 else str(sc_val)
+                steps = min(10, max(1, int(pk_val // 1.5))) if pk_val > 0 else 1
+                for k in range(steps):
+                    pct_step = round((k + 1) * (pk_val / max(1, steps)), 1)
+                    c_data[f"C{k+1}"][row_i] = f"{sc_txt}(+{pct_step}%)"
+
+        c_df = pd.DataFrame(c_data, index=df_trail.index)
+        base_cols_2 = [c for c in display_cols if c in df_trail.columns]
+        trades_2 = pd.concat([df_trail[base_cols_2], c_df], axis=1)
+
+        col_a, col_b = st.columns([3, 1])
+        with col_b:
+            st.download_button(
+                label="📥 Export Trail-2 CSV",
+                data=trades_2.to_csv(index=False).encode("utf-8"),
+                file_name=f"live_trade_audit_trail_2_{selected_strat}.csv",
+                mime="text/csv",
+                key="dl_trade_audit_trail_2_live",
+                use_container_width=True,
+            )
+
+        styled_trail_2 = trades_2.style.apply(highlight_active_rows, axis=1)
+        st.dataframe(styled_trail_2, use_container_width=True, hide_index=True)
+
+    else:
+        st.info(f"No live trades recorded yet for strategy `{selected_strat}` within the previous one month.")
+
+    # ==============================================================================
+    # Historical Raw Data (All Records)
+    # Filtered strictly for regular market trading hours (09:15:00 to 15:30:00 IST)
+    # ==============================================================================
+    st.markdown("---")
+    st.subheader("📊 Historical Raw Data (All Records)")
+
+    executed_dates = live_db.get_executed_dates_for_strategy(selected_strat, max_days=30)
+    if not executed_dates and not trades.empty:
+        # Fallback to unique dates in trades table
+        executed_dates = [
+            str(d) for d in trades["session_date"].dropna().unique()
+            if str(d) >= one_month_ago_str
+        ]
+
+    # Load raw candles from local store / Kotak cache
+    timeframe_val = int(inst_cfg.get("timeframe", 5))
+    raw_df = pd.DataFrame()
+
+    candle_files = [
+        f"data/{active_instrument.lower()}_{timeframe_val}m.csv",
+        f"data/{active_instrument.lower()}_5m.csv",
+        "data/nifty26oct22500pe_5m.csv",
+        "data/nifty26oct22500pe_1m.csv",
+        "data/nifty_5m.csv",
+    ]
+    for cf in candle_files:
+        if os.path.exists(cf):
+            raw_df = load_csv(cf)
+            if raw_df is not None and not raw_df.empty:
+                break
+
+    if raw_df is not None and not raw_df.empty:
+        raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"])
+        if raw_df["timestamp"].dt.tz is not None:
+            raw_df["timestamp"] = raw_df["timestamp"].dt.tz_localize(None)
+
+        # Filter strictly for regular market hours (09:15 to 15:30)
+        raw_df = raw_df[
+            (raw_df["timestamp"].dt.time >= time(9, 15, 0)) &
+            (raw_df["timestamp"].dt.time <= time(15, 30, 0))
+        ].reset_index(drop=True)
+
+        # Filter strictly for previous one month
+        mask_month = (raw_df["timestamp"].dt.date >= one_month_ago) & (raw_df["timestamp"].dt.date <= today)
+
+        # Also filter strictly for dates where live trades were executed
+        if executed_dates:
+            exec_dates_set = set(pd.to_datetime(d).date() for d in executed_dates)
+            mask_exec = raw_df["timestamp"].dt.date.isin(exec_dates_set)
+            filtered_raw = raw_df[mask_month & mask_exec].copy()
+            if filtered_raw.empty:
+                filtered_raw = raw_df[mask_month].copy()
+        else:
+            filtered_raw = raw_df[mask_month].copy()
+
+        if not filtered_raw.empty:
+            filtered_raw = filtered_raw.sort_values("timestamp").reset_index(drop=True)
+
+            # Direction Of Change
+            diff = filtered_raw["close"].diff()
+            direction_col = pd.Series("", index=filtered_raw.index, dtype=str)
+            direction_col[diff > 0] = "🟢 UP"
+            direction_col[diff < 0] = "🔴 DOWN"
+            if len(direction_col) > 0:
+                direction_col.iloc[0] = ""
+            filtered_raw["Direction Of Change"] = direction_col
+
+            def style_direction_cell(val):
+                if "UP" in str(val) or "🟢" in str(val):
+                    return "background-color: rgba(38, 166, 154, 0.22); color: #26a69a; font-weight: 700; border-radius: 4px;"
+                elif "DOWN" in str(val) or "🔴" in str(val):
+                    return "background-color: rgba(239, 83, 80, 0.22); color: #ef5350; font-weight: 700; border-radius: 4px;"
+                return ""
+
+            styled_raw = filtered_raw.style.map(
+                style_direction_cell, subset=["Direction Of Change"]
+            ).format({
+                "open": "{:.2f}",
+                "high": "{:.2f}",
+                "low": "{:.2f}",
+                "close": "{:.2f}",
+                "volume": "{:,.0f}",
+            })
+
+            st.caption(
+                f"Displaying **{len(filtered_raw):,}** historical records for live trade executed dates within the previous 1 month "
+                f"(`{one_month_ago_str}` to `{today_str}`) strictly between 09:15:00 and 15:30:00 IST. Older data is excluded."
+            )
+
             st.dataframe(
-                orders_df[["order_id", "gateway", "timestamp", "symbol", "side", "quantity", "price", "status", "reason"]],
+                styled_raw,
                 use_container_width=True,
                 hide_index=True,
+                column_config={
+                    "timestamp": st.column_config.TextColumn("timestamp"),
+                    "open": st.column_config.NumberColumn("open", format="%.2f"),
+                    "high": st.column_config.NumberColumn("high", format="%.2f"),
+                    "low": st.column_config.NumberColumn("low", format="%.2f"),
+                    "close": st.column_config.NumberColumn("close", format="%.2f"),
+                    "volume": st.column_config.NumberColumn("volume", format="%d"),
+                    "Direction Of Change": st.column_config.TextColumn("Direction Of Change"),
+                },
             )
+
+            csv_bytes = filtered_raw.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download Historical Raw Data (CSV)",
+                data=csv_bytes,
+                file_name=f"{active_instrument}_live_trade_raw_candles_{one_month_ago_str}_{today_str}.csv",
+                mime="text/csv",
+                key="btn_dl_raw_candles_live",
+            )
+        else:
+            st.info(f"No historical raw candles found for live trade executed dates between `{one_month_ago_str}` and `{today_str}`.")
+    else:
+        st.info("No raw candle dataset available for this instrument.")
+
+    # ---------------- 2-Second Live Auto Refresh Loop ----------------
+    if is_live_running:
+        _time.sleep(2.0)
+        st.rerun()
+
 
 if __name__ == "__main__":
     st.set_page_config(
-        page_title="AI Live Trading Terminal",
+        page_title="Live Trading Terminal",
         page_icon="⚡",
         layout="wide",
         initial_sidebar_state="expanded",

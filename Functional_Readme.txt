@@ -312,6 +312,38 @@ TRADE AUDIT TRAIL & TRADE AUDIT TRAIL-2:
 - Exportable to CSV via "Export Trail-2 CSV" button.
 ===============================================================
 
+===============================================================
+KOTAK NEO LIVE TRADE API INTEGRATION & USE CASES:
+See full architecture document: docs/KOTAK_LIVE_TRADE_USE_CASES.md
+
+Core Categories & Endpoints:
+1. Session & Auth:
+   - login() & session_2fa(): Generates bearer_token and sid via Kotak TOTP flow.
+   - ensure_authenticated(): Automatic silent re-authentication on 401 / 100022 expiry.
+   - get_connection_info(): Real-time broker connectivity & latency diagnostics.
+
+2. Live Market Data:
+   - get_live_market_depth(): Real-time LTP, 5-level Best Bid/Ask depth & volume every 2 seconds.
+   - get_ltp(): Fast tick lookup for live unrealized MTM P&L calculation.
+   - fetch_historical_candles(): 1m/3m/5m OHLCV feeds strictly between 09:15:00 and 15:30:00 IST.
+
+3. Pre-Trade Risk Management (RiskConfig):
+   - get_open_positions_count(): Enforces max_open_positions (e.g. 3) on Kotak API positions.
+   - get_loss_trades_today(): Enforces max_consecutive_losses (e.g. 3) to halt trading.
+   - get_balance(): Enforces capital and margin requirements prior to order placement.
+
+4. Live Order Execution (Bracket / OCO Order Flow):
+   - place_market_order(): Places Market entry order (BUY for LONG / SELL for SHORT).
+   - place_target_order(): Places limit profit-booking target order (e.g. +30%).
+   - place_stoploss_order(): Places stop-loss trigger order (e.g. -5%).
+   - cancel_order(): Cancels opposite bracket leg upon fill to avoid double fills.
+
+5. Square-Off & Exits:
+   - Strategy Square-Off: Automatic market exit at strategy square_off_time (e.g. 15:15 IST).
+   - Market Close Square-Off: Automatic market exit at regular close (15:30 IST).
+   - emergency_square_off_all(): One-click cancellation of pending orders & square-off of all open positions.
+===============================================================
+
 Repository URL: https://github.com/nambirajan87/ai_autotrading_v1
 
 ===============================================================

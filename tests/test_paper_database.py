@@ -165,3 +165,112 @@ def test_paper_database_runs_and_metrics_filtering(temp_db):
     assert loss_metrics["win_rate"] == 0.0
     assert loss_metrics["net_pnl"] == -1000.0
 
+
+def test_paper_orders_persistence(temp_db):
+    # Test manual order recording
+    order_id = temp_db.record_order({
+        "run_id": 99,
+        "gateway": "KOTAK-PAPER",
+        "symbol": "NIFTY26OCT22500PE",
+        "side": "BUY",
+        "quantity": 65,
+        "price": 200.0,
+        "status": "FILLED",
+        "reason": "MOMENTUM_BREAKOUT",
+    })
+    assert order_id > 0
+
+    orders = temp_db.get_orders(run_id=99)
+    assert len(orders) == 1
+    assert orders[0]["symbol"] == "NIFTY26OCT22500PE"
+    assert orders[0]["side"] == "BUY"
+    assert orders[0]["price"] == 200.0
+    assert orders[0]["status"] == "FILLED"
+
+    # Test auto-order creation during save_run
+    run_id = temp_db.save_run(
+        {"strategy_name": "ORDER_TEST", "symbol": "RELIANCE"},
+        [{
+            "trade_id": 1,
+            "side": "LONG",
+            "quantity": 50,
+            "entry_time": "2026-10-09 10:00:00",
+            "entry_price": 2500.0,
+            "exit_time": "2026-10-09 11:00:00",
+            "exit_price": 2550.0,
+            "exit_reason": "TARGET",
+            "gross_pnl": 2500.0,
+            "charges": 40.0,
+            "net_pnl": 2460.0,
+        }],
+    )
+    run_orders = temp_db.get_orders(run_id=run_id)
+    assert len(run_orders) == 2  # 1 entry order + 1 exit order
+    assert run_orders[0]["side"] in ("BUY", "SELL")
+    assert run_orders[1]["side"] in ("BUY", "SELL")
+
+
+def test_accumulated_trades_and_active_trade_lifecycle(temp_db):
+    from datetime import date, timedelta
+    today_str = str(date.today())
+    old_date_str = str(date.today() - timedelta(days=45))
+
+    # 1. Save an active open trade
+    t_id = temp_db.save_active_trade(
+        strategy_name="TEST_ACCUM",
+        symbol="NIFTY26OCT22500PE",
+        session_date=today_str,
+        trade_id=5000,
+        side="LONG",
+        quantity=65,
+        entry_time=f"{today_str} 10:15:00",
+        entry_price=160.0,
+        stop_loss=154.0,
+        target=175.0,
+        score=5,
+        regime="TRENDING",
+    )
+    assert t_id is not None
+
+    accum = temp_db.get_accumulated_trades_for_strategy("TEST_ACCUM", max_days=30)
+    assert len(accum) == 1
+    assert accum[0]["status"] == "ACTIVE"
+    assert accum[0]["side"] == "LONG"
+    assert accum[0]["entry_price"] == 160.0
+
+    # 2. Close the active trade
+    temp_db.close_active_trade(
+        trade_id_or_row_id=t_id,
+        exit_time=f"{today_str} 11:30:00",
+        exit_price=175.0,
+        exit_reason="TARGET",
+        gross_pnl=975.0,
+        charges=20.0,
+        peak_gain_pct=9.38,
+    )
+    accum_closed = temp_db.get_accumulated_trades_for_strategy("TEST_ACCUM", max_days=30)
+    assert len(accum_closed) == 1
+    assert accum_closed[0]["status"] == "CLOSED"
+    assert accum_closed[0]["exit_reason"] == "TARGET"
+    assert accum_closed[0]["net_pnl"] == 955.0
+
+    # 3. Record a No-Trade session
+    temp_db.record_no_trade_day("TEST_ACCUM", "NIFTY26OCT22500PE", str(date.today() - timedelta(days=2)))
+    accum_with_no_trade = temp_db.get_accumulated_trades_for_strategy("TEST_ACCUM", max_days=30)
+    assert len(accum_with_no_trade) == 2
+    sides = [t["side"] for t in accum_with_no_trade]
+    assert "No Trade" in sides
+    assert "LONG" in sides
+
+    # 4. Ensure records older than 30 days are omitted
+    temp_db.save_single_trade(
+        strategy_name="TEST_ACCUM",
+        symbol="NIFTY26OCT22500PE",
+        session_date=old_date_str,
+        trade={"trade_id": 9999, "side": "LONG", "gross_pnl": 500.0, "net_pnl": 480.0, "entry_time": f"{old_date_str} 10:00:00"},
+    )
+    accum_30d = temp_db.get_accumulated_trades_for_strategy("TEST_ACCUM", max_days=30)
+    dates_in_accum = [t["session_date"] for t in accum_30d]
+    assert old_date_str not in dates_in_accum
+
+

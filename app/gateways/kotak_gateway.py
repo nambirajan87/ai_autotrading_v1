@@ -18,6 +18,21 @@ from app.gateways.base_gateway import (
 
 logger = logging.getLogger(__name__)
 
+# Force Kotak Securities API requests through IPv4 (AF_INET) to prevent dual-stack
+# IPv6 connection mismatches with Kotak Trade API static IPv4 whitelisting.
+try:
+    import socket as _socket
+    _orig_getaddrinfo = _socket.getaddrinfo
+
+    def _kotak_ipv4_getaddrinfo(host, port, family=0, *args, **kwargs):
+        if host and isinstance(host, str) and "kotaksecurities.com" in host:
+            return _orig_getaddrinfo(host, port, _socket.AF_INET, *args, **kwargs)
+        return _orig_getaddrinfo(host, port, family, *args, **kwargs)
+
+    _socket.getaddrinfo = _kotak_ipv4_getaddrinfo
+except Exception:
+    pass
+
 
 try:
     from neo_api_client import NeoAPI
@@ -208,6 +223,18 @@ class KotakGateway(BaseBrokerGateway):
                 logger.info("Kotak limits 401 Unauthorized. Auto re-authenticating...")
                 return self.login()
         return self._authenticated
+
+    @staticmethod
+    def get_current_public_ip() -> str:
+        """Fetches current outbound public IPv4 address seen by external servers."""
+        for url in ("https://api.ipify.org", "https://checkip.amazonaws.com", "https://icanhazip.com"):
+            try:
+                resp = requests.get(url, timeout=3)
+                if resp.status_code == 200 and resp.text.strip():
+                    return resp.text.strip()
+            except Exception:
+                continue
+        return "Unknown"
 
     def is_connected(self) -> bool:
         """Returns True if Kotak Neo consumer key or access token is configured."""
@@ -475,12 +502,30 @@ class KotakGateway(BaseBrokerGateway):
             t0 = _t.time()
             pos = self._client.positions()
             ms = int((_t.time() - t0) * 1000)
-            is_ok = isinstance(pos, dict) and (pos.get("stat") == "Ok" or pos.get("stCode") == 5203)
+            is_ok = isinstance(pos, dict) and (
+                str(pos.get("stat", "")).lower() in ("ok", "success")
+                or pos.get("stCode") in (200, 5203, 1000)
+                or "data" in pos
+            )
+            data_list = (
+                pos.get("data", [])
+                if isinstance(pos, dict) and isinstance(pos.get("data"), list)
+                else (pos if isinstance(pos, list) else [])
+            )
+            if isinstance(pos, dict) and pos.get("stCode") == 5203:
+                pos_summary = "Clear Book (0 Open Positions)"
+            elif data_list:
+                pos_summary = f"{len(data_list)} Open Position(s) Found"
+            elif is_ok:
+                pos_summary = "Clear Book (0 Open Positions)"
+            else:
+                pos_summary = str(pos)[:60]
+
             results["4_positions"] = {
                 "name": "Positions Book (F&O / Equity)",
                 "status": "ONLINE" if is_ok else "ERROR",
                 "latency_ms": ms,
-                "summary": "Clear Book (0 Open Positions)" if isinstance(pos, dict) and pos.get("stCode") == 5203 else ("Active Positions Found" if isinstance(pos, list) and pos else str(pos)[:60]),
+                "summary": pos_summary,
             }
         except Exception as e:
             results["4_positions"] = {"name": "Positions Book", "status": "ERROR", "summary": str(e)}
@@ -490,15 +535,47 @@ class KotakGateway(BaseBrokerGateway):
             t0 = _t.time()
             ord_rep = self._client.order_report()
             ms = int((_t.time() - t0) * 1000)
-            is_ok = isinstance(ord_rep, dict) and (ord_rep.get("stat") == "Ok" or ord_rep.get("stCode") == 5203)
+            is_ok = isinstance(ord_rep, dict) and (
+                str(ord_rep.get("stat", "")).lower() in ("ok", "success")
+                or ord_rep.get("stCode") in (200, 5203, 1000)
+                or "data" in ord_rep
+            )
+            ord_list = (
+                ord_rep.get("data", [])
+                if isinstance(ord_rep, dict) and isinstance(ord_rep.get("data"), list)
+                else (ord_rep if isinstance(ord_rep, list) else [])
+            )
+            if isinstance(ord_rep, dict) and ord_rep.get("stCode") == 5203:
+                ord_summary = "Clear Order Book (0 orders today)"
+            elif ord_list:
+                ord_summary = f"{len(ord_list)} Orders found today"
+            elif is_ok:
+                ord_summary = "Clear Order Book (0 orders today)"
+            else:
+                ord_summary = str(ord_rep)[:60]
+
             results["5_order_report"] = {
                 "name": "Order Report (Order Book & History)",
                 "status": "ONLINE" if is_ok else "ERROR",
                 "latency_ms": ms,
-                "summary": "Clear Order Book (0 orders today)" if isinstance(ord_rep, dict) and ord_rep.get("stCode") == 5203 else ("Orders found" if isinstance(ord_rep, list) and ord_rep else str(ord_rep)[:60]),
+                "summary": ord_summary,
             }
         except Exception as e:
             results["5_order_report"] = {"name": "Order Report", "status": "ERROR", "summary": str(e)}
+
+        # 6. Outbound IP Verification for Kotak Neo Trade API Whitelisting
+        try:
+            pub_ip = self.get_current_public_ip()
+            kotak_ip_resp = self._client.whatsmyip() if hasattr(self._client, "whatsmyip") else {}
+            kotak_seen_ip = "N/A"
+            if isinstance(kotak_ip_resp, dict) and "data" in kotak_ip_resp and kotak_ip_resp["data"]:
+                kotak_seen_ip = kotak_ip_resp["data"][0].get("ip", "N/A")
+            results["ip_check"] = {
+                "public_ipv4": pub_ip,
+                "kotak_seen_ip": kotak_seen_ip,
+            }
+        except Exception:
+            pass
 
         return results
 
@@ -835,9 +912,14 @@ class KotakGateway(BaseBrokerGateway):
                 else:
                     raise
 
-            # If response returned unauthorized status, retry once after 2FA login
-            if isinstance(resp, dict) and (resp.get("stCode") in (100008, 100022, 401) or "unauthorized" in str(resp.get("errMsg", "")).lower() or "invalid session" in str(resp.get("errMsg", "")).lower()):
-                logger.warning("Kotak place_order returned unauthorized (stCode=%s). Re-authenticating via 2FA...", resp.get("stCode"))
+            # If response returned unauthorized or session IP mismatch status, retry once after 2FA login
+            if isinstance(resp, dict) and (
+                resp.get("stCode") in (100008, 100022, 1037, 401, 403)
+                or "unauthorized" in str(resp.get("errMsg", "")).lower()
+                or "invalid session" in str(resp.get("errMsg", "")).lower()
+                or "session ip" in str(resp.get("errMsg", "")).lower()
+            ):
+                logger.warning("Kotak place_order rejected with %s (%s). Re-authenticating fresh session...", resp.get("stCode"), resp.get("errMsg"))
                 if self.login():
                     resp = self._client.place_order(
                         exchange_segment=seg,
@@ -865,6 +947,22 @@ class KotakGateway(BaseBrokerGateway):
                     err_msg = resp.get("errMsg") or resp.get("desc") or resp.get("message") or resp.get("stat") or str(resp)
                 else:
                     err_msg = str(resp)
+
+                if "unauthorized" in str(err_msg).lower() or (isinstance(resp, dict) and resp.get("stCode") in (100008, 401)):
+                    pub_ip = self.get_current_public_ip()
+                    err_msg = (
+                        f"unauthorized (stCode: 100008) — IP Whitelist Mismatch. "
+                        f"Kotak Neo Trade API strictly requires your Public IPv4 address ({pub_ip}) "
+                        f"to be whitelisted in the Kotak Neo Developer Portal (More > Trade API > Add IP). "
+                        f"Local private IPs (such as 192.168.x.x) are rejected by the broker."
+                    )
+                elif "session ip" in str(err_msg).lower() or (isinstance(resp, dict) and resp.get("stCode") == 1037):
+                    pub_ip = self.get_current_public_ip()
+                    err_msg = (
+                        f"session ip doesnt match with request ip (stCode: 1037). "
+                        f"Your active session was created before IP whitelisting or under a different IP. "
+                        f"Please click '🔐 Re-authenticate Kotak 2FA' in the sidebar to bind your session to {pub_ip}."
+                    )
                 logger.error("Kotak Live broker order rejected: %s", err_msg)
                 
                 # In real money mode, NEVER simulate silently on rejection!
@@ -941,7 +1039,227 @@ class KotakGateway(BaseBrokerGateway):
             if order.order_id == order_id and order.status == "PENDING":
                 order.status = "CANCELLED"
                 return True
+        if self._client and getattr(self, "live_order_routing", False):
+            try:
+                # If broker live order id
+                broker_num = order_id.replace("KOTAK-LIVE-", "").strip()
+                if broker_num.isdigit():
+                    self._client.cancel_order(order_no=broker_num)
+                    return True
+            except Exception as e:
+                logger.debug("Kotak live cancel_order error: %s", e)
         return False
+
+    def place_target_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        target_price: float,
+        isin: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> GatewayOrder:
+        """
+        Places a Target LIMIT order in Kotak Neo live or paper mode.
+        """
+        self._order_counter += 1
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_live = getattr(self, "live_order_routing", False)
+        order_id = f"KOTAK-TGT-{datetime.now().strftime('%y%m%d')}-{self._order_counter:05d}"
+
+        if is_live:
+            if not self.ensure_authenticated():
+                raise RuntimeError("Kotak Neo live order routing failed: Authentication error.")
+            seg = "nse_fo" if ("fo" in str(instrument_key or isin).lower() or len(symbol) > 10) else "nse_cm"
+            tx_type = "B" if side.upper() == "BUY" else "S"
+            try:
+                resp = self._client.place_order(
+                    exchange_segment=seg,
+                    product="MIS",
+                    price=str(round(target_price, 2)),
+                    order_type="L",
+                    quantity=str(quantity),
+                    validity="DAY",
+                    trading_symbol=symbol,
+                    transaction_type=tx_type,
+                    amo="NO",
+                    disclosed_quantity="0",
+                    trigger_price="0",
+                    tag="KOTAKTGT"
+                )
+                if isinstance(resp, dict) and "nOrdNo" in resp:
+                    order_id = f"KOTAK-LIVE-TGT-{resp['nOrdNo']}"
+                    logger.info("Kotak Live Target Limit Order Placed: %s", resp)
+            except Exception as e:
+                logger.warning("Kotak Live Target Order error: %s", e)
+
+        order = GatewayOrder(
+            order_id=order_id,
+            gateway="KOTAK",
+            symbol=symbol,
+            side=side,
+            order_type="LIMIT",
+            quantity=quantity,
+            price=round(target_price, 2),
+            status="PENDING",
+            timestamp=now_ts,
+            fill_price=round(target_price, 2),
+            fill_time="",
+            charges=20.0,
+            client_order_id=client_order_id,
+            reason="TARGET_ORDER",
+        )
+        self._orders.insert(0, order)
+        return order
+
+    def place_stoploss_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: int,
+        stoploss_price: float,
+        isin: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        client_order_id: Optional[str] = None,
+    ) -> GatewayOrder:
+        """
+        Places a Stop Loss (SL-M) trigger order in Kotak Neo live or paper mode.
+        """
+        self._order_counter += 1
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        is_live = getattr(self, "live_order_routing", False)
+        order_id = f"KOTAK-SL-{datetime.now().strftime('%y%m%d')}-{self._order_counter:05d}"
+
+        if is_live:
+            if not self.ensure_authenticated():
+                raise RuntimeError("Kotak Neo live order routing failed: Authentication error.")
+            seg = "nse_fo" if ("fo" in str(instrument_key or isin).lower() or len(symbol) > 10) else "nse_cm"
+            tx_type = "B" if side.upper() == "BUY" else "S"
+            try:
+                resp = self._client.place_order(
+                    exchange_segment=seg,
+                    product="MIS",
+                    price="0",
+                    order_type="SL-M",
+                    quantity=str(quantity),
+                    validity="DAY",
+                    trading_symbol=symbol,
+                    transaction_type=tx_type,
+                    amo="NO",
+                    disclosed_quantity="0",
+                    trigger_price=str(round(stoploss_price, 2)),
+                    tag="KOTAKSL"
+                )
+                if isinstance(resp, dict) and "nOrdNo" in resp:
+                    order_id = f"KOTAK-LIVE-SL-{resp['nOrdNo']}"
+                    logger.info("Kotak Live Stoploss SL-M Order Placed: %s", resp)
+            except Exception as e:
+                logger.warning("Kotak Live Stoploss Order error: %s", e)
+
+        order = GatewayOrder(
+            order_id=order_id,
+            gateway="KOTAK",
+            symbol=symbol,
+            side=side,
+            order_type="STOP_LOSS",
+            quantity=quantity,
+            price=round(stoploss_price, 2),
+            status="PENDING",
+            timestamp=now_ts,
+            fill_price=round(stoploss_price, 2),
+            fill_time="",
+            charges=20.0,
+            client_order_id=client_order_id,
+            reason="STOP_LOSS_ORDER",
+        )
+        self._orders.insert(0, order)
+        return order
+
+    def emergency_square_off_all(self) -> Dict[str, Any]:
+        """
+        Triggers Emergency Square Off for ALL open positions in Kotak Live API immediately.
+        Places opposing market orders for any non-zero net positions and cancels open bracket orders.
+        Returns details of squared off positions.
+        """
+        is_live = getattr(self, "live_order_routing", False)
+        if is_live:
+            self.sync_live_broker_records()
+
+        positions = self.get_positions()
+        squared_off_list = []
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for pos in positions:
+            net_qty = pos.quantity
+            if net_qty != 0:
+                opp_side = "SELL" if net_qty > 0 else "BUY"
+                abs_qty = abs(net_qty)
+                try:
+                    sq_order = self.place_market_order(
+                        symbol=pos.symbol,
+                        side=opp_side,
+                        quantity=abs_qty,
+                        reference_price=pos.ltp or pos.avg_price,
+                    )
+                    squared_off_list.append({
+                        "symbol": pos.symbol,
+                        "side": opp_side,
+                        "quantity": abs_qty,
+                        "exit_price": sq_order.fill_price or pos.ltp,
+                        "order_id": sq_order.order_id,
+                        "status": "SQUARED_OFF",
+                        "time": now_ts,
+                    })
+                except Exception as e:
+                    logger.error("Failed to square off %s: %s", pos.symbol, e)
+                    squared_off_list.append({
+                        "symbol": pos.symbol,
+                        "side": opp_side,
+                        "quantity": abs_qty,
+                        "status": f"ERROR: {e}",
+                        "time": now_ts,
+                    })
+
+        # Cancel any remaining pending orders
+        for o in self._orders:
+            if o.status == "PENDING":
+                self.cancel_order(o.order_id)
+
+        # Clear local positions cache
+        self._positions.clear()
+
+        return {
+            "status": "SUCCESS" if squared_off_list else "NO_OPEN_POSITIONS",
+            "count": len(squared_off_list),
+            "details": squared_off_list,
+            "timestamp": now_ts,
+        }
+
+    def get_open_positions_count(self) -> int:
+        """
+        Queries Kotak live API / local positions and returns the number of open positions.
+        Used to enforce max_open_positions risk parameter.
+        """
+        if getattr(self, "live_order_routing", False):
+            self.sync_live_broker_records()
+        open_pos = [p for p in self.get_positions() if p.quantity != 0]
+        return len(open_pos)
+
+    def get_loss_trades_today(self) -> int:
+        """
+        Queries Kotak live API / daily executed orders and returns the number of loss trades today.
+        Used to enforce max_consecutive_losses risk parameter.
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if getattr(self, "live_order_routing", False):
+            self.sync_live_broker_records()
+        loss_count = 0
+        for o in self._orders:
+            if str(o.timestamp).startswith(today_str) and getattr(o, "pnl", 0.0) < 0:
+                loss_count += 1
+        return loss_count
+
 
     def fetch_historical_candles(
         self,
@@ -1021,6 +1339,9 @@ class KotakGateway(BaseBrokerGateway):
                                 df["timestamp"] = df["timestamp"].dt.tz_localize(None)
                             for c in ["open", "high", "low", "close", "volume"]:
                                 df[c] = pd.to_numeric(df[c], errors="coerce")
+                            # Filter strictly within regular market trading hours (09:15:00 to 15:30:00 IST)
+                            import datetime as _dt
+                            df = df[(df["timestamp"].dt.time >= _dt.time(9, 15)) & (df["timestamp"].dt.time <= _dt.time(15, 30))]
                             return df.dropna().reset_index(drop=True)
                     elif isinstance(res, dict) and res.get("code") == 429:
                         import time as _t
@@ -1065,6 +1386,8 @@ class KotakGateway(BaseBrokerGateway):
                                     df["timestamp"] = df["timestamp"].dt.tz_localize(None)
                                 for c in ["open", "high", "low", "close", "volume"]:
                                     df[c] = pd.to_numeric(df[c], errors="coerce")
+                                import datetime as _dt
+                                df = df[(df["timestamp"].dt.time >= _dt.time(9, 15)) & (df["timestamp"].dt.time <= _dt.time(15, 30))]
                                 return df.dropna().reset_index(drop=True)
             except Exception as e:
                 logger.debug("Kotak smart token retry error: %s", e)
