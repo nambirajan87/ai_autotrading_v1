@@ -54,9 +54,10 @@ def validate_order(d: RiskDecision, cfg: RiskConfig) -> Optional[str]:
     if (d.side == "LONG" and d.target <= d.entry_price) or \
        (d.side == "SHORT" and d.target >= d.entry_price):
         return "target on the wrong side of entry"
+    is_fixed_derivative = (getattr(cfg, "fo_mode", "") == "OIPulse Mode" or cfg.lot_size > 1) and d.quantity <= cfg.lot_size
     is_fixed_short = (d.side == "SHORT" and getattr(cfg, "short_lot_size", None) is not None
                       and d.quantity <= cfg.lot_size * getattr(cfg, "short_lot_size", 1))
-    if not is_fixed_short and d.risk_amount > cfg.capital * cfg.risk_per_trade_pct + 1e-6:
+    if not is_fixed_short and not is_fixed_derivative and d.risk_amount > cfg.capital * cfg.risk_per_trade_pct + 1e-6:
         return "risk amount above per-trade limit"
     return None
 
@@ -173,6 +174,9 @@ class RiskEngine:
             qty = calculate_quantity(cfg.capital, cfg.risk_per_trade_pct, entry, stop,
                                      cfg.lot_size, max_exposure_value=room,
                                      max_quantity=cfg.max_quantity)
+        if qty == 0 and (getattr(cfg, "fo_mode", "") == "OIPulse Mode" or cfg.lot_size > 1):
+            # In F&O / OIPulse Mode or derivative contracts with lot_size > 1, allocate standard 1 lot
+            qty = min(cfg.lot_size, cfg.max_quantity)
         if qty == 0:
             return self._reject(decision, "quantity is 0 (stop too wide for risk budget, "
                                           "or no exposure room left)")

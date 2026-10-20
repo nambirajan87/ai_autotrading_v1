@@ -1271,14 +1271,41 @@ class KotakGateway(BaseBrokerGateway):
     ) -> pd.DataFrame:
         """
         Fetches historical candles from Kotak Neo API using NeoAPI SDK historical_data().
+        Automatically chunks date ranges exceeding 25 days into compliant windows (Kotak Neo
+        enforces max 30 days per request for 1min interval).
         """
+        import datetime as _dt
+        import time as _t
+        from datetime import timedelta
+
         if timeframe_minutes in (1, 3, 5, 10, 15, 30, 60):
             interval_str = f"{timeframe_minutes}min"
         else:
             interval_str = f"{timeframe_minutes}m"
 
-        from_str = start_date.strftime("%Y-%m-%d") if hasattr(start_date, "strftime") else str(start_date)[:10]
-        to_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
+        # Parse start and end dates into date objects
+        try:
+            if hasattr(start_date, "date"):
+                start_d = start_date.date()
+            elif isinstance(start_date, str):
+                start_d = pd.to_datetime(start_date).date()
+            else:
+                start_d = start_date
+        except Exception:
+            start_d = _dt.date.today() - timedelta(days=30)
+
+        try:
+            if hasattr(end_date, "date"):
+                end_d = end_date.date()
+            elif isinstance(end_date, str):
+                end_d = pd.to_datetime(end_date).date()
+            else:
+                end_d = end_date
+        except Exception:
+            end_d = _dt.date.today()
+
+        if start_d > end_d:
+            start_d, end_d = end_d, start_d
 
         # Format neosymbol: e.g. "nse_fo|51331", "nse_cm|2885"
         neosym = str(instrument_key or symbol or "").strip()
@@ -1319,16 +1346,26 @@ class KotakGateway(BaseBrokerGateway):
             if token_found:
                 neosym = f"nse_fo|{token_found}"
 
-        # 1. Primary: Use Kotak Neo SDK historical_data
-        if self._client:
+        # Build date chunks: 25 calendar days max to strictly stay under Kotak 30-day API limit
+        chunk_days = 25
+        chunks = []
+        cursor = start_d
+        while cursor <= end_d:
+            chunk_end = min(cursor + timedelta(days=chunk_days - 1), end_d)
+            chunks.append((cursor.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+            cursor = chunk_end + timedelta(days=1)
+
+        def _fetch_single_window(target_neosym: str, c_from: str, c_to: str) -> pd.DataFrame:
+            if not self._client:
+                return pd.DataFrame()
             max_retries = 3
             for attempt in range(max_retries):
                 try:
                     res = self._client.historical_data(
-                        neosymbol=neosym,
+                        neosymbol=target_neosym,
                         interval=interval_str,
-                        from_date=from_str,
-                        to_date=to_str,
+                        from_date=c_from,
+                        to_date=c_to,
                     )
                     if isinstance(res, dict) and res.get("status") == "SUCCESS":
                         candles = res.get("data", {}).get("candles", [])
@@ -1340,55 +1377,69 @@ class KotakGateway(BaseBrokerGateway):
                             for c in ["open", "high", "low", "close", "volume"]:
                                 df[c] = pd.to_numeric(df[c], errors="coerce")
                             # Filter strictly within regular market trading hours (09:15:00 to 15:30:00 IST)
-                            import datetime as _dt
                             df = df[(df["timestamp"].dt.time >= _dt.time(9, 15)) & (df["timestamp"].dt.time <= _dt.time(15, 30))]
                             return df.dropna().reset_index(drop=True)
+                        return pd.DataFrame()
                     elif isinstance(res, dict) and res.get("code") == 429:
-                        import time as _t
-                        _t.sleep(1.0)
+                        _t.sleep(1.0 + attempt * 0.5)
                         continue
                     elif isinstance(res, dict) and (res.get("stCode") == 100022 or "invalid session" in str(res).lower() or res.get("status") == 401 or res.get("code") == 401):
                         logger.info("Kotak session token expired, attempting auto-relogin...")
                         if self.login():
+                            _t.sleep(0.5)
                             continue
+                    fault_msg = str(res.get("fault", {}).get("message", "")) if isinstance(res, dict) else ""
+                    if fault_msg:
+                        logger.warning("Kotak historical_data error for %s (%s to %s): %s", target_neosym, c_from, c_to, fault_msg)
                     break
                 except Exception as err:
                     err_msg = str(err).lower()
                     if "429" in err_msg or "rate limit" in err_msg:
-                        import time as _t
-                        _t.sleep(1.0)
+                        _t.sleep(1.0 + attempt * 0.5)
                         continue
                     if "100022" in err_msg or "invalid session" in err_msg or "unauthorized" in err_msg or "401" in err_msg:
                         logger.info("Kotak session expired exception, auto-relogin...")
                         if self.login():
+                            _t.sleep(0.5)
                             continue
+                    logger.warning("Kotak historical_data exception for %s: %s", target_neosym, err)
+                    break
+            return pd.DataFrame()
+
+        # 1. Primary: Use Kotak Neo SDK historical_data with chunking
+        if self._client:
+            chunk_dfs = []
+            for idx, (c_from, c_to) in enumerate(chunks):
+                if idx > 0:
+                    _t.sleep(0.35)  # Politeness interval to prevent rate limit (429)
+                cdf = _fetch_single_window(neosym, c_from, c_to)
+                if not cdf.empty:
+                    chunk_dfs.append(cdf)
+            if chunk_dfs:
+                combined = pd.concat(chunk_dfs, ignore_index=True)
+                combined = combined.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                return combined
+
         # 2. Token resolution retry: If primary neosymbol returned no candles, resolve actual token from symbol
         if self._client and (symbol or neosym):
             try:
                 search_query = symbol or neosym
                 scrips = self.smart_search_instruments(search_query)
-                for sc in scrips:
+                for sc in (scrips[:2] if scrips else []):
                     target_tok = str(sc.get("pSymbol") or "")
                     if target_tok and f"nse_fo|{target_tok}" != neosym:
                         logger.info("Retrying Kotak historical_data with resolved token %s for %s", target_tok, search_query)
-                        res = self._client.historical_data(
-                            neosymbol=f"nse_fo|{target_tok}",
-                            interval=interval_str,
-                            from_date=from_str,
-                            to_date=to_str,
-                        )
-                        if isinstance(res, dict) and res.get("status") == "SUCCESS":
-                            candles = res.get("data", {}).get("candles", [])
-                            if candles:
-                                df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                                df["timestamp"] = pd.to_datetime(df["timestamp"])
-                                if df["timestamp"].dt.tz is not None:
-                                    df["timestamp"] = df["timestamp"].dt.tz_localize(None)
-                                for c in ["open", "high", "low", "close", "volume"]:
-                                    df[c] = pd.to_numeric(df[c], errors="coerce")
-                                import datetime as _dt
-                                df = df[(df["timestamp"].dt.time >= _dt.time(9, 15)) & (df["timestamp"].dt.time <= _dt.time(15, 30))]
-                                return df.dropna().reset_index(drop=True)
+                        retry_chunks = []
+                        for idx, (c_from, c_to) in enumerate(chunks):
+                            if idx > 0:
+                                _t.sleep(0.35)
+                            cdf = _fetch_single_window(f"nse_fo|{target_tok}", c_from, c_to)
+                            if not cdf.empty:
+                                retry_chunks.append(cdf)
+                        if retry_chunks:
+                            combined = pd.concat(retry_chunks, ignore_index=True)
+                            combined = combined.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+                            return combined
             except Exception as e:
                 logger.debug("Kotak smart token retry error: %s", e)
 
@@ -1396,8 +1447,9 @@ class KotakGateway(BaseBrokerGateway):
         if instrument_key and ("NSE_EQ" in instrument_key or "NSE_INDEX" in instrument_key):
             try:
                 from app.data.upstox_loader import fetch_range
-                return fetch_range(instrument_key, "minutes", timeframe_minutes, start_date, end_date)
+                return fetch_range(instrument_key, "minutes", timeframe_minutes, start_d, end_d)
             except Exception as e:
                 logger.warning("Upstox fallback fetch_range error: %s", e)
 
         return pd.DataFrame()
+

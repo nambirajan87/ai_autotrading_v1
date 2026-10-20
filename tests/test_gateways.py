@@ -93,3 +93,45 @@ def test_kotak_dynamic_instruments():
     if expiries:
         assert len(expiries) > 0
         assert "-" in expiries[0]  # e.g. YYYY-MM-DD format
+
+
+def test_kotak_fetch_historical_candles_chunking():
+    import datetime as dt
+    from unittest.mock import MagicMock
+
+    gw = KotakGateway()
+    mock_client = MagicMock()
+
+    # Mock historical_data response for two chunks
+    def mock_hist(neosymbol, interval, from_date, to_date):
+        return {
+            "status": "SUCCESS",
+            "data": {
+                "candles": [
+                    [f"{from_date}T09:16:00+05:30", 100.0, 105.0, 99.0, 104.0, 5000],
+                    [f"{to_date}T15:30:00+05:30", 104.0, 106.0, 103.0, 105.5, 4500],
+                ]
+            },
+        }
+
+    mock_client.historical_data.side_effect = mock_hist
+    gw._client = mock_client
+
+    # Request 37-day range (which triggers >= 2 chunks of <= 25 days)
+    df = gw.fetch_historical_candles(
+        symbol="NIFTY26OCT22500PE",
+        instrument_key="nse_fo|51331",
+        timeframe_minutes=1,
+        start_date=dt.date(2026, 9, 1),
+        end_date=dt.date(2026, 10, 7),
+    )
+
+    assert not df.empty
+    assert mock_client.historical_data.call_count >= 2
+    # Verify chunks stay within 25 days
+    for call in mock_client.historical_data.call_args_list:
+        c_kwargs = call.kwargs
+        c_from = dt.date.fromisoformat(c_kwargs["from_date"])
+        c_to = dt.date.fromisoformat(c_kwargs["to_date"])
+        assert (c_to - c_from).days <= 25
+

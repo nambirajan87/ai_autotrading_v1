@@ -250,6 +250,11 @@ def render_backtest_module():
                         st.session_state[f"backtest_chosen_strike_{und}"] = str(inst_cfg["strike"])
                     except Exception:
                         pass
+                if inst_cfg.get("fo_mode"):
+                    try:
+                        st.session_state["backtest_fo_mode"] = inst_cfg["fo_mode"]
+                    except Exception:
+                        pass
 
             if inst_cfg.get("option_type"):
                 opt_str = "PE (Put)" if "PE" in str(inst_cfg["option_type"]).upper() else "CE (Call)"
@@ -307,16 +312,18 @@ def render_backtest_module():
     def get_current_instrument_config() -> dict:
         """Collects current instrument configuration and environment parameters from session state."""
         und = st.session_state.get("backtest_underlying_choice", "NIFTY")
+        fo_mode = st.session_state.get("backtest_fo_mode", "Normal Mode")
         return {
             "market_segment": st.session_state.get("market_segment", "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]"),
+            "fo_mode": fo_mode,
             "symbol": st.session_state.get("symbol", "NIFTY"),
             "isin": st.session_state.get("isin", ""),
             "equity_name": st.session_state.get("equity_name", ""),
             "instrument_key": st.session_state.get("instrument_key", ""),
             "underlying": und,
-            "expiry": st.session_state.get(f"backtest_sel_expiry_{und}", ""),
-            "option_type": st.session_state.get("backtest_opt_type_choice", "PE (Put)"),
-            "strike": str(st.session_state.get(f"backtest_chosen_strike_{und}", "")),
+            "expiry": st.session_state.get(f"backtest_sel_expiry_{und}", "") if fo_mode != "OIPulse Mode" else "",
+            "option_type": st.session_state.get("backtest_opt_type_choice", "PE (Put)") if fo_mode != "OIPulse Mode" else "",
+            "strike": str(st.session_state.get(f"backtest_chosen_strike_{und}", "")) if fo_mode != "OIPulse Mode" else "",
             "start_date": str(st.session_state.get("start_date", "2026-09-01")),
             "end_date": str(st.session_state.get("end_date", "2026-09-30")),
             "timeframe": int(st.session_state.get("timeframe", 5)),
@@ -719,9 +726,12 @@ def render_backtest_module():
             raw_df = None
             is_kotak_inst = bool(inst_key and ("nse_fo" in inst_key.lower() or "nse_cm" in inst_key.lower() or inst_key.isdigit()))
             is_fo = "F&O" in st.session_state.get("market_segment", "")
+            kotak_err = None
+            upstox_err = None
 
             # 1. Fetch from Kotak Neo Gateway (Primary for F&O and Kotak instruments)
-            if is_kotak_inst or is_fo:
+            fo_mode_active = st.session_state.get("backtest_fo_mode", "Normal Mode") == "OIPulse Mode"
+            if (is_kotak_inst or is_fo) and not (fo_mode_active and os.path.exists(f"data/nifty_{st.session_state.timeframe}m.csv")):
                 try:
                     kotak_gw = get_gateway("KOTAK")
                     logger.info("Fetching historical candles from Kotak Neo for %s (%s)", st.session_state.symbol, inst_key)
@@ -732,14 +742,30 @@ def render_backtest_module():
                         start_date=start_d,
                         end_date=end_d,
                     )
+                    if raw_df is None or raw_df.empty:
+                        kotak_err = "Kotak API returned 0 candles for requested symbol and date window."
                 except Exception as e:
+                    kotak_err = str(e)
                     logger.warning("Kotak Neo candle fetch exception: %s", e)
+
+            # Auto-cache freshly fetched Kotak candles so local CSV cache is enriched (only if significant valid candles returned)
+            if raw_df is not None and len(raw_df) > 50 and (is_kotak_inst or is_fo):
+                try:
+                    sym_clean = st.session_state.symbol.lower().replace(" ", "")
+                    raw_df.to_csv(f"data/{sym_clean}_{st.session_state.timeframe}m.csv", index=False)
+                    raw_df.to_csv(f"data/{st.session_state.symbol.lower()}_{st.session_state.timeframe}m.csv", index=False)
+                except Exception as _e:
+                    logger.debug("Failed saving cache CSV: %s", _e)
+                st.session_state["data_source_warning"] = None
 
             # 2. If not fetched and Upstox token is available for standard Upstox keys
             if (raw_df is None or raw_df.empty) and token and not is_kotak_inst:
                 try:
                     raw_df = fetch_range(inst_key, "minutes", st.session_state.timeframe, start_d, end_d, chunk_days=28)
+                    if raw_df is None or raw_df.empty:
+                        upstox_err = "Upstox API returned 0 candles."
                 except Exception as e:
+                    upstox_err = str(e)
                     logger.warning("Upstox fetch_range failed: %s", e)
 
             # 3. Local cached CSV fallback if live fetch returned empty
@@ -754,17 +780,42 @@ def render_backtest_module():
                 fallback_2 = f"data/reliance_{st.session_state.timeframe}m.csv"
                 fallback_3 = "data/reliance_5m.csv"
                 fallback_4 = "data/upstox_5m.csv"
+                fb_found = None
                 for fb in [local_fallback, fallback_clean, fallback_5m, fallback_clean_5m, fallback_nifty, fallback_nifty5m, fallback_2, fallback_3, fallback_4]:
                     if os.path.exists(fb):
                         logger.warning("Using local fallback file: %s", fb)
                         raw_df = load_csv(fb)
+                        fb_found = fb
                         break
 
                 if raw_df is not None and not raw_df.empty:
                     ts_dt = pd.to_datetime(raw_df["timestamp"]).dt.date
+                    avail_min = ts_dt.min()
+                    avail_max = ts_dt.max()
+
+                    # Strict date coverage check:
+                    # If requested range extends beyond local cache and broker fetch failed, throw explicit error!
+                    if start_d < avail_min or end_d > avail_max:
+                        broker_fail_reason = ""
+                        if is_kotak_inst or is_fo:
+                            broker_fail_reason = f"Kotak Neo live market fetch failed ({kotak_err or 'No candle records returned from Kotak API'}). "
+                        elif not is_kotak_inst:
+                            broker_fail_reason = f"Upstox live market fetch failed ({upstox_err or 'Token missing or no records returned'}). "
+
+                        raw_df = None
+                        raise ValueError(
+                            f"{broker_fail_reason}Local fallback cache '{os.path.basename(fb_found)}' only covers {avail_min} to {avail_max}, "
+                            f"which does not satisfy your requested date range ({start_d} to {end_d}). "
+                            "Please verify your broker connection / credentials or select an available date range."
+                        )
+
                     in_range = raw_df[(ts_dt >= start_d) & (ts_dt <= end_d)]
                     if not in_range.empty:
                         raw_df = in_range.copy()
+                        st.session_state["data_source_warning"] = (
+                            f"⚠️ **Live Broker Fetch Notice**: Live data fetch failed ({kotak_err or upstox_err or 'No live response'}). "
+                            f"Backtest executed using local cached data `{os.path.basename(fb_found)}` ({avail_min} to {avail_max})."
+                        )
                     else:
                         avail_min = ts_dt.min()
                         avail_max = ts_dt.max()
@@ -776,7 +827,13 @@ def render_backtest_module():
                         )
 
             if raw_df is None or raw_df.empty:
-                raise ValueError(f"No candle data returned for {inst_key} between {start_d} and {end_d}. Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
+                broker_fail_reason = ""
+                if is_kotak_inst or is_fo:
+                    broker_fail_reason = f"Kotak Neo live fetch failed ({kotak_err or 'Broker returned 0 candles for instrument ' + str(inst_key)}). "
+                elif not is_kotak_inst:
+                    broker_fail_reason = f"Upstox live fetch failed ({upstox_err or 'Upstox API returned 0 candles'}). "
+                raise ValueError(f"{broker_fail_reason}No candle data available for {inst_key} between {start_d} and {end_d}. Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
+
 
             progress_bar.progress(50)
             status_text.text("Calculating 14 custom indicators...")
@@ -867,6 +924,7 @@ def render_backtest_module():
                 snooze_minutes=snooze_minutes,
                 trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
                 trail_beyond_target=bool(ind.get("trail_beyond_target", False)),
+                fo_mode=st.session_state.get("backtest_fo_mode", "Normal Mode"),
             )
 
             # Full run
@@ -1615,161 +1673,187 @@ def render_backtest_module():
         is_valid_isin = True
 
         if is_fo:
-            col_und, col_exp = st.columns(2)
-            with col_und:
+            fo_mode = st.radio(
+                "F&O Configuration Mode",
+                ["Normal Mode", "OIPulse Mode"],
+                index=0 if st.session_state.get("backtest_fo_mode", "Normal Mode") == "Normal Mode" else 1,
+                horizontal=True,
+                key="backtest_fo_mode",
+                help="Normal Mode uses static rolling contract selection. OIPulse Mode dynamically derives Expiry, Option Type (CE/PE), and Strike Price based on oi_strength readings."
+            )
+
+            if fo_mode == "OIPulse Mode":
                 underlying_choice = st.selectbox(
                     "Underlying Index / Stock",
                     ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
                     index=0,
                     key="backtest_underlying_choice"
                 )
-            with col_exp:
-                live_expiries = fetch_kotak_expiries(underlying_choice)
-                sel_expiry = st.selectbox(
-                    "Rolling Expiry Date (Kotak Live)",
-                    live_expiries,
-                    index=0,
-                    help="Live weekly and monthly rolling expiries from Kotak Neo.",
-                    key=f"backtest_sel_expiry_{underlying_choice}"
-                )
+                mkt_lot = int(INDEX_LOT_SIZES.get(underlying_choice, 65))
+                st.session_state.symbol = underlying_choice
+                st.session_state.isin = "INF204KB14I2" if underlying_choice == "NIFTY" else f"INF00{underlying_choice}1"
+                st.session_state.instrument_key = f"NSE_INDEX|{underlying_choice}"
+                st.session_state.equity_name = f"{underlying_choice} (OIPulse Mode)"
+                st.session_state.risk["lot_size"] = mkt_lot
 
-            col_typ, col_strk = st.columns(2)
-            with col_typ:
-                opt_type_choice = st.radio("Option Type", ["PE (Put)", "CE (Call)"], horizontal=True, key="backtest_opt_type_choice")
-                clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
+                st.caption(f"🎯 **Active Selection:** `{underlying_choice}`")
 
-            with col_strk:
-                oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry, count=250) if sel_expiry else {}
-                spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
-                mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", INDEX_LOT_SIZES.get(underlying_choice, 65)))
+            else:
+                col_und, col_exp = st.columns(2)
+                with col_und:
+                    underlying_choice = st.selectbox(
+                        "Underlying Index / Stock",
+                        ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
+                        index=0,
+                        key="backtest_underlying_choice"
+                    )
+                with col_exp:
+                    live_expiries = fetch_kotak_expiries(underlying_choice)
+                    sel_expiry = st.selectbox(
+                        "Rolling Expiry Date (Kotak Live)",
+                        live_expiries,
+                        index=0,
+                        help="Live weekly and monthly rolling expiries from Kotak Neo.",
+                        key=f"backtest_sel_expiry_{underlying_choice}"
+                    )
 
-                # Collect all available strikes from both Call and Put chains
-                all_strikes = set()
-                for item in oc_data.get("call", []):
-                    s = item.get("inst", {}).get("strkPrc")
-                    if s:
-                        all_strikes.add(s)
-                for item in oc_data.get("put", []):
-                    s = item.get("inst", {}).get("strkPrc")
-                    if s:
-                        all_strikes.add(s)
+                col_typ, col_strk = st.columns(2)
+                with col_typ:
+                    opt_type_choice = st.radio("Option Type", ["PE (Put)", "CE (Call)"], horizontal=True, key="backtest_opt_type_choice")
+                    clean_opt_type = "PE" if "PE" in opt_type_choice else "CE"
 
-                oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
-                strike_to_inst = {}
-                for item in oc_chain:
-                    inst = item.get("inst", {})
-                    strk = inst.get("strkPrc")
-                    if strk:
-                        strike_to_inst[strk] = inst
+                with col_strk:
+                    oc_data = fetch_kotak_option_chain(underlying_choice, expiry=sel_expiry, count=250) if sel_expiry else {}
+                    spot_val = oc_data.get("spot", {}).get("ltp") or oc_data.get("future", {}).get("ltp") or "Live"
+                    mkt_lot = int(oc_data.get("common_data", {}).get("mktLot", INDEX_LOT_SIZES.get(underlying_choice, 65)))
 
-                strikes = list(all_strikes) if all_strikes else list(strike_to_inst.keys())
+                    # Collect all available strikes from both Call and Put chains
+                    all_strikes = set()
+                    for item in oc_data.get("call", []):
+                        s = item.get("inst", {}).get("strkPrc")
+                        if s:
+                            all_strikes.add(s)
+                    for item in oc_data.get("put", []):
+                        s = item.get("inst", {}).get("strkPrc")
+                        if s:
+                            all_strikes.add(s)
 
-                if not strikes:
-                    if underlying_choice == "BANKNIFTY":
-                        strikes = [str(x) for x in range(40000, 68100, 100)]
-                        spot_val = "50500"
-                    elif underlying_choice == "FINNIFTY":
-                        strikes = [str(x) for x in range(17000, 32050, 50)]
-                        spot_val = "23500"
-                    elif underlying_choice == "MIDCPNIFTY":
-                        strikes = [str(x) for x in range(8500, 18050, 50)]
-                        spot_val = "12500"
-                    else:  # NIFTY
-                        strikes = [str(x) for x in range(17000, 30050, 50)]
-                        spot_val = "22500"
+                    oc_chain = oc_data.get("put" if clean_opt_type == "PE" else "call", [])
+                    strike_to_inst = {}
+                    for item in oc_chain:
+                        inst = item.get("inst", {})
+                        strk = inst.get("strkPrc")
+                        if strk:
+                            strike_to_inst[strk] = inst
 
-                try:
-                    strikes = sorted(list(set(strikes)), key=lambda x: float(x))
-                except Exception:
-                    strikes = sorted(list(set(strikes)))
+                    strikes = list(all_strikes) if all_strikes else list(strike_to_inst.keys())
 
-                default_idx = len(strikes) // 2
-                try:
-                    s_num = float(spot_val)
-                    closest_strike = min(strikes, key=lambda x: abs(float(x) - s_num))
-                    default_idx = strikes.index(closest_strike)
-                except Exception:
-                    default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
-                    if default_strike in strikes:
-                        default_idx = strikes.index(default_strike)
+                    if not strikes:
+                        if underlying_choice == "BANKNIFTY":
+                            strikes = [str(x) for x in range(40000, 68100, 100)]
+                            spot_val = "50500"
+                        elif underlying_choice == "FINNIFTY":
+                            strikes = [str(x) for x in range(17000, 32050, 50)]
+                            spot_val = "23500"
+                        elif underlying_choice == "MIDCPNIFTY":
+                            strikes = [str(x) for x in range(8500, 18050, 50)]
+                            spot_val = "12500"
+                        else:  # NIFTY
+                            strikes = [str(x) for x in range(17000, 30050, 50)]
+                            spot_val = "22500"
 
-                strike_key = f"backtest_chosen_strike_{underlying_choice}"
-                if strike_key in st.session_state and st.session_state[strike_key] not in strikes:
-                    st.session_state[strike_key] = strikes[default_idx]
-
-                chosen_strike = st.selectbox(
-                    f"Strike Price (Spot: ~{spot_val})",
-                    strikes,
-                    index=default_idx,
-                    key=strike_key
-                )
-                selected_inst = strike_to_inst.get(chosen_strike, {})
-                display_dt, sym_code = parse_expiry_info(sel_expiry)
-
-                if not selected_inst:
                     try:
-                        gw = get_gateway("KOTAK")
-                        target_sym = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
-                        if hasattr(gw, "smart_search_instruments"):
-                            scrips = gw.smart_search_instruments(target_sym)
-                            for sc in scrips:
-                                p_tok = str(sc.get("pSymbol") or "")
-                                if p_tok:
-                                    selected_inst = {
-                                        "symbol": sc.get("tradingsymbol", target_sym),
-                                        "neoSymbol": f"nse_fo|{p_tok}",
-                                        "optType": clean_opt_type,
-                                        "strkPrc": chosen_strike,
-                                    }
-                                    break
-                        if not selected_inst and hasattr(gw, "search_scrip"):
-                            scrip_res = gw.search_scrip(
-                                symbol=underlying_choice,
-                                expiry=sel_expiry,
-                                option_type=clean_opt_type,
-                                strike_price=chosen_strike,
-                            )
-                            if scrip_res and isinstance(scrip_res, list) and len(scrip_res) > 0:
-                                scrip_item = scrip_res[0]
-                                p_tok = str(scrip_item.get("pSymbol") or scrip_item.get("token") or "")
-                                p_sym = str(scrip_item.get("pTrdSymbol") or scrip_item.get("tradingSymbol") or "")
-                                if p_sym or p_tok:
-                                    selected_inst = {
-                                        "symbol": p_sym or f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}",
-                                        "neoSymbol": f"nse_fo|{p_tok}" if p_tok else f"nse_fo|{chosen_strike}",
-                                        "optType": clean_opt_type,
-                                        "strkPrc": chosen_strike,
-                                    }
-                    except Exception as e:
-                        logger.debug("Scrip search fallback error: %s", e)
+                        strikes = sorted(list(set(strikes)), key=lambda x: float(x))
+                    except Exception:
+                        strikes = sorted(list(set(strikes)))
 
-                if selected_inst:
-                    st.session_state.symbol = selected_inst.get("symbol", f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}")
-                    st.session_state.isin = selected_inst.get("neoSymbol", "").split("|")[-1]
-                    st.session_state.instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
-                    st.session_state.equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
-                    st.session_state.risk["lot_size"] = mkt_lot
-                else:
-                    target_symbol = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
-                    found_std = None
-                    for s_inst in NIFTY_STANDARD_INSTRUMENTS:
-                        if s_inst["tradingsymbol"] == target_symbol:
-                            found_std = s_inst
-                            break
-                    if found_std:
-                        st.session_state.symbol = found_std["tradingsymbol"]
-                        st.session_state.isin = found_std["isin"]
-                        st.session_state.instrument_key = found_std["instrument_key"]
-                        st.session_state.equity_name = found_std["name"]
-                        st.session_state.risk["lot_size"] = int(found_std.get("lot_size", mkt_lot))
-                    else:
-                        st.session_state.symbol = target_symbol
-                        st.session_state.isin = f"INF00{chosen_strike}1"
-                        st.session_state.instrument_key = f"NSE_FO|{chosen_strike}"
+                    default_idx = len(strikes) // 2
+                    try:
+                        s_num = float(spot_val)
+                        closest_strike = min(strikes, key=lambda x: abs(float(x) - s_num))
+                        default_idx = strikes.index(closest_strike)
+                    except Exception:
+                        default_strike = "50500" if underlying_choice == "BANKNIFTY" else ("23500" if underlying_choice == "FINNIFTY" else ("12500" if underlying_choice == "MIDCPNIFTY" else "22500"))
+                        if default_strike in strikes:
+                            default_idx = strikes.index(default_strike)
+
+                    strike_key = f"backtest_chosen_strike_{underlying_choice}"
+                    if strike_key in st.session_state and st.session_state[strike_key] not in strikes:
+                        st.session_state[strike_key] = strikes[default_idx]
+
+                    chosen_strike = st.selectbox(
+                        f"Strike Price (Spot: ~{spot_val})",
+                        strikes,
+                        index=default_idx,
+                        key=strike_key
+                    )
+                    selected_inst = strike_to_inst.get(chosen_strike, {})
+                    display_dt, sym_code = parse_expiry_info(sel_expiry)
+
+                    if not selected_inst:
+                        try:
+                            gw = get_gateway("KOTAK")
+                            target_sym = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
+                            if hasattr(gw, "smart_search_instruments"):
+                                scrips = gw.smart_search_instruments(target_sym)
+                                for sc in scrips:
+                                    p_tok = str(sc.get("pSymbol") or "")
+                                    if p_tok:
+                                        selected_inst = {
+                                            "symbol": sc.get("tradingsymbol", target_sym),
+                                            "neoSymbol": f"nse_fo|{p_tok}",
+                                            "optType": clean_opt_type,
+                                            "strkPrc": chosen_strike,
+                                        }
+                                        break
+                            if not selected_inst and hasattr(gw, "search_scrip"):
+                                scrip_res = gw.search_scrip(
+                                    symbol=underlying_choice,
+                                    expiry=sel_expiry,
+                                    option_type=clean_opt_type,
+                                    strike_price=chosen_strike,
+                                )
+                                if scrip_res and isinstance(scrip_res, list) and len(scrip_res) > 0:
+                                    scrip_item = scrip_res[0]
+                                    p_tok = str(scrip_item.get("pSymbol") or scrip_item.get("token") or "")
+                                    p_sym = str(scrip_item.get("pTrdSymbol") or scrip_item.get("tradingSymbol") or "")
+                                    if p_sym or p_tok:
+                                        selected_inst = {
+                                            "symbol": p_sym or f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}",
+                                            "neoSymbol": f"nse_fo|{p_tok}" if p_tok else f"nse_fo|{chosen_strike}",
+                                            "optType": clean_opt_type,
+                                            "strkPrc": chosen_strike,
+                                        }
+                        except Exception as e:
+                            logger.debug("Scrip search fallback error: %s", e)
+
+                    if selected_inst:
+                        st.session_state.symbol = selected_inst.get("symbol", f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}")
+                        st.session_state.isin = selected_inst.get("neoSymbol", "").split("|")[-1]
+                        st.session_state.instrument_key = selected_inst.get("neoSymbol", f"NSE_FO|{chosen_strike}")
                         st.session_state.equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
                         st.session_state.risk["lot_size"] = mkt_lot
+                    else:
+                        target_symbol = f"{underlying_choice}{sym_code}{chosen_strike}{clean_opt_type}"
+                        found_std = None
+                        for s_inst in NIFTY_STANDARD_INSTRUMENTS:
+                            if s_inst["tradingsymbol"] == target_symbol:
+                                found_std = s_inst
+                                break
+                        if found_std:
+                            st.session_state.symbol = found_std["tradingsymbol"]
+                            st.session_state.isin = found_std["isin"]
+                            st.session_state.instrument_key = found_std["instrument_key"]
+                            st.session_state.equity_name = found_std["name"]
+                            st.session_state.risk["lot_size"] = int(found_std.get("lot_size", mkt_lot))
+                        else:
+                            st.session_state.symbol = target_symbol
+                            st.session_state.isin = f"INF00{chosen_strike}1"
+                            st.session_state.instrument_key = f"NSE_FO|{chosen_strike}"
+                            st.session_state.equity_name = f"{underlying_choice} {display_dt} {chosen_strike} {clean_opt_type}"
+                            st.session_state.risk["lot_size"] = mkt_lot
 
-            st.caption(f"🎯 **Active Selection:** `{st.session_state.symbol}` | Expiry: `{display_dt}` | Key: `{st.session_state.instrument_key}` | Lot: `{st.session_state.risk.get('lot_size', mkt_lot)}`")
+                st.caption(f"🎯 **Active Selection:** `{st.session_state.symbol}` | Expiry: `{display_dt}` | Key: `{st.session_state.instrument_key}` | Lot: `{st.session_state.risk.get('lot_size', mkt_lot)}`")
 
         else:
             c1, c2 = st.columns(2)
@@ -1964,6 +2048,9 @@ def render_backtest_module():
         st.header(f"Results: Run #{run_data.get('id', 'N/A')} ({run_data.get('symbol', 'EQUITY')})")
         st.caption(f"Strategy: `{run_data.get('strategy_version', 'custom')}` | Period: {run_data.get('date_from')} to {run_data.get('date_to')}{tsl_info}")
 
+        if st.session_state.get("data_source_warning"):
+            st.warning(st.session_state["data_source_warning"])
+
         # Disclaimer Note
         st.warning("⚠️ **Notice:** Past results do not predict future results. Changing parameters after seeing results turns this data into in-sample data.")
 
@@ -2017,6 +2104,8 @@ def render_backtest_module():
         if ind_cfg.get("obv_enabled", False): max_score_cfg += ind_cfg.get("obv_weight", 1)
         if ind_cfg.get("higher_high_enabled", False): max_score_cfg += ind_cfg.get("higher_high_weight", 1)
         if ind_cfg.get("lower_low_enabled", False): max_score_cfg += ind_cfg.get("lower_low_weight", 1)
+        if ind_cfg.get("hma_enabled", False): max_score_cfg += ind_cfg.get("hma_weight", 1)
+        if ind_cfg.get("supertrend_enabled", False): max_score_cfg += ind_cfg.get("supertrend_weight", 1)
         max_score_cfg = max(max_score_cfg, 1)
 
         long_th = ind_cfg.get("long_threshold", 5)
@@ -2040,6 +2129,22 @@ def render_backtest_module():
         short_lot_disp = f" | Short Lot Size = **{ind_cfg.get('short_lot_size', 1)} Lot**" if side_val != "LONG" else ""
         snooze_disp = f" | Snooze = **{snooze_val} min**" if snooze_val > 0 else ""
         st.caption(f"🎯 **Trade Levels:** Fixed Target = **{tgt_val}%** | Fixed Stoploss = **{sl_val}%**{tsl_disp} | Side = **{side_val}**{short_lot_disp}{snooze_disp}")
+
+        active_inds = []
+        if ind_cfg.get("ema_enabled"): active_inds.append(f"EMA ({ind_cfg.get('ema_fast')}/{ind_cfg.get('ema_slow')})")
+        if ind_cfg.get("rsi_enabled"): active_inds.append(f"RSI ({ind_cfg.get('rsi_period')})")
+        if ind_cfg.get("macd_enabled"): active_inds.append("MACD")
+        if ind_cfg.get("vwap_enabled"): active_inds.append("VWAP")
+        if ind_cfg.get("adx_enabled"): active_inds.append(f"ADX ({ind_cfg.get('adx_period')})")
+        if ind_cfg.get("volume_enabled"): active_inds.append("Volume")
+        if ind_cfg.get("bollinger_enabled"): active_inds.append("Bollinger Bands")
+        if ind_cfg.get("stoch_enabled"): active_inds.append("Stochastic")
+        if ind_cfg.get("obv_enabled"): active_inds.append("OBV")
+        if ind_cfg.get("higher_high_enabled"): active_inds.append("Higher High")
+        if ind_cfg.get("lower_low_enabled"): active_inds.append("Lower Low")
+        if ind_cfg.get("hma_enabled"): active_inds.append(f"HMA ({ind_cfg.get('hma_period', 100)})")
+        if ind_cfg.get("supertrend_enabled"): active_inds.append(f"Supertrend ({ind_cfg.get('supertrend_period', 10)}, {ind_cfg.get('supertrend_mult_simple', 2.0)}/{ind_cfg.get('supertrend_mult_complex', 4.0)})")
+        st.caption(f"🧩 **Active Indicators ({len(active_inds)}):** {', '.join(active_inds) if active_inds else 'None'}")
 
         # Benchmark Buy-and-Hold
         if "indicators_df" in res and res["indicators_df"] is not None and not res["indicators_df"].empty:
@@ -2188,6 +2293,10 @@ def render_backtest_module():
                             obv_enabled=ind_d.get("obv_enabled", False), obv_ma_period=ind_d.get("obv_ma_period", 20), obv_weight=ind_d.get("obv_weight", 1),
                             higher_high_enabled=bool(ind_d.get("higher_high_enabled", False)), higher_high_period=int(ind_d.get("higher_high_period", 5)), higher_high_weight=int(ind_d.get("higher_high_weight", 1)),
                             lower_low_enabled=bool(ind_d.get("lower_low_enabled", False)), lower_low_period=int(ind_d.get("lower_low_period", 5)), lower_low_weight=int(ind_d.get("lower_low_weight", 1)),
+                            hma_enabled=bool(ind_d.get("hma_enabled", False)), hma_period=int(ind_d.get("hma_period", 100)), hma_weight=int(ind_d.get("hma_weight", 1)),
+                            supertrend_enabled=bool(ind_d.get("supertrend_enabled", False)), supertrend_period=int(ind_d.get("supertrend_period", 10)),
+                            supertrend_mult_simple=float(ind_d.get("supertrend_mult_simple", 2.0)), supertrend_mult_complex=float(ind_d.get("supertrend_mult_complex", 4.0)),
+                            supertrend_weight=int(ind_d.get("supertrend_weight", 1)),
                             long_threshold=ind_d.get("long_threshold", 4), short_threshold=ind_d.get("short_threshold", -4),
                         )
                     except Exception:
@@ -2438,6 +2547,18 @@ def render_backtest_module():
 
             filtered_raw = df_raw[mask].sort_values("timestamp").reset_index(drop=True)
             matched_date_range = not filtered_raw.empty
+            if matched_date_range and date_to:
+                try:
+                    f_max_date = pd.to_datetime(filtered_raw["timestamp"]).dt.date.max()
+                    req_to_date = pd.to_datetime(date_to).date()
+                    if f_max_date < req_to_date:
+                        st.warning(
+                            f"⚠️ **Truncated Date Alert**: Historical Raw Data only extends up to **{f_max_date}**, "
+                            f"which is earlier than your requested end date (**{req_to_date}**). "
+                            f"Total {len(filtered_raw):,} candles loaded."
+                        )
+                except Exception:
+                    pass
             if not matched_date_range:
                 min_avail = str(ts_series.dt.date.min())
                 max_avail = str(ts_series.dt.date.max())

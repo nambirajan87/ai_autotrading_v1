@@ -42,6 +42,13 @@ logger = logging.getLogger(__name__)
 # Initialize database schema if not present
 init_user_db()
 
+# Auto-start OI Pulse Live Strength scheduler daemon if not already running
+try:
+    from scripts.schedule_oipulse_strength import start_oipulse_scheduler_background
+    start_oipulse_scheduler_background(batch_minutes=1, offset_seconds=10)
+except Exception as e:
+    logger.warning("Could not auto-start OI Pulse scheduler: %s", e)
+
 SUITE_MODES = [
     "⚡ Live Trading Terminal",
     "📈 AI Paper Trading Studio",

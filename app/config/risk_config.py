@@ -126,6 +126,21 @@ class RiskConfig:
     # times vary, so check your broker.
 
     def __post_init__(self):
+        # Auto-convert string times to datetime.time objects if needed
+        from datetime import datetime as _dt
+        for attr in ("entry_start", "entry_end", "square_off_time"):
+            val = getattr(self, attr, None)
+            if isinstance(val, str):
+                val_str = val.strip()
+                try:
+                    if len(val_str) == 8:
+                        t_obj = _dt.strptime(val_str, "%H:%M:%S").time()
+                    else:
+                        t_obj = _dt.strptime(val_str, "%H:%M").time()
+                    object.__setattr__(self, attr, t_obj)
+                except Exception:
+                    pass
+
         if self.capital <= 0:
             raise ValueError("capital must be positive")
         # 5% cap is a typo guard (e.g. someone typing 1 instead of 0.01)

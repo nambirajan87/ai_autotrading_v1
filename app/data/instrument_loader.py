@@ -122,12 +122,12 @@ def parse_expiry_info(exp_str: str) -> tuple[str, str]:
     display_dt = dt.strftime("%d-%b-%Y").upper()
     yy = dt.strftime("%y")
     mmm = dt.strftime("%b").upper()
-    month_codes = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+    month_codes = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "S", 10: "O", 11: "N", 12: "D"}
     # If date >= 23, treat as monthly contract code (e.g. 26OCT, 26NOV, 26DEC, 27MAR)
     if dt.day >= 23:
         sym_code = f"{yy}{mmm}"
     else:
-        # Weekly contract format: e.g. 26O13, 26O19
+        # Weekly contract format: e.g. 26S03, 26O13, 26O19
         m_code = month_codes.get(dt.month, str(dt.month))
         sym_code = f"{yy}{m_code}{dt.day:02d}"
     return display_dt, sym_code

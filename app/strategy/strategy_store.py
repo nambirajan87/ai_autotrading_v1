@@ -71,6 +71,7 @@ DEFAULT_TEMPLATES = {
         },
         "instrument": {
             "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+            "fo_mode": "Normal Mode",
             "symbol": "NIFTY",
             "isin": "INF204KB14I2",
             "equity_name": "NIFTY",
@@ -147,6 +148,7 @@ DEFAULT_TEMPLATES = {
         },
         "instrument": {
             "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+            "fo_mode": "Normal Mode",
             "symbol": "NIFTY26OCT22500PE",
             "isin": "INF000513319",
             "equity_name": "NIFTY 27-OCT-2026 22500 PE",
@@ -223,6 +225,7 @@ DEFAULT_TEMPLATES = {
         },
         "instrument": {
             "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+            "fo_mode": "Normal Mode",
             "symbol": "NIFTY",
             "isin": "INF204KB14I2",
             "equity_name": "NIFTY",
@@ -299,6 +302,7 @@ DEFAULT_TEMPLATES = {
         },
         "instrument": {
             "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+            "fo_mode": "Normal Mode",
             "symbol": "NIFTY",
             "isin": "INF204KB14I2",
             "equity_name": "NIFTY",
@@ -373,6 +377,7 @@ DEFAULT_TEMPLATES = {
         },
         "instrument": {
             "market_segment": "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]",
+            "fo_mode": "Normal Mode",
             "symbol": "NIFTY",
             "isin": "INF204KB14I2",
             "equity_name": "NIFTY",

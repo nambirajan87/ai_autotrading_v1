@@ -172,8 +172,11 @@ def render_paper_trade_module():
     strategy_entry_end = parse_time_param(risk_cfg.get("entry_end"), time(15, 0))
 
     # Resolve active instrument
+    fo_mode = inst_cfg.get("fo_mode", "Normal Mode")
     active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
-    if active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
+    if fo_mode == "OIPulse Mode":
+        active_instrument = inst_cfg.get("underlying") or "NIFTY"
+    elif active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
         active_instrument = "NIFTY26OCT22500PE"
 
     # Current date and previous 1 month date window (strictly 30 days)
@@ -550,6 +553,17 @@ def render_paper_trade_module():
                 st.info(f"⏳ Current time ({now_time.strftime('%H:%M:%S')}) is past Strategy Entry End ({strategy_entry_end.strftime('%H:%M')}) / Square-off ({strategy_sq_time.strftime('%H:%M')}) from Risk Parameters. New entries are blocked.")
             else:
                 # Check for new entry signal strictly within market hours & strategy entry window
+                trade_symbol = active_instrument
+                if fo_mode == "OIPulse Mode":
+                    from app.strategy.oipulse_resolver import resolve_oipulse_option
+                    oi_res = resolve_oipulse_option(
+                        underlying=inst_cfg.get("underlying") or "NIFTY",
+                        candle_dt=datetime.now(),
+                        live_ltp=live_ltp,
+                    )
+                    if oi_res.get("has_signal"):
+                        trade_symbol = oi_res["resolved_symbol"]
+
                 if latest_score >= long_th and side_val in ("BOTH", "LONG"):
                     entry_p = live_ltp
                     tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
@@ -557,7 +571,7 @@ def render_paper_trade_module():
                     next_tid = 5000 + len(real_trades) + 1
                     paper_db.save_active_trade(
                         strategy_name=selected_strat,
-                        symbol=active_instrument,
+                        symbol=trade_symbol,
                         session_date=today_str,
                         trade_id=next_tid,
                         side="LONG",
@@ -569,7 +583,7 @@ def render_paper_trade_module():
                         score=latest_score,
                         regime="TRENDING",
                     )
-                    st.toast(f"🟢 Executed LONG Trade #{next_tid} on {active_instrument} @ ₹{entry_p:.2f}!", icon="🟢")
+                    st.toast(f"🟢 Executed LONG Trade #{next_tid} on {trade_symbol} @ ₹{entry_p:.2f}!", icon="🟢")
                     st.rerun()
 
                 elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
@@ -579,7 +593,7 @@ def render_paper_trade_module():
                     next_tid = 5000 + len(real_trades) + 1
                     paper_db.save_active_trade(
                         strategy_name=selected_strat,
-                        symbol=active_instrument,
+                        symbol=trade_symbol,
                         session_date=today_str,
                         trade_id=next_tid,
                         side="SHORT",
@@ -591,7 +605,7 @@ def render_paper_trade_module():
                         score=latest_score,
                         regime="TRENDING",
                     )
-                    st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {active_instrument} @ ₹{entry_p:.2f}!", icon="🔴")
+                    st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {trade_symbol} @ ₹{entry_p:.2f}!", icon="🔴")
                     st.rerun()
 
         elif active_open_trade is not None:

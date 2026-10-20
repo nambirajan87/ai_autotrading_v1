@@ -30,6 +30,13 @@ except Exception:
 
 # Run the unified application on every execution and rerun
 from app.ui.main_app import render_unified_suite
+from scripts.schedule_oipulse_strength import start_oipulse_scheduler_background
+
+# Start OI Pulse Strength Scheduler daemon on server startup (triggers at hh:mm:10)
+try:
+    start_oipulse_scheduler_background(batch_minutes=1, offset_seconds=10)
+except Exception as e:
+    print(f"[!] Warning: Could not initialize OI Pulse scheduler: {e}")
 
 if __name__ == "__main__":
     render_unified_suite()

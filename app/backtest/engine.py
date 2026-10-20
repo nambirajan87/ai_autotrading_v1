@@ -25,6 +25,7 @@ class BacktestConfig:
     trailing_sl_enabled: bool = False  # Enable Model B Trailing Stop-Loss
     trail_beyond_target: bool = False  # If True, trade does not exit at target, keeps trailing
     execution_mode: str = "SIGNAL_BAR_CLOSE"  # "SIGNAL_BAR_CLOSE" (immediate fill at candle close) or "NEXT_BAR_OPEN"
+    fo_mode: str = "Normal Mode"  # "Normal Mode" or "OIPulse Mode"
 
 
 @dataclass
@@ -42,6 +43,7 @@ class OpenTrade:
     peak_price: float = 0.0
     trough_price: float = 0.0
     trailing_active: bool = False
+    contract_symbol: str = ""
 
 
 @dataclass
@@ -154,6 +156,30 @@ class Backtester:
             self.rejections["shorting disabled"] += 1
             return
 
+        resolved_contract_symbol = self.symbol
+        if getattr(self.bt_cfg, "fo_mode", "Normal Mode") == "OIPulse Mode":
+            from datetime import datetime as _dt
+            from app.strategy.oipulse_resolver import resolve_oipulse_option
+            dt_val = row["timestamp"]
+            if hasattr(dt_val, "to_pydatetime"):
+                dt_val = dt_val.to_pydatetime()
+            elif isinstance(dt_val, str):
+                try:
+                    dt_val = _dt.fromisoformat(dt_val.replace("Z", "+00:00"))
+                except Exception:
+                    pass
+            oi_res = resolve_oipulse_option(self.symbol, dt_val)
+            if not oi_res.get("has_signal"):
+                self.rejections["OIPulse: Strength within neutral band (-50 to +50)"] += 1
+                return
+            if signal.signal == "LONG" and oi_res.get("option_type") != "CE":
+                self.rejections["OIPulse: Signal direction mismatch (Indicator LONG vs OIPulse PE)"] += 1
+                return
+            if signal.signal == "SHORT" and oi_res.get("option_type") != "PE":
+                self.rejections["OIPulse: Signal direction mismatch (Indicator SHORT vs OIPulse CE)"] += 1
+                return
+            resolved_contract_symbol = oi_res.get("resolved_symbol", self.symbol)
+
         state = PortfolioState(open_positions=[], daily_pnl=self.daily_pnl,
                                consecutive_losses=self.consecutive_losses,
                                last_exit_time=self.last_exit_time)
@@ -161,13 +187,13 @@ class Backtester:
         if decision.approved:
             regime = row.get("regime", "") or detect_regime_row(row)
             if getattr(self.bt_cfg, "execution_mode", "SIGNAL_BAR_CLOSE") == "NEXT_BAR_OPEN":
-                self.pending = (decision, signal, regime)
+                self.pending = (decision, signal, regime, resolved_contract_symbol)
             else:
-                self._enter_immediate(row, decision, signal, regime)
+                self._enter_immediate(row, decision, signal, regime, contract_symbol=resolved_contract_symbol)
         else:
             self.rejections[decision.rejection_reason.split(" (")[0]] += 1
 
-    def _enter_immediate(self, row: pd.Series, decision, signal, regime: str) -> None:
+    def _enter_immediate(self, row: pd.Series, decision, signal, regime: str, contract_symbol: str = "") -> None:
         leg = "BUY" if decision.side == "LONG" else "SELL"
         reference = row["close"]
         fill = apply_slippage(reference, leg, self.cost_cfg.slippage_pct,
@@ -192,10 +218,15 @@ class Backtester:
             peak_price=fill,
             trough_price=fill,
             trailing_active=False,
+            contract_symbol=contract_symbol or self.symbol,
         )
 
     def _fill_pending(self, row: pd.Series) -> None:
-        decision, signal, regime = self.pending
+        if len(self.pending) == 4:
+            decision, signal, regime, contract_sym = self.pending
+        else:
+            decision, signal, regime = self.pending
+            contract_sym = self.symbol
         self.pending = None
         leg = "BUY" if decision.side == "LONG" else "SELL"
         reference = row["open"]
@@ -221,6 +252,7 @@ class Backtester:
             peak_price=fill,
             trough_price=fill,
             trailing_active=False,
+            contract_symbol=contract_sym or self.symbol,
         )
 
     # ---------- exits ----------
@@ -328,7 +360,7 @@ class Backtester:
             peak_pct = round(max(0.0, (p.entry_price - trough) / p.entry_price * 100.0), 2) if p.entry_price > 0 else 0.0
 
         self.trades.append(Trade(
-            symbol=self.symbol, side=p.side, strategy_version=self.strategy_cfg.version,
+            symbol=getattr(p, "contract_symbol", "") or self.symbol, side=p.side, strategy_version=self.strategy_cfg.version,
             regime=p.regime, score=p.score, signal_time=p.signal_time,
             entry_time=p.entry_time, exit_time=ts, quantity=p.quantity,
             entry_price=p.entry_price, exit_price=fill, stop_loss=p.stop_loss,

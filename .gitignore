@@ -69,6 +69,8 @@ data/backtest_report.txt
 data/backtest_analyse_report.txt
 data/empirical_action_plan_results.json
 data/*.py
+scratch/
+
 
 # ==========================================
 # Operating System & IDE Configs
