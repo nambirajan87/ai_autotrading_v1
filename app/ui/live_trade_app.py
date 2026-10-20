@@ -503,6 +503,10 @@ def render_live_trade_module():
         obv_enabled=ind_cfg.get("obv_enabled", False), obv_ma_period=ind_cfg.get("obv_ma_period", 20), obv_weight=ind_cfg.get("obv_weight", 1),
         higher_high_enabled=bool(ind_cfg.get("higher_high_enabled", False)), higher_high_period=int(ind_cfg.get("higher_high_period", 5)), higher_high_weight=int(ind_cfg.get("higher_high_weight", 1)),
         lower_low_enabled=bool(ind_cfg.get("lower_low_enabled", False)), lower_low_period=int(ind_cfg.get("lower_low_period", 5)), lower_low_weight=int(ind_cfg.get("lower_low_weight", 1)),
+        hma_enabled=bool(ind_cfg.get("hma_enabled", False)), hma_period=int(ind_cfg.get("hma_period", 100)), hma_weight=int(ind_cfg.get("hma_weight", 1)),
+        supertrend_enabled=bool(ind_cfg.get("supertrend_enabled", False)), supertrend_period=int(ind_cfg.get("supertrend_period", 10)),
+        supertrend_mult_simple=float(ind_cfg.get("supertrend_mult_simple", 2.0)), supertrend_mult_complex=float(ind_cfg.get("supertrend_mult_complex", 4.0)),
+        supertrend_weight=int(ind_cfg.get("supertrend_weight", 1)),
         long_threshold=long_th, short_threshold=short_th,
     )
 
@@ -515,6 +519,46 @@ def render_live_trade_module():
                 int(sum(score_custom_row(r, custom_cfg).values())) for _, r in scored_candles.iterrows()
             ]
             latest_score = int(scored_candles.iloc[-1]["consensus_score"])
+
+    # Constant Display of Both Trigger & Signal Bar Check Sections during active live session
+    if is_live_running:
+        now_dt = datetime.now()
+        tf_val = max(1, timeframe_m)
+        seconds_past_hour = now_dt.minute * 60 + now_dt.second
+        tf_seconds = tf_val * 60
+        next_boundary_sec = ((seconds_past_hour // tf_seconds) + 1) * tf_seconds
+        next_candle_dt = now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(seconds=next_boundary_sec)
+        rem_seconds = max(0, int((next_candle_dt - now_dt).total_seconds()))
+        next_check_str = next_candle_dt.strftime("%H:%M:%S")
+
+        if candles_df is not None and not candles_df.empty:
+            last_candle_row = candles_df.iloc[-1]
+            last_bar_dt = pd.to_datetime(last_candle_row["timestamp"])
+            last_bar_str = last_bar_dt.strftime("%Y-%m-%d %H:%M:%S")
+            bar_closed_at_str = (last_bar_dt + timedelta(minutes=tf_val)).strftime("%H:%M:%S")
+        else:
+            last_bar_dt = now_dt - timedelta(minutes=tf_val)
+            last_bar_str = last_bar_dt.strftime("%Y-%m-%d %H:%M:%S")
+            bar_closed_at_str = now_dt.strftime("%H:%M:%S")
+
+        if latest_score >= long_th:
+            sig_disp = "LONG"
+            sig_color = "#00e676"
+        elif latest_score <= short_th:
+            sig_disp = "SHORT"
+            sig_color = "#ff5252"
+        else:
+            sig_disp = "HOLD"
+            sig_color = "#ffd600"
+
+        st.markdown(f"""
+        <div style="background: rgba(33, 150, 243, 0.12); border: 1px solid #2196f3; border-radius: 8px; padding: 10px 16px; margin-top: 10px; margin-bottom: 6px; font-size: 0.95rem;">
+            <b style="color: #64b5f6;">⏱️ CANDLE CLOSE TRIGGER ACTIVE:</b> Next signal check at <b>{next_check_str}</b> (<b>{rem_seconds}s remaining</b>) on <b>{tf_val}m candle close</b>.
+        </div>
+        <div style="background: rgba(0, 230, 118, 0.08); border: 1px solid rgba(0, 230, 118, 0.35); border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; font-size: 0.95rem;">
+            <b style="color: #00e676;">📊 Signal bar close check</b> &nbsp;➔&nbsp; Last Signal Bar: <b>{last_bar_str}</b> (Closed at <b>{bar_closed_at_str}</b>) &nbsp;|&nbsp; Signal: <b style="color: {sig_color};">{sig_disp}</b> &nbsp;|&nbsp; Score: <b>{latest_score}</b> &nbsp;|&nbsp; <i>Continuous 2s LTP, chart & exit monitoring active.</i>
+        </div>
+        """, unsafe_allow_html=True)
 
     # If live running, check market hours and strategy square-off time; if past square-off or market closed, auto square off and stop
     if is_live_running:

@@ -1700,3 +1700,43 @@ def test_backtest_two_step_workflow():
     st.session_state.step = 1
     assert st.session_state.step == 1
 
+
+def test_backtest_ui_hma_and_supertrend_toggles():
+    from app.strategy.strategy_store import get_strategy, save_strategy, delete_strategy
+
+    strat_name = "TEST_HMA_ST_UI_STRAT"
+    ind_cfg = {
+        "ema_enabled": True, "ema_fast": 20, "ema_slow": 50, "ema_weight": 2,
+        "rsi_enabled": False, "rsi_period": 14, "rsi_bull_low": 55.0, "rsi_bull_high": 70.0,
+        "rsi_bear_low": 30.0, "rsi_bear_high": 45.0, "rsi_weight": 1,
+        "macd_enabled": False, "macd_fast": 12, "macd_slow": 26, "macd_signal": 9, "macd_weight": 2,
+        "vwap_enabled": False, "vwap_weight": 1,
+        "atr_enabled": True, "atr_period": 14, "atr_stop_multiplier": 1.5, "atr_reward_risk_ratio": 2.0,
+        "adx_enabled": False, "adx_period": 14, "adx_min": 20.0, "adx_weight": 1,
+        "volume_enabled": False, "volume_period": 20, "volume_ratio_min": 1.2, "volume_consecutive": 3, "volume_weight": 1,
+        "bollinger_enabled": False, "bollinger_period": 20, "bollinger_std_dev": 2.0, "bollinger_weight": 1,
+        "stoch_enabled": False, "stoch_k": 14, "stoch_d": 3, "stoch_low": 20.0, "stoch_high": 80.0, "stoch_weight": 1,
+        "obv_enabled": False, "obv_ma_period": 20, "obv_weight": 1,
+        "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
+        "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+        "hma_enabled": True, "hma_period": 100, "hma_weight": 2,
+        "supertrend_enabled": True, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 3,
+        "long_threshold": 4, "short_threshold": -4,
+    }
+
+    save_strategy(strat_name, indicators=ind_cfg)
+    loaded = get_strategy(strat_name)
+    assert loaded is not None
+    loaded_ind = loaded["indicators"]
+    assert loaded_ind["hma_enabled"] is True
+    assert loaded_ind["hma_period"] == 100
+    assert loaded_ind["hma_weight"] == 2
+    assert loaded_ind["supertrend_enabled"] is True
+    assert loaded_ind["supertrend_period"] == 10
+    assert loaded_ind["supertrend_mult_simple"] == 2.0
+    assert loaded_ind["supertrend_mult_complex"] == 4.0
+    assert loaded_ind["supertrend_weight"] == 3
+
+    delete_strategy(strat_name)
+
+

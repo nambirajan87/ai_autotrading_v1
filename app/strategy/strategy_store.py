@@ -30,6 +30,8 @@ DEFAULT_TEMPLATES = {
             "obv_enabled": False, "obv_ma_period": 20, "obv_weight": 1,
             "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
             "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+            "hma_enabled": False, "hma_period": 100, "hma_weight": 1,
+            "supertrend_enabled": False, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 1,
             "long_threshold": 4, "short_threshold": -4,
             "fixed_target_pct": 3.0, "fixed_stoploss_pct": 2.0,
             "trailing_sl_enabled": False, "trail_beyond_target": False,
@@ -104,6 +106,8 @@ DEFAULT_TEMPLATES = {
             "obv_enabled": False, "obv_ma_period": 20, "obv_weight": 1,
             "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
             "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+            "hma_enabled": False, "hma_period": 100, "hma_weight": 1,
+            "supertrend_enabled": False, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 1,
             "long_threshold": 4, "short_threshold": -4,
             "fixed_target_pct": 3.0, "fixed_stoploss_pct": 2.0,
             "trailing_sl_enabled": False, "trail_beyond_target": False,
@@ -178,6 +182,8 @@ DEFAULT_TEMPLATES = {
             "obv_enabled": False, "obv_ma_period": 20, "obv_weight": 1,
             "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
             "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+            "hma_enabled": False, "hma_period": 100, "hma_weight": 1,
+            "supertrend_enabled": False, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 1,
             "long_threshold": 4, "short_threshold": -4,
             "fixed_target_pct": 3.0, "fixed_stoploss_pct": 1.5,
             "trailing_sl_enabled": True, "trail_beyond_target": True,
@@ -252,6 +258,8 @@ DEFAULT_TEMPLATES = {
             "obv_enabled": False, "obv_ma_period": 20, "obv_weight": 1,
             "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
             "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+            "hma_enabled": False, "hma_period": 100, "hma_weight": 1,
+            "supertrend_enabled": False, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 1,
             "long_threshold": 4, "short_threshold": -4,
             "fixed_target_pct": 2.0, "fixed_stoploss_pct": 1.5,
             "trailing_sl_enabled": False, "trail_beyond_target": False,
@@ -417,6 +425,10 @@ def auto_suggest_strategy_name(ind: dict) -> str:
         tokens.append("HH")
     if ind.get("lower_low_enabled"):
         tokens.append("LL")
+    if ind.get("hma_enabled"):
+        tokens.append("HMA")
+    if ind.get("supertrend_enabled"):
+        tokens.append("STREND")
 
     if not tokens:
         return "Custom_Strategy_v1"

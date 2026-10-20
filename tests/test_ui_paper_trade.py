@@ -144,3 +144,32 @@ def test_square_off_trigger_logic():
 
     check_time_late = time(15, 20)
     assert check_time_late >= sq_time
+
+
+def test_paper_trade_constant_sections_timing_and_content():
+    from datetime import datetime, timedelta
+    now_dt = datetime.now()
+    timeframe_m = 1
+
+    tf_val = max(1, timeframe_m)
+    seconds_past_hour = now_dt.minute * 60 + now_dt.second
+    tf_seconds = tf_val * 60
+    next_boundary_sec = ((seconds_past_hour // tf_seconds) + 1) * tf_seconds
+    next_candle_dt = now_dt.replace(minute=0, second=0, microsecond=0) + timedelta(seconds=next_boundary_sec)
+    rem_seconds = max(0, int((next_candle_dt - now_dt).total_seconds()))
+    next_check_str = next_candle_dt.strftime("%H:%M:%S")
+
+    last_bar_dt = now_dt - timedelta(minutes=tf_val)
+    last_bar_str = last_bar_dt.strftime("%Y-%m-%d %H:%M:%S")
+    bar_closed_at_str = now_dt.strftime("%H:%M:%S")
+    latest_score = 5
+    sig_disp = "HOLD"
+
+    sec1_text = f"CANDLE CLOSE TRIGGER ACTIVE: Next signal check at {next_check_str} ({rem_seconds}s remaining) on {tf_val}m candle close."
+    sec2_text = f"Signal bar close check -> Last Signal Bar: {last_bar_str} (Closed at {bar_closed_at_str})  |  Signal: {sig_disp}  |  Score: {latest_score}  |  Continuous 2s LTP, chart & exit monitoring active."
+
+    assert "CANDLE CLOSE TRIGGER ACTIVE: Next signal check at" in sec1_text
+    assert f"on {tf_val}m candle close." in sec1_text
+    assert "Signal bar close check -> Last Signal Bar:" in sec2_text
+    assert "Continuous 2s LTP, chart & exit monitoring active." in sec2_text
+

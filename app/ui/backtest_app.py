@@ -165,6 +165,8 @@ def render_backtest_module():
         ("obv_enabled", "c_obv"),
         ("higher_high_enabled", "c_hh"),
         ("lower_low_enabled", "c_ll"),
+        ("hma_enabled", "c_hma"),
+        ("supertrend_enabled", "c_supertrend"),
     ]
 
 
@@ -399,6 +401,8 @@ def render_backtest_module():
                     "obv_enabled": True, "obv_ma_period": 20, "obv_weight": 1,
                     "higher_high_enabled": False, "higher_high_period": 5, "higher_high_weight": 1,
                     "lower_low_enabled": False, "lower_low_period": 5, "lower_low_weight": 1,
+                    "hma_enabled": False, "hma_period": 100, "hma_weight": 1,
+                    "supertrend_enabled": False, "supertrend_period": 10, "supertrend_mult_simple": 2.0, "supertrend_mult_complex": 4.0, "supertrend_weight": 1,
                     "long_threshold": 5, "short_threshold": -5,
                     "fixed_target_pct": 3, "fixed_stoploss_pct": 2,
                     "trailing_sl_enabled": False, "trail_beyond_target": False,
@@ -428,6 +432,22 @@ def render_backtest_module():
                 st.session_state.indicators["lower_low_period"] = 5
             if "lower_low_weight" not in st.session_state.indicators:
                 st.session_state.indicators["lower_low_weight"] = 1
+            if "hma_enabled" not in st.session_state.indicators:
+                st.session_state.indicators["hma_enabled"] = False
+            if "hma_period" not in st.session_state.indicators:
+                st.session_state.indicators["hma_period"] = 100
+            if "hma_weight" not in st.session_state.indicators:
+                st.session_state.indicators["hma_weight"] = 1
+            if "supertrend_enabled" not in st.session_state.indicators:
+                st.session_state.indicators["supertrend_enabled"] = False
+            if "supertrend_period" not in st.session_state.indicators:
+                st.session_state.indicators["supertrend_period"] = 10
+            if "supertrend_mult_simple" not in st.session_state.indicators:
+                st.session_state.indicators["supertrend_mult_simple"] = 2.0
+            if "supertrend_mult_complex" not in st.session_state.indicators:
+                st.session_state.indicators["supertrend_mult_complex"] = 4.0
+            if "supertrend_weight" not in st.session_state.indicators:
+                st.session_state.indicators["supertrend_weight"] = 1
             if "trade_side" not in st.session_state.indicators:
                 st.session_state.indicators["trade_side"] = "BOTH"
             if "short_lot_size" not in st.session_state.indicators:
@@ -759,7 +779,7 @@ def render_backtest_module():
                 raise ValueError(f"No candle data returned for {inst_key} between {start_d} and {end_d}. Verify Kotak/Upstox connection or ensure local cached CSV exists in data/.")
 
             progress_bar.progress(50)
-            status_text.text("Calculating 12 custom indicators...")
+            status_text.text("Calculating 14 custom indicators...")
 
             ind = st.session_state.indicators
             risk_inp = st.session_state.risk
@@ -785,6 +805,14 @@ def render_backtest_module():
                 lower_low_enabled=bool(ind.get("lower_low_enabled", False)),
                 lower_low_period=int(ind.get("lower_low_period", 5)),
                 lower_low_weight=int(ind.get("lower_low_weight", 1)),
+                hma_enabled=bool(ind.get("hma_enabled", False)),
+                hma_period=int(ind.get("hma_period", 100)),
+                hma_weight=int(ind.get("hma_weight", 1)),
+                supertrend_enabled=bool(ind.get("supertrend_enabled", False)),
+                supertrend_period=int(ind.get("supertrend_period", 10)),
+                supertrend_mult_simple=float(ind.get("supertrend_mult_simple", 2.0)),
+                supertrend_mult_complex=float(ind.get("supertrend_mult_complex", 4.0)),
+                supertrend_weight=int(ind.get("supertrend_weight", 1)),
                 long_threshold=ind["long_threshold"], short_threshold=ind["short_threshold"],
                 fixed_target_pct=float(ind.get("fixed_target_pct", 3)), fixed_stoploss_pct=float(ind.get("fixed_stoploss_pct", 2)),
                 trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
@@ -1088,11 +1116,13 @@ def render_backtest_module():
                 ("obv_enabled", "c_obv"),
                 ("higher_high_enabled", "c_hh"),
                 ("lower_low_enabled", "c_ll"),
+                ("hma_enabled", "c_hma"),
+                ("supertrend_enabled", "c_supertrend"),
             ]
 
             for ik, wk in ind_toggle_keys:
                 if wk not in st.session_state:
-                    st.session_state[wk] = ind.get(ik, False if "enabled" in ik and ("higher_high" in ik or "lower_low" in ik) else True)
+                    st.session_state[wk] = ind.get(ik, False if "enabled" in ik and ("higher_high" in ik or "lower_low" in ik or "hma" in ik or "supertrend" in ik) else True)
 
             def sync_side_for_indicators():
                 hh = st.session_state.indicators.get("higher_high_enabled", False)
@@ -1130,7 +1160,7 @@ def render_backtest_module():
                 "☑️ Select All / Deselect All Indicators",
                 key="select_all_ind",
                 on_change=on_select_all_toggle,
-                help="Check to enable all 12 indicators, or uncheck to disable all indicators at once."
+                help="Check to enable all 14 indicators, or uncheck to disable all indicators at once."
             )
 
             i_col1, i_col2 = st.columns(2)
@@ -1199,6 +1229,20 @@ def render_backtest_module():
                         value=ind.get("higher_high_weight", 1),
                         key="w_hh"
                     )
+
+                # 13. HMA (NEW)
+                with st.expander("13. HMA (Hull Moving Average 100) (NEW)", expanded=True):
+                    ind["hma_enabled"] = st.checkbox(
+                        "Enable HMA(100)",
+                        key="c_hma",
+                        on_change=on_ind_checkbox_change,
+                        args=("hma_enabled", "c_hma"),
+                        help="Condition: Signal bar close > HMA(100) adds score for bullish consensus (or < HMA for bearish)."
+                    )
+                    st.caption("Condition: **Signal bar close > current HMA(100)** adds score for this logic.")
+                    h1, h2 = st.columns(2)
+                    ind["hma_period"] = h1.number_input("HMA Period", min_value=5, max_value=300, value=ind.get("hma_period", 100))
+                    ind["hma_weight"] = h2.number_input("HMA Weight", min_value=1, max_value=5, value=ind.get("hma_weight", 1), key="w_hma")
 
             with i_col2:
                 # 6. ADX
@@ -1276,6 +1320,22 @@ def render_backtest_module():
                         key="w_ll"
                     )
 
+                # 14. Supertrend (NEW)
+                with st.expander("14. Supertrend ((10,2) simple and (10,4) complex trend applied by default) (NEW)", expanded=True):
+                    ind["supertrend_enabled"] = st.checkbox(
+                        "Enable Supertrend",
+                        key="c_supertrend",
+                        on_change=on_ind_checkbox_change,
+                        args=("supertrend_enabled", "c_supertrend"),
+                        help="(10,2) simple and (10,4) complex trend applied by default. Condition: Signal bar close > Supertrend (10,2) AND Signal bar close > Supertrend (10,4)."
+                    )
+                    st.caption("(10,2) simple and (10,4) complex trend applied by default.<br>Condition: AND mode { <b>Signal bar close > current Supertrend (10,2)</b> AND <b>Signal bar close > current Supertrend (10,4)</b> } adds score for this logic.", unsafe_allow_html=True)
+                    st1, st2, st3, st4 = st.columns(4)
+                    ind["supertrend_period"] = st1.number_input("Lookback Period", min_value=2, max_value=50, value=ind.get("supertrend_period", 10))
+                    ind["supertrend_mult_simple"] = st2.number_input("Simple Multiplier", min_value=0.5, max_value=10.0, value=float(ind.get("supertrend_mult_simple", 2.0)), step=0.5)
+                    ind["supertrend_mult_complex"] = st3.number_input("Complex Multiplier", min_value=0.5, max_value=10.0, value=float(ind.get("supertrend_mult_complex", 4.0)), step=0.5)
+                    ind["supertrend_weight"] = st4.number_input("Supertrend Weight", min_value=1, max_value=5, value=ind.get("supertrend_weight", 1), key="w_supertrend")
+
             # Dynamic Max Score Calculation
             max_possible = 0
             if ind["ema_enabled"]: max_possible += ind["ema_weight"]
@@ -1289,6 +1349,8 @@ def render_backtest_module():
             if ind["obv_enabled"]: max_possible += ind["obv_weight"]
             if ind.get("higher_high_enabled"): max_possible += ind.get("higher_high_weight", 1)
             if ind.get("lower_low_enabled"): max_possible += ind.get("lower_low_weight", 1)
+            if ind.get("hma_enabled"): max_possible += ind.get("hma_weight", 1)
+            if ind.get("supertrend_enabled"): max_possible += ind.get("supertrend_weight", 1)
             max_possible = max(max_possible, 1)
 
             th_head_col, th_help_col = st.columns([3, 1])
@@ -1304,6 +1366,10 @@ def render_backtest_module():
                 st.info(f"📈 **Higher High Active (Indicator 11):** Only LONG trades taken. Requires Current Candle High > Previous Swing High (Lookback: {ind.get('higher_high_period', 5)} candles).")
             if ind.get("lower_low_enabled"):
                 st.info(f"📉 **Lower Low Active (Indicator 12):** Only SHORT trades taken. Requires Current Candle Low < Previous Swing Low (Lookback: {ind.get('lower_low_period', 5)} candles).")
+            if ind.get("hma_enabled"):
+                st.info(f"🌊 **HMA(100) Active (Indicator 13):** Adds {ind.get('hma_weight', 1)} pt(s) when Signal bar close > HMA({ind.get('hma_period', 100)}) (or short when < HMA).")
+            if ind.get("supertrend_enabled"):
+                st.info(f"⚡ **Supertrend Active (Indicator 14):** (10,2) simple and (10,4) complex trend applied by default in AND mode. Adds {ind.get('supertrend_weight', 1)} pt(s) when Signal bar close > Supertrend(10,2) AND > Supertrend(10,4).")
 
             th1, th2 = st.columns(2)
             ind["long_threshold"] = th1.number_input(

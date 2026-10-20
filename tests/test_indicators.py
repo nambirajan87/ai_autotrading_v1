@@ -109,4 +109,93 @@ def test_regime_detection():
     assert detect_regime(df).tolist() == ["SIDEWAYS", "UP", "DOWN", "SIDEWAYS"]
     assert detect_regime_row(pd.Series({"adx": 22.0, "ema20": 105.0, "ema50": 100.0})) == "UP"
     assert detect_regime_row(pd.Series({"adx": 22.0, "ema20": 95.0, "ema50": 100.0})) == "DOWN"
-    assert detect_regime_row(pd.Series({"adx": 18.0, "ema20": 105.0, "ema50": 100.0})) == "SIDEWAYS"
+    assert detect_regime_row(pd.Series({"adx": 18.0, "ema20": 105.0, "ema50": 100.0})) == "SIDEWAYS"
+
+
+def test_hma_indicator():
+    from app.indicators.hma import hma
+
+    # Constant series should yield close to constant
+    constant_s = pd.Series([100.0] * 120)
+    res_const = hma(constant_s, period=100)
+    assert np.allclose(res_const.iloc[-10:], 100.0)
+
+    # Trending series: in an uptrend, HMA should follow the trend and be close to current prices
+    trend_s = pd.Series(np.linspace(100.0, 200.0, 150))
+    res_trend = hma(trend_s, period=50)
+    assert not res_trend.isna().any()
+    assert res_trend.iloc[-1] > res_trend.iloc[0]
+
+
+def test_supertrend_indicator():
+    from app.indicators.supertrend import supertrend
+
+    # Strong uptrend: Supertrend should be bullish (trend == 1, close > supertrend)
+    n = 50
+    up_prices = np.linspace(100.0, 200.0, n)
+    df_up = pd.DataFrame({
+        "open": up_prices - 0.5,
+        "high": up_prices + 1.0,
+        "low": up_prices - 1.0,
+        "close": up_prices,
+    })
+    st_res_up = supertrend(df_up, period=10, multiplier=2.0)
+    assert (st_res_up["trend"].iloc[-10:] == 1).all()
+    assert (df_up["close"].iloc[-10:] > st_res_up["supertrend"].iloc[-10:]).all()
+
+    # Strong downtrend: Supertrend should be bearish (trend == -1, close < supertrend)
+    down_prices = np.linspace(200.0, 100.0, n)
+    df_down = pd.DataFrame({
+        "open": down_prices + 0.5,
+        "high": down_prices + 1.0,
+        "low": down_prices - 1.0,
+        "close": down_prices,
+    })
+    st_res_down = supertrend(df_down, period=10, multiplier=2.0)
+    assert (st_res_down["trend"].iloc[-10:] == -1).all()
+    assert (df_down["close"].iloc[-10:] < st_res_down["supertrend"].iloc[-10:]).all()
+
+
+def test_custom_strategy_hma_and_supertrend_scoring():
+    from app.strategy.custom_strategy import (
+        CustomStrategyConfig,
+        calculate_custom_indicators,
+        score_custom_row,
+    )
+
+    n = 60
+    base = np.linspace(100.0, 160.0, n)
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2026-10-19 09:15", periods=n, freq="1min"),
+        "open": base - 0.2,
+        "high": base + 0.8,
+        "low": base - 0.8,
+        "close": base,
+        "volume": [1000] * n,
+    })
+
+    # Enable HMA and Supertrend
+    cfg = CustomStrategyConfig(
+        ema_enabled=False, rsi_enabled=False, macd_enabled=False, vwap_enabled=False,
+        atr_enabled=True, adx_enabled=False, volume_enabled=False, bollinger_enabled=False,
+        stoch_enabled=False, obv_enabled=False, higher_high_enabled=False, lower_low_enabled=False,
+        hma_enabled=True, hma_period=20, hma_weight=2,
+        supertrend_enabled=True, supertrend_period=10, supertrend_mult_simple=2.0, supertrend_mult_complex=4.0, supertrend_weight=3,
+        long_threshold=4, short_threshold=-4,
+    )
+
+    scored_df = calculate_custom_indicators(df, cfg)
+    assert "hma" in scored_df.columns
+    assert "supertrend_simple" in scored_df.columns
+    assert "supertrend_complex" in scored_df.columns
+
+    last_row = scored_df.iloc[-1]
+    scores = score_custom_row(last_row, cfg)
+
+    # In strong uptrend:
+    # 1. close > hma -> +hma_weight (2)
+    # 2. close > supertrend(10,2) AND close > supertrend(10,4) -> +supertrend_weight (3)
+    assert scores.get("hma") == 2
+    assert scores.get("supertrend") == 3
+    assert sum(scores.values()) == 5
+

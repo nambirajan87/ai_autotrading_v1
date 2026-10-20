@@ -97,6 +97,18 @@ class CustomStrategyConfig:
     lower_low_period: int = 5
     lower_low_weight: int = 1
 
+    # 13. HMA (indicator 13: Hull Moving Average 100)
+    hma_enabled: bool = False
+    hma_period: int = 100
+    hma_weight: int = 1
+
+    # 14. Supertrend (indicator 14: (10,2) simple and (10,4) complex trend applied by default)
+    supertrend_enabled: bool = False
+    supertrend_period: int = 10
+    supertrend_mult_simple: float = 2.0
+    supertrend_mult_complex: float = 4.0
+    supertrend_weight: int = 1
+
     # Score thresholds
     long_threshold: int = 5
     short_threshold: int = -5
@@ -137,6 +149,10 @@ class CustomStrategyConfig:
             total += self.higher_high_weight
         if self.lower_low_enabled:
             total += self.lower_low_weight
+        if self.hma_enabled:
+            total += self.hma_weight
+        if self.supertrend_enabled:
+            total += self.supertrend_weight
         return max(total, 1)
 
     @property
@@ -170,6 +186,10 @@ class CustomStrategyConfig:
             raise ValueError("Higher High swing period must be >= 1")
         if self.lower_low_period < 1:
             raise ValueError("Lower Low swing period must be >= 1")
+        if self.hma_period < 1:
+            raise ValueError("HMA period must be >= 1")
+        if self.supertrend_period < 1 or self.supertrend_mult_simple <= 0 or self.supertrend_mult_complex <= 0:
+            raise ValueError("Supertrend period and multipliers must be positive")
         if self.volume_period < 1 or self.volume_ratio_min <= 0:
             raise ValueError("Volume period must be >= 1 and volume_ratio_min must be positive")
         if not (1 <= self.volume_consecutive <= 5):
@@ -274,6 +294,19 @@ def calculate_custom_indicators(df: pd.DataFrame, cfg: CustomStrategyConfig) -> 
         ll_df = swing_high_low(out, period=cfg.lower_low_period)
         out["swing_low"] = ll_df["swing_low"]
         out["lower_low"] = ll_df["lower_low"]
+
+    if cfg.hma_enabled:
+        from app.indicators.hma import hma
+        out["hma"] = hma(out["close"], period=cfg.hma_period)
+
+    if cfg.supertrend_enabled:
+        from app.indicators.supertrend import supertrend
+        st_sim = supertrend(out, period=cfg.supertrend_period, multiplier=cfg.supertrend_mult_simple)
+        st_cpx = supertrend(out, period=cfg.supertrend_period, multiplier=cfg.supertrend_mult_complex)
+        out["supertrend_simple"] = st_sim["supertrend"]
+        out["supertrend_simple_trend"] = st_sim["trend"]
+        out["supertrend_complex"] = st_cpx["supertrend"]
+        out["supertrend_complex_trend"] = st_cpx["trend"]
 
     if "regime" not in out.columns:
         out["regime"] = detect_regime(out)
@@ -441,6 +474,33 @@ def score_custom_row(row: pd.Series, cfg: CustomStrategyConfig) -> Dict[str, int
             components["lower_low"] = -cfg.lower_low_weight
         else:
             components["lower_low"] = 0
+
+    # 12. HMA (Hull Moving Average 100)
+    if cfg.hma_enabled:
+        c = row.get("close")
+        h = row.get("hma")
+        if c is not None and h is not None and pd.notna(h):
+            if c > h:
+                components["hma"] = cfg.hma_weight
+            elif c < h:
+                components["hma"] = -cfg.hma_weight
+            else:
+                components["hma"] = 0
+
+    # 13. Supertrend ((10,2) simple and (10,4) complex trend applied by default in AND mode)
+    if cfg.supertrend_enabled:
+        c = row.get("close")
+        st_s = row.get("supertrend_simple")
+        st_c = row.get("supertrend_complex")
+        if c is not None and st_s is not None and st_c is not None and pd.notna(st_s) and pd.notna(st_c):
+            # check whether "Signal bar close" is greater than current Supertrend (10,2)
+            # and check whether "Signal bar close" is greater than current Supertrend (10,4)
+            if c > st_s and c > st_c:
+                components["supertrend"] = cfg.supertrend_weight
+            elif c < st_s and c < st_c:
+                components["supertrend"] = -cfg.supertrend_weight
+            else:
+                components["supertrend"] = 0
 
     return components
 
