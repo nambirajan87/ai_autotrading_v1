@@ -52,6 +52,7 @@ logs/
 *.sqlite
 *.sqlite3
 data/*.db
+!data/backtest.db
 
 # ==========================================
 # Temporary Exports, Scratch Files & Downloads
