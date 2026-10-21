@@ -1447,7 +1447,10 @@ class KotakGateway(BaseBrokerGateway):
         if instrument_key and ("NSE_EQ" in instrument_key or "NSE_INDEX" in instrument_key):
             try:
                 from app.data.upstox_loader import fetch_range
-                return fetch_range(instrument_key, "minutes", timeframe_minutes, start_d, end_d)
+                up_df = fetch_range(instrument_key, "minutes", timeframe_minutes, start_d, end_d)
+                if up_df is not None and len(up_df) >= 10:
+                    return up_df
+                logger.warning("Upstox returned insufficient/corrupt candles (%d rows) for %s; ignoring", len(up_df) if up_df is not None else 0, instrument_key)
             except Exception as e:
                 logger.warning("Upstox fallback fetch_range error: %s", e)
 

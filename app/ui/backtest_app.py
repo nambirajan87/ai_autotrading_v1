@@ -729,9 +729,24 @@ def render_backtest_module():
             kotak_err = None
             upstox_err = None
 
-            # 1. Fetch from Kotak Neo Gateway (Primary for F&O and Kotak instruments)
+            # 0. Primary for OIPulse Mode / Local NIFTY Master Dataset (Never query brokers or overwrite)
             fo_mode_active = st.session_state.get("backtest_fo_mode", "Normal Mode") == "OIPulse Mode"
-            if (is_kotak_inst or is_fo) and not (fo_mode_active and os.path.exists(f"data/nifty_{st.session_state.timeframe}m.csv")):
+            nifty_master_file = f"data/nifty_{st.session_state.timeframe}m.csv"
+            if (fo_mode_active or st.session_state.symbol.upper() == "NIFTY") and os.path.exists(nifty_master_file):
+                try:
+                    logger.info("Loading pre-calculated master dataset from %s", nifty_master_file)
+                    loaded_m = load_csv(nifty_master_file)
+                    if loaded_m is not None and not loaded_m.empty:
+                        ts_dt = pd.to_datetime(loaded_m["timestamp"]).dt.date
+                        in_range = loaded_m[(ts_dt >= start_d) & (ts_dt <= end_d)]
+                        if not in_range.empty:
+                            raw_df = in_range.copy()
+                            st.session_state["data_source_warning"] = None
+                except Exception as _m_err:
+                    logger.warning("Error reading master dataset %s: %s", nifty_master_file, _m_err)
+
+            # 1. Fetch from Kotak Neo Gateway (Primary for F&O and Kotak instruments)
+            if (raw_df is None or raw_df.empty) and (is_kotak_inst or is_fo):
                 try:
                     kotak_gw = get_gateway("KOTAK")
                     logger.info("Fetching historical candles from Kotak Neo for %s (%s)", st.session_state.symbol, inst_key)
@@ -748,10 +763,18 @@ def render_backtest_module():
                     kotak_err = str(e)
                     logger.warning("Kotak Neo candle fetch exception: %s", e)
 
-            # Auto-cache freshly fetched Kotak candles so local CSV cache is enriched (only if significant valid candles returned)
-            if raw_df is not None and len(raw_df) > 50 and (is_kotak_inst or is_fo):
+            # Auto-cache freshly fetched Kotak candles so local CSV cache is enriched
+            # Strictly protected: NEVER overwrite master datasets (nifty_1m, nifty_3m, etc.)
+            protected_master = {
+                f"nifty_{st.session_state.timeframe}m.csv".lower(),
+                "nifty_1m.csv",
+                "nifty_3m.csv",
+                "nifty_5m.csv",
+            }
+            sym_clean = st.session_state.symbol.lower().replace(" ", "")
+            target_fn = f"{sym_clean}_{st.session_state.timeframe}m.csv".lower()
+            if raw_df is not None and len(raw_df) > 100 and (is_kotak_inst or is_fo) and not fo_mode_active and target_fn not in protected_master:
                 try:
-                    sym_clean = st.session_state.symbol.lower().replace(" ", "")
                     raw_df.to_csv(f"data/{sym_clean}_{st.session_state.timeframe}m.csv", index=False)
                     raw_df.to_csv(f"data/{st.session_state.symbol.lower()}_{st.session_state.timeframe}m.csv", index=False)
                 except Exception as _e:
@@ -762,8 +785,9 @@ def render_backtest_module():
             if (raw_df is None or raw_df.empty) and token and not is_kotak_inst:
                 try:
                     raw_df = fetch_range(inst_key, "minutes", st.session_state.timeframe, start_d, end_d, chunk_days=28)
-                    if raw_df is None or raw_df.empty:
-                        upstox_err = "Upstox API returned 0 candles."
+                    if raw_df is None or len(raw_df) < 10:
+                        upstox_err = "Upstox API returned 0 or truncated candles."
+                        raw_df = None
                 except Exception as e:
                     upstox_err = str(e)
                     logger.warning("Upstox fetch_range failed: %s", e)

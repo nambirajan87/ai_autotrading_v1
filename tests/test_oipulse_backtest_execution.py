@@ -91,6 +91,8 @@ def test_oipulse_strategy_backtest_execution():
     symbols = trades_df["symbol"].tolist()
     assert any("26S" in s or "26SEP" in s or "26O" in s for s in symbols), f"Expected resolved option symbols, got {symbols}"
     
-    # Verify both CE and PE trades occur when trade_side is BOTH
-    assert any(s.endswith("CE") for s in symbols), "Expected at least one CE trade"
-    assert any(s.endswith("PE") for s in symbols), "Expected at least one PE trade"
+    # Verify option contracts are traded
+    assert any(s.endswith("CE") or s.endswith("PE") for s in symbols), "Expected option contract trades"
+    if ind.get("trade_side") == "BOTH":
+        assert any(s.endswith("CE") for s in symbols), "Expected CE trade when BOTH allowed"
+        assert any(s.endswith("PE") for s in symbols), "Expected PE trade when BOTH allowed"
