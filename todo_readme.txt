@@ -106,9 +106,9 @@ def find_value(LTP, current_day, OIStrength):
 
     # Step 2: Define weekday adjustments
     adjustments = {
-        "Wednesday": 300,
-        "Thursday": 200,
-        "Friday": 100,
+        "Wednesday": 350,
+        "Thursday": 250,
+        "Friday": 150,
         "Monday": 0,
         "Tuesday": -100
     }

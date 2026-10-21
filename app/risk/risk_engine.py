@@ -138,7 +138,7 @@ class RiskEngine:
             except Exception as e:
                 logger.warning("Error evaluating snooze cooldown: %s", e)
 
-        entry = signal.indicators.get("close")
+        entry = signal.indicators.get("option_price") or signal.indicators.get("close")
         atr = signal.indicators.get("atr")
         if entry is None or entry <= 0:
             return self._reject(decision, "missing or invalid close")

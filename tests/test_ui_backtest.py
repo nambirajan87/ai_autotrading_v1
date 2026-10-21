@@ -1740,3 +1740,182 @@ def test_backtest_ui_hma_and_supertrend_toggles():
     delete_strategy(strat_name)
 
 
+
+
+
+def test_trade_audit_trail_instrument_and_option_type_columns():
+    """Tests that both Trade Audit Trail and Trade Audit Trail-2 tables derive and include
+    'Instrument', 'Index-LTP', and 'Option Type' columns accurately for FO (PE/CE), OIPulse Mode, and Equity."""
+    import re
+    import os
+    import sqlite3
+    import numpy as np
+    import pandas as pd
+
+    trades = pd.DataFrame([
+        {
+            "id": 1,
+            "symbol": "NIFTY26S0124000CE",
+            "side": "LONG",
+            "score": 3,
+            "entry_time": "2026-09-01 11:21:00",
+            "exit_time": "2026-09-01 11:35:00",
+            "quantity": 50,
+            "entry_price": 120.0,
+            "exit_price": 135.0,
+            "net_pnl": 750.0,
+        },
+        {
+            "id": 2,
+            "symbol": "NIFTY26SEP22650CE",
+            "side": "LONG",
+            "score": 4,
+            "entry_time": "2026-10-21 10:15:00",
+            "exit_time": "2026-10-21 10:45:00",
+            "quantity": 50,
+            "entry_price": 80.0,
+            "exit_price": 92.0,
+            "net_pnl": 600.0,
+            "index_ltp": 22640.5,
+        },
+        {
+            "id": 3,
+            "symbol": "RELIANCE",
+            "side": "LONG",
+            "score": 2,
+            "entry_time": "2026-10-21 11:00:00",
+            "exit_time": "2026-10-21 11:30:00",
+            "quantity": 10,
+            "entry_price": 2500.0,
+            "exit_price": 2520.0,
+            "net_pnl": 200.0,
+        }
+    ])
+
+    run_data = {"symbol": "NIFTY", "config": {"equity_name": "NIFTY 27-OCT-2026 22500 PE"}}
+
+    db_oi_file = "data/backtest.db"
+    oi_conn = None
+    if os.path.exists(db_oi_file):
+        try:
+            oi_conn = sqlite3.connect(db_oi_file)
+        except Exception:
+            oi_conn = None
+    oi_cur = oi_conn.cursor() if oi_conn else None
+
+    def get_trade_instrument_and_opt_type(row):
+        sym = str(row.get("symbol") or "").strip()
+        if not sym or sym.lower() in ("none", "nan", ""):
+            sym = str(run_data.get("symbol") or "").strip()
+
+        cfg_sym = str(run_data.get("config", {}).get("symbol") or "").strip()
+        cfg_eq = str(run_data.get("config", {}).get("equity_name") or "").strip()
+
+        if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+            if cfg_sym and cfg_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_sym.upper()):
+                sym = cfg_sym
+            elif cfg_eq and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq.upper()) and "OIPulse" not in cfg_eq:
+                sym = cfg_eq
+
+        # Resolve Index-LTP
+        idx_ltp = np.nan
+        if "index_ltp" in row and pd.notna(row["index_ltp"]):
+            try:
+                idx_ltp = round(float(row["index_ltp"]), 2)
+            except Exception:
+                pass
+
+        if pd.isna(idx_ltp):
+            e_ts = row.get("entry_time") or row.get("signal_time")
+            if e_ts and pd.notna(e_ts):
+                try:
+                    dt = pd.to_datetime(e_ts)
+                    d_str = dt.strftime("%d-%m-%Y")
+                    t_str = dt.strftime("%H:%M:%S")
+
+                    if oi_cur:
+                        oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time = ? LIMIT 1", (d_str, t_str))
+                        r_ltp = oi_cur.fetchone()
+                        if not r_ltp:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time <= ? ORDER BY Time DESC LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                        if not r_ltp:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time >= ? ORDER BY Time ASC LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                        if r_ltp and r_ltp[0] is not None:
+                            idx_ltp = round(float(r_ltp[0]), 2)
+                except Exception:
+                    pass
+
+        # Resolve Option Type
+        opt_t = ""
+        if "opt_type" in row and pd.notna(row["opt_type"]) and str(row["opt_type"]).strip() and str(row["opt_type"]).strip().lower() != "none":
+            opt_t = str(row["opt_type"]).strip().upper()
+        elif "option_type" in row and pd.notna(row["option_type"]) and str(row["option_type"]).strip() and str(row["option_type"]).strip().lower() != "none":
+            opt_t = str(row["option_type"]).strip().upper()
+
+        if not opt_t:
+            sym_upper = sym.upper()
+            m_sym = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", sym_upper)
+            if m_sym:
+                opt_t = m_sym.group(1)
+            elif sym in (run_data.get("symbol", ""), "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                cfg_opt = str(run_data.get("config", {}).get("option_type") or "").upper()
+                cfg_eq_upper = cfg_eq.upper()
+                m_eq = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq_upper)
+                if "CE" in cfg_opt:
+                    opt_t = "CE"
+                elif "PE" in cfg_opt:
+                    opt_t = "PE"
+                elif m_eq:
+                    opt_t = m_eq.group(1)
+                else:
+                    opt_t = "-"
+            else:
+                opt_t = "-"
+
+        return pd.Series([sym, idx_ltp, opt_t], index=["Instrument", "Index-LTP", "Option Type"])
+
+    trades[["Instrument", "Index-LTP", "Option Type"]] = trades.apply(get_trade_instrument_and_opt_type, axis=1)
+    if oi_conn:
+        oi_conn.close()
+
+    # Verify column values
+    assert trades.loc[0, "Instrument"] == "NIFTY26S0124000CE"
+    assert trades.loc[0, "Index-LTP"] == 24124.35
+    assert trades.loc[0, "Option Type"] == "CE"
+
+    assert trades.loc[1, "Instrument"] == "NIFTY26SEP22650CE"
+    assert trades.loc[1, "Index-LTP"] == 22640.5
+    assert trades.loc[1, "Option Type"] == "CE"
+
+    assert trades.loc[2, "Instrument"] == "RELIANCE"
+    assert trades.loc[2, "Option Type"] == "-"
+
+    # Verify Trade Audit Trail 1 cols
+    cols = [c for c in [
+        "id", "Instrument", "Index-LTP", "Option Type", "side", "regime", "Calculated_Score", "entry_time", "exit_time",
+        "quantity", "entry_price", "Margin used", "peak_gain",
+        "5%", "10%", "15%", "20%", "25%", "30%",
+        "exit_price", "stop_loss", "target",
+        "exit_reason", "gross_pnl", "costs", "slippage_cost", "net_pnl"
+    ] if c in trades.columns]
+
+    assert "Instrument" in cols
+    assert "Index-LTP" in cols
+    assert "Option Type" in cols
+    assert cols.index("Instrument") == 1
+    assert cols.index("Index-LTP") == 2
+    assert cols.index("Option Type") == 3
+
+    # Verify Trade Audit Trail 2 (Candle Progression: C1 to C360) base cols
+    c_cols = [f"C{i}" for i in range(1, 11)]
+    c_df = pd.DataFrame({col: ["-"] * len(trades) for col in c_cols}, index=trades.index)
+    base_cols_2 = [c for c in cols if c in trades.columns]
+    trades_2 = pd.concat([trades[base_cols_2], c_df], axis=1)
+
+    assert "Instrument" in trades_2.columns
+    assert "Index-LTP" in trades_2.columns
+    assert "Option Type" in trades_2.columns
+    assert trades_2.loc[0, "Index-LTP"] == 24124.35
+

@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS backtest_trades (
     costs REAL,
     slippage_cost REAL,
     net_pnl REAL,
+    opt_type TEXT,
+    index_ltp REAL,
     FOREIGN KEY(run_id) REFERENCES backtest_runs(id) ON DELETE CASCADE
 );
 
@@ -68,6 +70,14 @@ class BacktestDatabase:
     def _init_schema(self) -> None:
         with self.conn:
             self.conn.executescript(SCHEMA)
+            try:
+                self.conn.execute("ALTER TABLE backtest_trades ADD COLUMN opt_type TEXT")
+            except Exception:
+                pass
+            try:
+                self.conn.execute("ALTER TABLE backtest_trades ADD COLUMN index_ltp REAL")
+            except Exception:
+                pass
 
     def close(self) -> None:
         self.conn.close()
@@ -114,9 +124,15 @@ class BacktestDatabase:
             if trades_df is not None and not trades_df.empty:
                 records = []
                 for _, r in trades_df.iterrows():
+                    sym_val = str(r.get("symbol", symbol))
+                    opt_val = str(r.get("opt_type", ""))
+                    if not opt_val or opt_val.lower() == "none":
+                        import re
+                        m_ot = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", sym_val.upper())
+                        opt_val = m_ot.group(1) if m_ot else ""
                     records.append((
                         run_id,
-                        str(r.get("symbol", symbol)),
+                        sym_val,
                         str(r.get("side", "")),
                         str(r.get("strategy_version", strategy_version)),
                         str(r.get("regime", "")),
@@ -134,6 +150,8 @@ class BacktestDatabase:
                         float(r.get("costs", 0.0)),
                         float(r.get("slippage_cost", 0.0)),
                         float(r.get("net_pnl", 0.0)),
+                        opt_val,
+                        float(r["Index-LTP"]) if "Index-LTP" in r and pd.notna(r["Index-LTP"]) else (float(r["index_ltp"]) if "index_ltp" in r and pd.notna(r["index_ltp"]) else None),
                     ))
                 self.conn.executemany(
                     """
@@ -141,8 +159,8 @@ class BacktestDatabase:
                         run_id, symbol, side, strategy_version, regime, score,
                         signal_time, entry_time, exit_time, quantity, entry_price,
                         exit_price, stop_loss, target, exit_reason, gross_pnl,
-                        costs, slippage_cost, net_pnl
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        costs, slippage_cost, net_pnl, opt_type, index_ltp
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     records,
                 )

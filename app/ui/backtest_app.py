@@ -1,4 +1,5 @@
 import json
+import re
 import logging
 import os
 import sys
@@ -729,21 +730,57 @@ def render_backtest_module():
             kotak_err = None
             upstox_err = None
 
-            # 0. Primary for OIPulse Mode / Local NIFTY Master Dataset (Never query brokers or overwrite)
+            # 0. Primary for OIPulse Mode: directly query oi_strength table from data/backtest.db
             fo_mode_active = st.session_state.get("backtest_fo_mode", "Normal Mode") == "OIPulse Mode"
-            nifty_master_file = f"data/nifty_{st.session_state.timeframe}m.csv"
-            if (fo_mode_active or st.session_state.symbol.upper() == "NIFTY") and os.path.exists(nifty_master_file):
-                try:
-                    logger.info("Loading pre-calculated master dataset from %s", nifty_master_file)
-                    loaded_m = load_csv(nifty_master_file)
-                    if loaded_m is not None and not loaded_m.empty:
-                        ts_dt = pd.to_datetime(loaded_m["timestamp"]).dt.date
-                        in_range = loaded_m[(ts_dt >= start_d) & (ts_dt <= end_d)]
-                        if not in_range.empty:
-                            raw_df = in_range.copy()
+            if fo_mode_active:
+                import sqlite3
+                from app.strategy.oipulse_resolver import parse_strength_value
+                db_file = "data/backtest.db"
+                if os.path.exists(db_file):
+                    try:
+                        conn = sqlite3.connect(db_file)
+                        df_oi = pd.read_sql("SELECT Date, Time, LTP, Strength FROM oi_strength WHERE Time != 'EOD' ORDER BY id ASC", conn)
+                        conn.close()
+                        records = []
+                        for _, row_oi in df_oi.iterrows():
+                            try:
+                                d_str = row_oi["Date"].strip()
+                                t_str = row_oi["Time"].strip()
+                                dt_oi = datetime.strptime(f"{d_str} {t_str}", "%d-%m-%Y %H:%M:%S")
+                                if start_d <= dt_oi.date() <= end_d:
+                                    ltp_val = float(row_oi["LTP"])
+                                    str_val = parse_strength_value(row_oi["Strength"])
+                                    records.append({
+                                        "timestamp": dt_oi,
+                                        "ltp": ltp_val,
+                                        "strength": str_val,
+                                    })
+                            except Exception:
+                                pass
+                        if records:
+                            raw_df = pd.DataFrame(records).sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+                            raw_df["open"] = raw_df["ltp"].shift(1).fillna(raw_df["ltp"])
+                            raw_df["high"] = raw_df[["open", "ltp"]].max(axis=1) + 0.5
+                            raw_df["low"] = raw_df[["open", "ltp"]].min(axis=1) - 0.5
+                            raw_df["close"] = raw_df["ltp"]
+                            raw_df["volume"] = 50000
                             st.session_state["data_source_warning"] = None
-                except Exception as _m_err:
-                    logger.warning("Error reading master dataset %s: %s", nifty_master_file, _m_err)
+                    except Exception as _oi_err:
+                        logger.warning("Error loading oi_strength for OIPulse mode: %s", _oi_err)
+            elif st.session_state.symbol.upper() == "NIFTY":
+                nifty_master_file = f"data/nifty_{st.session_state.timeframe}m.csv"
+                if os.path.exists(nifty_master_file):
+                    try:
+                        logger.info("Loading pre-calculated master dataset from %s", nifty_master_file)
+                        loaded_m = load_csv(nifty_master_file)
+                        if loaded_m is not None and not loaded_m.empty:
+                            ts_dt = pd.to_datetime(loaded_m["timestamp"]).dt.date
+                            in_range = loaded_m[(ts_dt >= start_d) & (ts_dt <= end_d)]
+                            if not in_range.empty:
+                                raw_df = in_range.copy()
+                                st.session_state["data_source_warning"] = None
+                    except Exception as _m_err:
+                        logger.warning("Error reading master dataset %s: %s", nifty_master_file, _m_err)
 
             # 1. Fetch from Kotak Neo Gateway (Primary for F&O and Kotak instruments)
             if (raw_df is None or raw_df.empty) and (is_kotak_inst or is_fo):
@@ -907,7 +944,7 @@ def render_backtest_module():
 
             trade_side = ind.get("trade_side", "BOTH")
             short_lot_size = int(ind.get("short_lot_size", 1)) if trade_side != "LONG" else None
-            snooze_minutes = int(ind.get("snooze_minutes", 0))
+            snooze_minutes = int(risk_inp.get("snooze_minutes") or ind.get("snooze_minutes") or 5)
 
             risk_cfg = RiskConfig(
                 capital=float(risk_inp["capital"]),
@@ -1707,20 +1744,24 @@ def render_backtest_module():
             )
 
             if fo_mode == "OIPulse Mode":
+                underlying_options = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+                curr_und = st.session_state.get("backtest_underlying_choice", "NIFTY")
+                idx = underlying_options.index(curr_und) if curr_und in underlying_options else 0
                 underlying_choice = st.selectbox(
                     "Underlying Index / Stock",
-                    ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"],
-                    index=0,
-                    key="backtest_underlying_choice"
+                    underlying_options,
+                    index=idx,
+                    key="backtest_underlying_choice",
+                    help="In OIPulse Mode, select the Underlying Index. Expiry, Option Type, and Strike Price are determined dynamically based on oi_strength."
                 )
                 mkt_lot = int(INDEX_LOT_SIZES.get(underlying_choice, 65))
                 st.session_state.symbol = underlying_choice
-                st.session_state.isin = "INF204KB14I2" if underlying_choice == "NIFTY" else f"INF00{underlying_choice}1"
+                st.session_state.isin = "INF204KB14I2" if underlying_choice == "NIFTY" else f"NSE_INDEX|{underlying_choice}"
                 st.session_state.instrument_key = f"NSE_INDEX|{underlying_choice}"
                 st.session_state.equity_name = f"{underlying_choice} (OIPulse Mode)"
                 st.session_state.risk["lot_size"] = mkt_lot
 
-                st.caption(f"🎯 **Active Selection:** `{underlying_choice}`")
+                st.caption(f"🎯 **Active Selection:** `{underlying_choice}` (Dynamic Expiry, Strike & Option Type via `oi_strength`)")
 
             else:
                 col_und, col_exp = st.columns(2)
@@ -2243,6 +2284,117 @@ def render_backtest_module():
                     trades["Margin used"] = (trades["quantity"] * trades["entry_price"]).round(2)
                     trades["margin_used"] = trades["Margin used"]
 
+                # Populate Instrument, Index-LTP, and Option Type columns
+                import sqlite3
+                db_oi_file = "data/backtest.db"
+                oi_conn = None
+                if os.path.exists(db_oi_file):
+                    try:
+                        oi_conn = sqlite3.connect(db_oi_file)
+                    except Exception:
+                        oi_conn = None
+                oi_cur = oi_conn.cursor() if oi_conn else None
+
+                # Pre-map candles for fallback index lookup if needed
+                c_ts_map = {}
+                raw_candles_ref = res.get("raw_df")
+                if raw_candles_ref is None or raw_candles_ref.empty:
+                    raw_candles_ref = res.get("indicators_df")
+                if raw_candles_ref is not None and not raw_candles_ref.empty and "timestamp" in raw_candles_ref.columns:
+                    for _, c_row in raw_candles_ref.iterrows():
+                        ts_key = str(c_row["timestamp"])[:19]
+                        val = c_row.get("ltp", c_row.get("close"))
+                        if val is not None and pd.notna(val):
+                            c_ts_map[ts_key] = float(val)
+
+                def get_trade_instrument_and_opt_type(row):
+                    import re
+                    # 1. Resolve active constructed instrument name
+                    sym = str(row.get("symbol") or "").strip()
+                    if not sym or sym.lower() in ("none", "nan", ""):
+                        sym = str(run_data.get("symbol") or st.session_state.get("symbol") or "").strip()
+                    
+                    cfg_sym = str(run_data.get("config", {}).get("symbol") or "").strip()
+                    cfg_eq = str(run_data.get("config", {}).get("equity_name") or st.session_state.get("equity_name") or "").strip()
+                    
+                    # If sym is just index name, upgrade to configured symbol / equity name if available
+                    if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                        if cfg_sym and cfg_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_sym.upper()):
+                            sym = cfg_sym
+                        elif cfg_eq and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq.upper()) and "OIPulse" not in cfg_eq:
+                            sym = cfg_eq
+
+                    # 2. Resolve Index-LTP from oi_strength table
+                    idx_ltp = np.nan
+                    if "index_ltp" in row and pd.notna(row["index_ltp"]):
+                        try:
+                            idx_ltp = round(float(row["index_ltp"]), 2)
+                        except Exception:
+                            pass
+
+                    if pd.isna(idx_ltp):
+                        e_ts = row.get("entry_time") or row.get("signal_time")
+                        if e_ts and pd.notna(e_ts):
+                            try:
+                                dt = pd.to_datetime(e_ts)
+                                d_str = dt.strftime("%d-%m-%Y")
+                                t_str = dt.strftime("%H:%M:%S")
+
+                                if oi_cur:
+                                    oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time = ? LIMIT 1", (d_str, t_str))
+                                    r_ltp = oi_cur.fetchone()
+                                    if not r_ltp:
+                                        oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time <= ? ORDER BY Time DESC LIMIT 1", (d_str, t_str))
+                                        r_ltp = oi_cur.fetchone()
+                                    if not r_ltp:
+                                        oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time >= ? ORDER BY Time ASC LIMIT 1", (d_str, t_str))
+                                        r_ltp = oi_cur.fetchone()
+                                    if r_ltp and r_ltp[0] is not None:
+                                        idx_ltp = round(float(r_ltp[0]), 2)
+                            except Exception:
+                                pass
+
+                            if pd.isna(idx_ltp):
+                                ts_k = str(e_ts)[:19]
+                                if ts_k in c_ts_map:
+                                    idx_ltp = round(c_ts_map[ts_k], 2)
+
+                    # 3. Resolve Option Type (CE or PE)
+                    opt_t = ""
+                    if "opt_type" in row and pd.notna(row["opt_type"]) and str(row["opt_type"]).strip() and str(row["opt_type"]).strip().lower() != "none":
+                        opt_t = str(row["opt_type"]).strip().upper()
+                    elif "option_type" in row and pd.notna(row["option_type"]) and str(row["option_type"]).strip() and str(row["option_type"]).strip().lower() != "none":
+                        opt_t = str(row["option_type"]).strip().upper()
+
+                    if not opt_t:
+                        sym_upper = sym.upper()
+                        m_sym = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", sym_upper)
+                        if m_sym:
+                            opt_t = m_sym.group(1)
+                        elif sym in (run_data.get("symbol", ""), "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                            cfg_opt = str(run_data.get("config", {}).get("option_type") or st.session_state.get("backtest_opt_type_choice") or "").upper()
+                            cfg_eq_upper = cfg_eq.upper()
+                            m_eq = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq_upper)
+                            if "CE" in cfg_opt:
+                                opt_t = "CE"
+                            elif "PE" in cfg_opt:
+                                opt_t = "PE"
+                            elif m_eq:
+                                opt_t = m_eq.group(1)
+                            else:
+                                opt_t = "-"
+                        else:
+                            opt_t = "-"
+
+                    return pd.Series([sym, idx_ltp, opt_t], index=["Instrument", "Index-LTP", "Option Type"])
+
+                trades[["Instrument", "Index-LTP", "Option Type"]] = trades.apply(get_trade_instrument_and_opt_type, axis=1)
+                if oi_conn:
+                    try:
+                        oi_conn.close()
+                    except Exception:
+                        pass
+
                 # Calculate Stop_Risk per trade: crossed percentage slab (5%, 10%, 15%, 20%, 25%...) reached before exit / Stop
                 raw_candles_for_trades = res.get("raw_df")
                 if raw_candles_for_trades is None or raw_candles_for_trades.empty:
@@ -2371,24 +2523,48 @@ def render_backtest_module():
                         pass
 
             cols = [c for c in [
-                "id", "side", "regime", "Calculated_Score", "entry_time", "exit_time",
+                "id", "Instrument", "Index-LTP", "Option Type", "side", "regime", "Calculated_Score", "entry_time", "exit_time",
                 "quantity", "entry_price", "Margin used", "peak_gain",
                 "5%", "10%", "15%", "20%", "25%", "30%",
                 "exit_price", "stop_loss", "target",
                 "exit_reason", "gross_pnl", "costs", "slippage_cost", "net_pnl"
             ] if c in trades.columns]
-            show_n = st.number_input(
-                "Rows to show (newest first)",
-                min_value=min(5, max(1, len(trades))),
-                max_value=max(len(trades), 5),
-                value=max(len(trades), min(5, max(1, len(trades)))),
-                step=5,
-            )
+            col_t1, col_t2 = st.columns([3, 1])
+            with col_t1:
+                show_n = st.number_input(
+                    "Rows to show (newest first)",
+                    min_value=min(5, max(1, len(trades))),
+                    max_value=max(len(trades), 5),
+                    value=max(len(trades), min(5, max(1, len(trades)))),
+                    step=5,
+                )
+            with col_t2:
+                st.write("")
+                st.download_button(
+                    label="📥 Export Trail CSV",
+                    data=trades[cols].to_csv(index=False).encode("utf-8"),
+                    file_name="trade_audit_trail_executions.csv",
+                    mime="text/csv",
+                    key="dl_trade_audit_trail",
+                )
             st.dataframe(
                 trades[cols].tail(int(show_n)).iloc[::-1],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
+                    "Instrument": st.column_config.TextColumn(
+                        "Instrument",
+                        help="Active constructed instrument / contract symbol (option chain name)",
+                    ),
+                    "Index-LTP": st.column_config.NumberColumn(
+                        "Index-LTP",
+                        help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)",
+                        format="%.2f",
+                    ),
+                    "Option Type": st.column_config.TextColumn(
+                        "Option Type",
+                        help="Option contract type: PE (Put) or CE (Call)",
+                    ),
                     "Margin used": st.column_config.NumberColumn(
                         "Margin used",
                         help="Margin used per trade = Quantity × Entry Price",
@@ -2509,6 +2685,19 @@ def render_backtest_module():
                 use_container_width=True,
                 hide_index=True,
                 column_config={
+                    "Instrument": st.column_config.TextColumn(
+                        "Instrument",
+                        help="Active constructed instrument / contract symbol (option chain name)",
+                    ),
+                    "Index-LTP": st.column_config.NumberColumn(
+                        "Index-LTP",
+                        help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)",
+                        format="%.2f",
+                    ),
+                    "Option Type": st.column_config.TextColumn(
+                        "Option Type",
+                        help="Option contract type: PE (Put) or CE (Call)",
+                    ),
                     "Margin used": st.column_config.NumberColumn(
                         "Margin used",
                         help="Margin used per trade = Quantity × Entry Price",

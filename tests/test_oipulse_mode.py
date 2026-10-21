@@ -12,22 +12,25 @@ from app.data.instrument_loader import parse_expiry_info
 from app.strategy.custom_strategy import CustomStrategyConfig, calculate_custom_indicators
 from app.strategy.oipulse_resolver import (
     calculate_oipulse_strike_and_type,
+    calculate_option_price,
     get_oipulse_record_from_db,
     resolve_nearest_expiry,
+    resolve_nearest_expiry_date,
     resolve_oipulse_option,
+    validate_oipulse_contract_symbol,
 )
 
 
 def test_market_standard_weekly_expiry_september():
-    """Verify market standard for September weekly option expiry symbol: 03-SEP-2026 must resolve to 26S03."""
-    disp, sym_code = parse_expiry_info("03-SEP-2026")
-    assert disp == "03-SEP-2026"
-    assert sym_code == "26S03", f"Expected '26S03' for 03-SEP-2026 weekly, but got '{sym_code}'"
+    """Verify market standard for September weekly option expiry symbol: 01-SEP-2026 must resolve to 26S01."""
+    disp, sym_code = parse_expiry_info("01-SEP-2026")
+    assert disp == "01-SEP-2026"
+    assert sym_code == "26S01", f"Expected '26S01' for 01-SEP-2026 weekly, but got '{sym_code}'"
 
     # Full contract symbol verification
     resolved_symbol = f"NIFTY{sym_code}24050PE"
-    assert resolved_symbol == "NIFTY26S0324050PE"
-    assert "26903" not in resolved_symbol
+    assert resolved_symbol == "NIFTY26S0124050PE"
+    assert "26901" not in resolved_symbol
 
 
 def test_weekly_month_codes_market_standards():
@@ -41,10 +44,11 @@ def test_weekly_month_codes_market_standards():
         ("04-JUN-2026", "26604"),
         ("02-JUL-2026", "26702"),
         ("06-AUG-2026", "26806"),
-        ("03-SEP-2026", "26S03"),
-        ("01-OCT-2026", "26O01"),
-        ("05-NOV-2026", "26N05"),
-        ("03-DEC-2026", "26D03"),
+        ("01-SEP-2026", "26S01"),
+        ("08-SEP-2026", "26S08"),
+        ("15-SEP-2026", "26S15"),
+        ("22-SEP-2026", "26S22"),
+        ("29-SEP-2026", "26SEP"),
     ]
     for exp_str, expected_code in test_cases:
         _, code = parse_expiry_info(exp_str)
@@ -58,7 +62,7 @@ def test_oipulse_logic_bounds_and_adjustments():
 
     # Tuesday: adj = -100
     # CE (> 50): 24001 + (-100) - 1 = 23900
-    # PE (< -50): 24001 - (-100) - 1 = 24101 -> 24101 or 24100
+    # PE (< -50): 24001 - (-100) - 1 = 24101 -> 24100
     strike_ce, opt_ce = calculate_oipulse_strike_and_type(24050.45, "Tuesday", 65)
     assert opt_ce == "CE"
     assert strike_ce == 23900
@@ -67,11 +71,23 @@ def test_oipulse_logic_bounds_and_adjustments():
     assert opt_pe == "PE"
     assert strike_pe == 24100
 
-    # Thursday: adj = +200
-    # PE (< -50): 24001 - 200 - 1 = 23800
+    # Thursday: adj = +250
+    # PE (< -50): 24001 - 250 - 1 = 23750
     strike_thu, opt_thu = calculate_oipulse_strike_and_type(24050.45, "Thursday", -60)
     assert opt_thu == "PE"
-    assert strike_thu == 23800
+    assert strike_thu == 23750
+
+    # Wednesday: adj = +350
+    # CE (> 50): 24001 + 350 - 1 = 24350
+    strike_wed, opt_wed = calculate_oipulse_strike_and_type(24050.45, "Wednesday", 60)
+    assert opt_wed == "CE"
+    assert strike_wed == 24350
+
+    # Friday: adj = +150
+    # PE (< -50): 24001 - 150 - 1 = 23850
+    strike_fri, opt_fri = calculate_oipulse_strike_and_type(24050.45, "Friday", -60)
+    assert opt_fri == "PE"
+    assert strike_fri == 23850
 
     # Neutral band (-50 to +50): No signal
     strike_neu, opt_neu = calculate_oipulse_strike_and_type(24050.45, "Thursday", 20)
@@ -79,22 +95,77 @@ def test_oipulse_logic_bounds_and_adjustments():
     assert strike_neu is None
 
 
-def test_resolve_nearest_expiry():
-    """Verify resolve_nearest_expiry selects the nearest weekly expiry date."""
-    # 2026-09-01 is Tuesday -> nearest Thursday is 2026-09-03
+def test_resolve_nearest_tuesday_expiry():
+    """Verify resolve_nearest_expiry selects the nearest weekly Tuesday expiry date."""
+    # 2026-09-01 is Tuesday -> same day expiry 01-SEP-2026 (26S01)
     disp, code = resolve_nearest_expiry(date(2026, 9, 1), "NIFTY")
-    assert disp == "03-SEP-2026"
-    assert code == "26S03"
+    assert disp == "01-SEP-2026"
+    assert code == "26S01"
 
-    # 2026-09-03 is Thursday -> same day expiry
-    disp, code = resolve_nearest_expiry(date(2026, 9, 3), "NIFTY")
-    assert disp == "03-SEP-2026"
-    assert code == "26S03"
+    # 2026-09-02 is Wednesday -> next Tuesday is 08-SEP-2026 (26S08)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 2), "NIFTY")
+    assert disp == "08-SEP-2026"
+    assert code == "26S08"
 
-    # 2026-09-04 is Friday -> next Thursday is 2026-09-10
-    disp, code = resolve_nearest_expiry(date(2026, 9, 4), "NIFTY")
-    assert disp == "10-SEP-2026"
-    assert code == "26S10"
+    # 2026-09-07 is Monday -> next day Tuesday is 08-SEP-2026 (26S08)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 7), "NIFTY")
+    assert disp == "08-SEP-2026"
+    assert code == "26S08"
+
+    # 2026-09-08 is Tuesday -> same day expiry 08-SEP-2026 (26S08)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 8), "NIFTY")
+    assert disp == "08-SEP-2026"
+    assert code == "26S08"
+
+    # 2026-09-15 is Tuesday -> 15-SEP-2026 (26S15)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 15), "NIFTY")
+    assert disp == "15-SEP-2026"
+    assert code == "26S15"
+
+    # 2026-09-22 is Tuesday -> 22-SEP-2026 (26S22)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 22), "NIFTY")
+    assert disp == "22-SEP-2026"
+    assert code == "26S22"
+
+    # 2026-09-29 is Tuesday -> 29-SEP-2026 (26SEP)
+    disp, code = resolve_nearest_expiry(date(2026, 9, 29), "NIFTY")
+    assert disp == "29-SEP-2026"
+    assert code == "26SEP"
+
+
+def test_contract_symbol_validation():
+    """Verify validation of dynamic contract symbols."""
+    valid, msg = validate_oipulse_contract_symbol("NIFTY26S0124000CE", "NIFTY")
+    assert valid, f"Expected valid, got: {msg}"
+
+    valid, msg = validate_oipulse_contract_symbol("NIFTY26SEP22700PE", "NIFTY")
+    assert valid, f"Expected valid, got: {msg}"
+
+    valid, msg = validate_oipulse_contract_symbol("BANKNIFTY26S0851200CE", "BANKNIFTY")
+    assert valid, f"Expected valid, got: {msg}"
+
+    # Invalid strike (not a multiple of 50 for NIFTY)
+    valid, msg = validate_oipulse_contract_symbol("NIFTY26S0124033CE", "NIFTY")
+    assert not valid
+    assert "multiple" in msg
+
+    # Invalid suffix
+    valid, msg = validate_oipulse_contract_symbol("NIFTY26S0124000XX", "NIFTY")
+    assert not valid
+    assert "CE" in msg or "PE" in msg
+
+
+def test_option_pricing_calculation():
+    """Verify Black-Scholes calculation yields realistic option premium in the ~₹70 to ₹135 range."""
+    # ATM Call option: NIFTY at 24000, Strike 24000, 3 days to Tuesday expiry
+    dt = datetime(2026, 9, 4, 10, 0, 0)
+    exp = date(2026, 9, 8)
+    ce_price = calculate_option_price(24000.0, 24000, "CE", dt, exp)
+    assert 50.0 <= ce_price <= 180.0, f"Expected realistic CE premium, got {ce_price}"
+
+    # ATM Put option: NIFTY at 24000, Strike 24000
+    pe_price = calculate_option_price(24000.0, 24000, "PE", dt, exp)
+    assert 50.0 <= pe_price <= 180.0, f"Expected realistic PE premium, got {pe_price}"
 
 
 def test_oipulse_db_lookup():
@@ -110,7 +181,7 @@ def test_oipulse_db_lookup():
 
 
 def test_backtest_with_oipulse_mode():
-    """Verify backtest simulation under OIPulse Mode records dynamic contract symbol and preserves indicator targets/stoploss."""
+    """Verify backtest simulation under OIPulse Mode records dynamic contract symbol and uses option premiums."""
     csv_file = "data/nifty_5m.csv"
     if not os.path.exists(csv_file):
         pytest.skip("nifty_5m.csv not present")
@@ -151,5 +222,4 @@ def test_backtest_with_oipulse_mode():
     # If trades triggered, check that contract symbols follow dynamic resolution
     if not trades_oipulse.empty:
         for sym in trades_oipulse["symbol"]:
-            # Symbol should be either NIFTY or a resolved option like NIFTY26S...
             assert "NIFTY" in sym
