@@ -1509,9 +1509,6 @@ def render_backtest_module():
             current_tgt = int(ind.get("fixed_target_pct", 3))
             current_tgt_idx = target_options.index(current_tgt) if current_tgt in target_options else 2
 
-            current_sl = int(ind.get("fixed_stoploss_pct", 2))
-            current_sl_idx = stoploss_options.index(current_sl) if current_sl in stoploss_options else 1
-
             ind["fixed_target_pct"] = pct_col1.selectbox(
                 "Fixed Target Percentage",
                 options=target_options,
@@ -1520,6 +1517,11 @@ def render_backtest_module():
                 key="sb_fixed_target_pct",
                 help="Fixed profit target percentage for each trade."
             )
+            risk["fixed_target_pct"] = ind["fixed_target_pct"]
+
+            current_sl = int(ind.get("fixed_stoploss_pct", 2))
+            current_sl_idx = stoploss_options.index(current_sl) if current_sl in stoploss_options else 1
+
             ind["fixed_stoploss_pct"] = pct_col2.selectbox(
                 "Fixed Stoploss Percentage",
                 options=stoploss_options,
@@ -1528,7 +1530,6 @@ def render_backtest_module():
                 key="sb_fixed_stoploss_pct",
                 help="Fixed stoploss percentage for each trade."
             )
-            risk["fixed_target_pct"] = ind["fixed_target_pct"]
             risk["fixed_stoploss_pct"] = ind["fixed_stoploss_pct"]
 
             # Trailing Stop-Loss Section (Model B)
@@ -2240,51 +2241,40 @@ def render_backtest_module():
 
         # Charts
         if not trades.empty:
-            ch_l, ch_r = st.columns(2)
-            with ch_l:
+            ch1, ch2, ch3 = st.columns(3)
+            with ch1:
                 st.subheader("Equity Curve")
                 eq = pd.concat([pd.Series([capital]), capital + trades["net_pnl"].cumsum()], ignore_index=True)
                 st.line_chart(eq.rename("Equity (₹)"))
 
-            with ch_r:
+            with ch2:
                 st.subheader("Daily Net P&L")
                 if "exit_time" in trades.columns:
                     trades["day"] = pd.to_datetime(trades["exit_time"]).dt.date
                     daily_pnl = trades.groupby("day")["net_pnl"].sum()
                     st.bar_chart(daily_pnl)
 
-            # Breakdowns
-            b_l, b_r = st.columns(2)
-            with b_l:
-                st.subheader("By Exit Reason")
-                by_exit = trades.groupby("exit_reason")["net_pnl"].agg(
-                    Trades="count", Net_PnL="sum", Avg_Trade="mean"
-                ).round(2)
-                st.dataframe(by_exit, use_container_width=True)
+            with ch3:
+                st.subheader("Monthly Net P&L")
+                time_col = "exit_time" if "exit_time" in trades.columns else ("entry_time" if "entry_time" in trades.columns else None)
+                if time_col is not None:
+                    dt = pd.to_datetime(trades[time_col].astype(str).str.slice(0, 10), errors="coerce")
+                    m_df = trades.assign(
+                        month_key=dt.dt.strftime("%Y-%m"),
+                        month_label=dt.dt.strftime("%b %Y")
+                    ).dropna(subset=["month_key"])
+                    if not m_df.empty:
+                        monthly_pnl = m_df.groupby(["month_key", "month_label"])["net_pnl"].sum().reset_index()
+                        monthly_pnl = monthly_pnl.sort_values("month_key").set_index("month_label")["net_pnl"]
+                        st.bar_chart(monthly_pnl)
 
-            with b_r:
-                st.subheader("By Side & Regime")
-                if "regime" in trades.columns and (trades["regime"] != "").any():
-                    by_regime = trades.groupby("regime")["net_pnl"].agg(
-                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
-                    ).round(2)
-                    st.dataframe(by_regime, use_container_width=True)
-                else:
-                    by_side = trades.groupby("side")["net_pnl"].agg(
-                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
-                    ).round(2)
-                    st.dataframe(by_side, use_container_width=True)
+            # Populate Instrument, Index-LTP, and Option Type columns prior to breakdowns
+            if "score" in trades.columns and "Calculated_Score" not in trades.columns:
+                trades["Calculated_Score"] = trades["score"]
+            if "quantity" in trades.columns and "entry_price" in trades.columns:
+                trades["Margin used"] = (trades["quantity"] * trades["entry_price"]).round(2)
+                trades["margin_used"] = trades["Margin used"]
 
-            # Trades Table
-            st.subheader("Trade Audit Trail (All Executions)")
-            if not trades.empty:
-                if "score" in trades.columns and "Calculated_Score" not in trades.columns:
-                    trades["Calculated_Score"] = trades["score"]
-                if "quantity" in trades.columns and "entry_price" in trades.columns:
-                    trades["Margin used"] = (trades["quantity"] * trades["entry_price"]).round(2)
-                    trades["margin_used"] = trades["Margin used"]
-
-                # Populate Instrument, Index-LTP, and Option Type columns
                 import sqlite3
                 db_oi_file = "data/backtest.db"
                 oi_conn = None
@@ -2394,6 +2384,50 @@ def render_backtest_module():
                         oi_conn.close()
                     except Exception:
                         pass
+
+            # Breakdowns
+            b1, b2, b3 = st.columns(3)
+            with b1:
+                st.subheader("By Exit Reason")
+                if not trades.empty and "exit_reason" in trades.columns and trades["exit_reason"].dropna().nunique() > 0:
+                    by_exit = trades.groupby("exit_reason")["net_pnl"].agg(
+                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                    ).round(2)
+                    st.dataframe(by_exit, use_container_width=True)
+                else:
+                    empty_exit = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                    empty_exit.index.name = "exit_reason"
+                    st.dataframe(empty_exit, use_container_width=True)
+
+            with b2:
+                st.subheader("Option Type PE: By Exit Reason")
+                pe_trades = trades[trades["Option Type"].astype(str).str.upper() == "PE"] if "Option Type" in trades.columns else pd.DataFrame()
+                if not pe_trades.empty and "exit_reason" in pe_trades.columns and pe_trades["exit_reason"].dropna().nunique() > 0:
+                    by_exit_pe = pe_trades.groupby("exit_reason")["net_pnl"].agg(
+                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                    ).round(2)
+                    st.dataframe(by_exit_pe, use_container_width=True)
+                else:
+                    empty_pe = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                    empty_pe.index.name = "exit_reason"
+                    st.dataframe(empty_pe, use_container_width=True)
+
+            with b3:
+                st.subheader("Option Type CE: By Exit Reason")
+                ce_trades = trades[trades["Option Type"].astype(str).str.upper() == "CE"] if "Option Type" in trades.columns else pd.DataFrame()
+                if not ce_trades.empty and "exit_reason" in ce_trades.columns and ce_trades["exit_reason"].dropna().nunique() > 0:
+                    by_exit_ce = ce_trades.groupby("exit_reason")["net_pnl"].agg(
+                        Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                    ).round(2)
+                    st.dataframe(by_exit_ce, use_container_width=True)
+                else:
+                    empty_ce = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                    empty_ce.index.name = "exit_reason"
+                    st.dataframe(empty_ce, use_container_width=True)
+
+            # Trades Table
+            st.subheader("Trade Audit Trail (All Executions)")
+            if not trades.empty:
 
                 # Calculate Stop_Risk per trade: crossed percentage slab (5%, 10%, 15%, 20%, 25%...) reached before exit / Stop
                 raw_candles_for_trades = res.get("raw_df")

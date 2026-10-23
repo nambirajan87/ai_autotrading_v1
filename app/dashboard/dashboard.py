@@ -77,15 +77,26 @@ else:
     c6.metric("Max drawdown", f"{max_drawdown(equity):,.0f}")
     st.caption(f"Final equity: {equity.iloc[-1]:,.2f}  |  Starting capital: {capital:,.0f}")
 
-    left, right = st.columns(2)
-    with left:
+    c1, c2, c3 = st.columns(3)
+    with c1:
         st.subheader("Equity curve (after each closed trade)")
         st.line_chart(equity.rename("equity"))
-    with right:
+    with c2:
         st.subheader("Daily net P&L")
         daily = trades.assign(day=pd.to_datetime(trades["exit_time"]).dt.date) \
                       .groupby("day")["net_pnl"].sum()
         st.bar_chart(daily)
+    with c3:
+        st.subheader("Monthly net P&L")
+        dt = pd.to_datetime(trades["exit_time"].astype(str).str.slice(0, 10), errors="coerce")
+        m_df = trades.assign(
+            month_key=dt.dt.strftime("%Y-%m"),
+            month_label=dt.dt.strftime("%b %Y")
+        ).dropna(subset=["month_key"])
+        if not m_df.empty:
+            monthly = m_df.groupby(["month_key", "month_label"])["net_pnl"].sum().reset_index()
+            monthly = monthly.sort_values("month_key").set_index("month_label")["net_pnl"]
+            st.bar_chart(monthly)
 
     left, right = st.columns(2)
     with left:

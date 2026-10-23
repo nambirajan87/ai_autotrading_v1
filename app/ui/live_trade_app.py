@@ -926,13 +926,13 @@ def render_live_trade_module():
     # Equity Curve and Daily Net P&L Charts
     # ==============================================================================
     if not real_trades.empty:
-        ch_l, ch_r = st.columns(2)
-        with ch_l:
+        ch1, ch2, ch3 = st.columns(3)
+        with ch1:
             st.subheader("Equity Curve")
             eq = pd.concat([pd.Series([capital]), capital + real_trades.sort_values("id")["net_pnl"].cumsum()], ignore_index=True)
             st.line_chart(eq.rename("Equity (₹)"))
 
-        with ch_r:
+        with ch2:
             st.subheader("Daily Net P&L")
             if "session_date" in real_trades.columns:
                 daily_pnl = real_trades.groupby("session_date")["net_pnl"].sum()
@@ -942,27 +942,82 @@ def render_live_trade_module():
                 daily_pnl = real_trades.groupby("day")["net_pnl"].sum()
                 st.bar_chart(daily_pnl)
 
-        # Breakdowns
-        b_l, b_r = st.columns(2)
-        with b_l:
-            st.subheader("By Exit Reason")
-            by_exit = real_trades.groupby("exit_reason")["net_pnl"].agg(
-                Trades="count", Net_PnL="sum", Avg_Trade="mean"
-            ).round(2)
-            st.dataframe(by_exit, use_container_width=True)
+        with ch3:
+            st.subheader("Monthly Net P&L")
+            date_src = real_trades["session_date"] if "session_date" in real_trades.columns else (real_trades["exit_time"] if "exit_time" in real_trades.columns else None)
+            if date_src is not None:
+                dt = pd.to_datetime(date_src.astype(str).str.slice(0, 10), errors="coerce")
+                m_df = real_trades.assign(
+                    month_key=dt.dt.strftime("%Y-%m"),
+                    month_label=dt.dt.strftime("%b %Y")
+                ).dropna(subset=["month_key"])
+                if not m_df.empty:
+                    monthly_pnl = m_df.groupby(["month_key", "month_label"])["net_pnl"].sum().reset_index()
+                    monthly_pnl = monthly_pnl.sort_values("month_key").set_index("month_label")["net_pnl"]
+                    st.bar_chart(monthly_pnl)
 
-        with b_r:
-            st.subheader("By Side & Regime")
-            if "regime" in real_trades.columns and (real_trades["regime"] != "").any():
-                by_regime = real_trades.groupby("regime")["net_pnl"].agg(
+        import re
+        def get_trade_opt_type(row):
+            for k in ("Option Type", "option_type", "opt_type"):
+                if k in row and pd.notna(row[k]):
+                    v = str(row[k]).strip().upper()
+                    if v in ("CE", "PE"):
+                        return v
+            sym = str(row.get("symbol") or active_instrument or "").strip().upper()
+            m = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym) or re.search(r"\b(CE|PE)\b", sym)
+            if m:
+                return m.group(1)
+            cfg_opt = str(inst_cfg.get("option_type") or "").strip().upper()
+            if "CE" in cfg_opt:
+                return "CE"
+            elif "PE" in cfg_opt:
+                return "PE"
+            return "-"
+
+        if not real_trades.empty and "Option Type" not in real_trades.columns:
+            real_trades["Option Type"] = real_trades.apply(get_trade_opt_type, axis=1)
+        if not trades.empty and "Option Type" not in trades.columns:
+            trades["Option Type"] = trades.apply(get_trade_opt_type, axis=1)
+
+        # Breakdowns
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            st.subheader("By Exit Reason")
+            if not real_trades.empty and "exit_reason" in real_trades.columns and real_trades["exit_reason"].dropna().nunique() > 0:
+                by_exit = real_trades.groupby("exit_reason")["net_pnl"].agg(
                     Trades="count", Net_PnL="sum", Avg_Trade="mean"
                 ).round(2)
-                st.dataframe(by_regime, use_container_width=True)
+                st.dataframe(by_exit, use_container_width=True)
             else:
-                by_side = real_trades.groupby("side")["net_pnl"].agg(
+                empty_exit = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                empty_exit.index.name = "exit_reason"
+                st.dataframe(empty_exit, use_container_width=True)
+
+        with b2:
+            st.subheader("Option Type PE: By Exit Reason")
+            pe_trades = real_trades[real_trades["Option Type"].astype(str).str.upper() == "PE"] if "Option Type" in real_trades.columns else pd.DataFrame()
+            if not pe_trades.empty and "exit_reason" in pe_trades.columns and pe_trades["exit_reason"].dropna().nunique() > 0:
+                by_exit_pe = pe_trades.groupby("exit_reason")["net_pnl"].agg(
                     Trades="count", Net_PnL="sum", Avg_Trade="mean"
                 ).round(2)
-                st.dataframe(by_side, use_container_width=True)
+                st.dataframe(by_exit_pe, use_container_width=True)
+            else:
+                empty_pe = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                empty_pe.index.name = "exit_reason"
+                st.dataframe(empty_pe, use_container_width=True)
+
+        with b3:
+            st.subheader("Option Type CE: By Exit Reason")
+            ce_trades = real_trades[real_trades["Option Type"].astype(str).str.upper() == "CE"] if "Option Type" in real_trades.columns else pd.DataFrame()
+            if not ce_trades.empty and "exit_reason" in ce_trades.columns and ce_trades["exit_reason"].dropna().nunique() > 0:
+                by_exit_ce = ce_trades.groupby("exit_reason")["net_pnl"].agg(
+                    Trades="count", Net_PnL="sum", Avg_Trade="mean"
+                ).round(2)
+                st.dataframe(by_exit_ce, use_container_width=True)
+            else:
+                empty_ce = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
+                empty_ce.index.name = "exit_reason"
+                st.dataframe(empty_ce, use_container_width=True)
 
     # ==============================================================================
     # Trade Audit Trail (All Executions)
@@ -1018,7 +1073,7 @@ def render_live_trade_module():
         df_trail["Display_ID"] = df_trail.apply(format_trade_id_display, axis=1)
 
         cols_wanted = [
-            "Display_ID", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
+            "Display_ID", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
             "quantity", "entry_price", "Margin used", "peak_gain",
             "5%", "10%", "15%", "20%", "25%", "30%",
             "exit_price", "stop_loss", "target",
@@ -1056,6 +1111,7 @@ def render_live_trade_module():
             hide_index=True,
             column_config={
                 "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
+                "Option Type": st.column_config.TextColumn("Option Type", help="Option contract type: CE (Call) or PE (Put)"),
                 "session_date": st.column_config.TextColumn("Session Date"),
                 "status": st.column_config.TextColumn("Status", help="ACTIVE (Open), CLOSED, or NO_TRADE"),
                 "Margin used": st.column_config.TextColumn("Margin used", help="Margin used per trade = Quantity × Entry Price"),

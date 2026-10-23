@@ -12,8 +12,10 @@ Table Schema:
 - Strength: TEXT (e.g. -63%)
 """
 
+import sys
 import sqlite3
 from pathlib import Path
+from datetime import datetime
 import pandas as pd
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -34,7 +36,12 @@ CREATE INDEX IF NOT EXISTS idx_oi_strength_date ON oi_strength(Date);
 CREATE INDEX IF NOT EXISTS idx_oi_strength_datetime ON oi_strength(Date, Time);
 """
 
-def load_data(csv_file=CSV_PATH, db_file=DB_PATH):
+def load_data(csv_file=None, db_file=DB_PATH):
+    if csv_file is None:
+        csv_file = CSV_PATH
+    else:
+        csv_file = Path(csv_file)
+
     if not csv_file.exists():
         raise FileNotFoundError(f"Source file not found: {csv_file}")
 
@@ -53,19 +60,38 @@ def load_data(csv_file=CSV_PATH, db_file=DB_PATH):
     # Create table & indexes
     cursor.executescript(SCHEMA)
 
-    # Insert or Replace records
-    records = [
-        (row["Date"].strip(), row["Time"].strip(), float(row["LTP"]), row["Strength"].strip())
-        for _, row in df.iterrows()
-    ]
+    # Check if table has Trigger_Time column
+    cursor.execute("PRAGMA table_info(oi_strength);")
+    cols = [col[1] for col in cursor.fetchall()]
+    has_trigger_time = "Trigger_Time" in cols
 
-    cursor.executemany(
-        """
-        INSERT OR REPLACE INTO oi_strength (Date, Time, LTP, Strength)
-        VALUES (?, ?, ?, ?)
-        """,
-        records
-    )
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Insert or Replace records
+    if has_trigger_time:
+        records = [
+            (row["Date"].strip(), row["Time"].strip(), float(row["LTP"]), row["Strength"].strip(), now_str)
+            for _, row in df.iterrows()
+        ]
+        cursor.executemany(
+            """
+            INSERT OR REPLACE INTO oi_strength (Date, Time, LTP, Strength, Trigger_Time)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            records
+        )
+    else:
+        records = [
+            (row["Date"].strip(), row["Time"].strip(), float(row["LTP"]), row["Strength"].strip())
+            for _, row in df.iterrows()
+        ]
+        cursor.executemany(
+            """
+            INSERT OR REPLACE INTO oi_strength (Date, Time, LTP, Strength)
+            VALUES (?, ?, ?, ?)
+            """,
+            records
+        )
     conn.commit()
 
     # Verification
@@ -91,4 +117,6 @@ def load_data(csv_file=CSV_PATH, db_file=DB_PATH):
     return total_count
 
 if __name__ == "__main__":
-    load_data()
+    target_file = sys.argv[1] if len(sys.argv) > 1 else CSV_PATH
+    load_data(target_file)
+
