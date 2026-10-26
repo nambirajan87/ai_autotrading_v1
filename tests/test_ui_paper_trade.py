@@ -173,3 +173,320 @@ def test_paper_trade_constant_sections_timing_and_content():
     assert "Signal bar close check -> Last Signal Bar:" in sec2_text
     assert "Continuous 2s LTP, chart & exit monitoring active." in sec2_text
 
+
+def test_strategy_period_display_resolution_from_strategy_config():
+    strat_def = get_strategy("EMA20_50_RSI_MACD_Plus_4Ind")
+    assert strat_def is not None
+    inst_cfg = strat_def.get("instrument", {})
+
+    today_str = str(date.today())
+    one_month_ago_str = str(date.today() - timedelta(days=30))
+
+    strat_from = str(
+        inst_cfg.get("start_date")
+        or inst_cfg.get("from_date")
+        or inst_cfg.get("date_from")
+        or strat_def.get("start_date")
+        or strat_def.get("from_date")
+        or strat_def.get("date_from")
+        or strat_def.get("config", {}).get("instrument", {}).get("start_date")
+        or one_month_ago_str
+    )
+    strat_to = str(
+        inst_cfg.get("end_date")
+        or inst_cfg.get("to_date")
+        or inst_cfg.get("date_to")
+        or strat_def.get("end_date")
+        or strat_def.get("to_date")
+        or strat_def.get("date_to")
+        or strat_def.get("config", {}).get("instrument", {}).get("end_date")
+        or today_str
+    )
+
+    # Strategy dates must be from stored strategy config (2026-10-01 to 2026-10-19)
+    assert strat_from == "2026-10-01"
+    assert strat_to == "2026-10-19"
+    assert (strat_from, strat_to) != (one_month_ago_str, today_str)
+
+
+def test_paper_database_start_and_end_date_filtering(temp_paper_db):
+    temp_paper_db.save_single_trade(
+        strategy_name="DATE_RANGE_TEST",
+        symbol="NIFTY26OCT22500PE",
+        session_date="2026-10-05",
+        trade={"trade_id": 101, "side": "LONG", "gross_pnl": 50.0, "net_pnl": 30.0, "entry_time": "2026-10-05 10:00:00"},
+    )
+    temp_paper_db.save_single_trade(
+        strategy_name="DATE_RANGE_TEST",
+        symbol="NIFTY26OCT22500PE",
+        session_date="2026-10-15",
+        trade={"trade_id": 102, "side": "SHORT", "gross_pnl": 100.0, "net_pnl": 80.0, "entry_time": "2026-10-15 10:00:00"},
+    )
+    temp_paper_db.save_single_trade(
+        strategy_name="DATE_RANGE_TEST",
+        symbol="NIFTY26OCT22500PE",
+        session_date="2026-10-25",
+        trade={"trade_id": 103, "side": "LONG", "gross_pnl": 150.0, "net_pnl": 130.0, "entry_time": "2026-10-25 10:00:00"},
+    )
+
+    # Filter between 2026-10-01 and 2026-10-10 (should only get 2026-10-05)
+    t1 = temp_paper_db.get_accumulated_trades_for_strategy(
+        "DATE_RANGE_TEST", start_date="2026-10-01", end_date="2026-10-10"
+    )
+    assert len(t1) == 1
+    assert t1[0]["session_date"] == "2026-10-05"
+
+    # Filter between 2026-10-10 and 2026-10-20 (should only get 2026-10-15)
+    t2 = temp_paper_db.get_accumulated_trades_for_strategy(
+        "DATE_RANGE_TEST", start_date="2026-10-10", end_date="2026-10-20"
+    )
+    assert len(t2) == 1
+    assert t2[0]["session_date"] == "2026-10-15"
+
+
+
+
+def test_paper_trade_audit_trail_instrument_and_index_ltp_columns():
+    """Verifies that Trade Audit Trail and Trade Audit Trail-2 in Paper/Live Trading include
+    'Instrument' and 'Index-LTP' columns alongside 'Option Type'."""
+    import re
+    import os
+    import sqlite3
+    import numpy as np
+    import pandas as pd
+    from app.ui.paper_trade_app import PROJECT_ROOT
+
+    trades = pd.DataFrame([
+        {
+            "trade_id": 1,
+            "symbol": "NIFTY26S0124000CE",
+            "side": "LONG",
+            "score": 3,
+            "session_date": "2026-09-01",
+            "entry_time": "2026-09-01 11:21:00",
+            "exit_time": "2026-09-01 11:35:00",
+            "quantity": 50,
+            "entry_price": 120.0,
+            "exit_price": 135.0,
+            "net_pnl": 750.0,
+        },
+        {
+            "trade_id": 2,
+            "symbol": "NIFTY26SEP22650CE",
+            "side": "LONG",
+            "score": 4,
+            "session_date": "2026-10-21",
+            "entry_time": "2026-10-21 10:15:00",
+            "exit_time": "2026-10-21 10:45:00",
+            "quantity": 50,
+            "entry_price": 80.0,
+            "exit_price": 92.0,
+            "net_pnl": 600.0,
+            "index_ltp": 22640.5,
+        },
+        {
+            "trade_id": 3,
+            "symbol": "RELIANCE",
+            "side": "LONG",
+            "score": 2,
+            "session_date": "2026-10-21",
+            "entry_time": "2026-10-21 11:00:00",
+            "exit_time": "2026-10-21 11:30:00",
+            "quantity": 10,
+            "entry_price": 2500.0,
+            "exit_price": 2520.0,
+            "net_pnl": 200.0,
+        }
+    ])
+
+    inst_cfg = {"tradingsymbol": "NIFTY 27-OCT-2026 22500 PE", "underlying": "NIFTY"}
+    active_instrument = "NIFTY 27-OCT-2026 22500 PE"
+    underlying_name = "NIFTY"
+
+    db_oi_file = PROJECT_ROOT / "data" / "backtest.db"
+    oi_conn = None
+    if os.path.exists(db_oi_file):
+        try:
+            oi_conn = sqlite3.connect(db_oi_file)
+        except Exception:
+            oi_conn = None
+    oi_cur = oi_conn.cursor() if oi_conn else None
+    c_ts_map = {}
+
+    def get_trade_instrument_and_opt_type(row):
+        sym = str(row.get("symbol") or "").strip()
+        if not sym or sym.lower() in ("none", "nan", ""):
+            sym = str(active_instrument or inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or underlying_name or "").strip()
+
+        cfg_sym = str(inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "").strip()
+        cfg_eq = str(inst_cfg.get("equity_name") or active_instrument or "").strip()
+
+        if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+            if cfg_sym and cfg_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_sym.upper()):
+                sym = cfg_sym
+            elif cfg_eq and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq.upper()) and "OIPulse" not in cfg_eq:
+                sym = cfg_eq
+
+        idx_ltp = np.nan
+        for k in ("index_ltp", "Index-LTP", "index_price"):
+            if k in row and pd.notna(row[k]):
+                try:
+                    idx_ltp = round(float(row[k]), 2)
+                    break
+                except Exception:
+                    pass
+
+        if pd.isna(idx_ltp):
+            e_ts = row.get("entry_time") or row.get("signal_time")
+            if e_ts and pd.notna(e_ts):
+                try:
+                    dt = pd.to_datetime(e_ts)
+                    d_str = dt.strftime("%d-%m-%Y")
+                    t_str = dt.strftime("%H:%M:%S")
+
+                    if oi_cur:
+                        oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time = ? LIMIT 1", (d_str, t_str))
+                        r_ltp = oi_cur.fetchone()
+                        if not r_ltp:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time <= ? ORDER BY Time DESC LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                        if not r_ltp:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time >= ? ORDER BY Time ASC LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                        if r_ltp and r_ltp[0] is not None:
+                            idx_ltp = round(float(r_ltp[0]), 2)
+                except Exception:
+                    pass
+
+        opt_t = ""
+        for k in ("opt_type", "option_type", "Option Type"):
+            if k in row and pd.notna(row[k]) and str(row[k]).strip() and str(row[k]).strip().lower() != "none":
+                opt_t = str(row[k]).strip().upper()
+                break
+
+        if not opt_t or opt_t == "-":
+            sym_upper = sym.upper()
+            m_sym = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym_upper) or re.search(r"\b(CE|PE)\b", sym_upper)
+            if m_sym:
+                opt_t = m_sym.group(1)
+            elif sym in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                cfg_opt = str(inst_cfg.get("option_type") or "").upper()
+                cfg_eq_upper = cfg_eq.upper()
+                m_eq = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq_upper)
+                if "CE" in cfg_opt:
+                    opt_t = "CE"
+                elif "PE" in cfg_opt:
+                    opt_t = "PE"
+                elif m_eq:
+                    opt_t = m_eq.group(1)
+                else:
+                    opt_t = "-"
+            else:
+                opt_t = "-"
+
+        return pd.Series([sym, idx_ltp, opt_t], index=["Instrument", "Index-LTP", "Option Type"])
+
+    trades[["Instrument", "Index-LTP", "Option Type"]] = trades.apply(get_trade_instrument_and_opt_type, axis=1)
+    if oi_conn:
+        try:
+            oi_conn.close()
+        except Exception:
+            pass
+
+    assert trades.loc[0, "Instrument"] == "NIFTY26S0124000CE"
+    assert trades.loc[0, "Index-LTP"] == 24124.35
+    assert trades.loc[0, "Option Type"] == "CE"
+
+    assert trades.loc[1, "Instrument"] == "NIFTY26SEP22650CE"
+    assert trades.loc[1, "Index-LTP"] == 22640.5
+    assert trades.loc[1, "Option Type"] == "CE"
+
+    assert trades.loc[2, "Instrument"] == "RELIANCE"
+    assert trades.loc[2, "Option Type"] == "-"
+
+    # Verify column ordering in Trade Audit Trail 1
+    trades["Display_ID"] = trades["trade_id"].apply(lambda tid: f"Trade id-{tid}")
+    cols_wanted = [
+        "Display_ID", "Instrument", "Index-LTP", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
+        "quantity", "entry_price", "Margin used", "peak_gain",
+        "5%", "10%", "15%", "20%", "25%", "30%",
+        "exit_price", "stop_loss", "target",
+        "exit_reason", "gross_pnl", "charges", "net_pnl", "status",
+    ]
+    display_cols = [c for c in cols_wanted if c in trades.columns]
+    assert "Instrument" in display_cols
+    assert "Index-LTP" in display_cols
+    assert "Option Type" in display_cols
+    assert display_cols.index("Instrument") == 1
+    assert display_cols.index("Index-LTP") == 2
+    assert display_cols.index("Option Type") == 3
+
+    # Verify Trade Audit Trail 2 columns (Candle Progression)
+    c_cols = [f"C{i}" for i in range(1, 11)]
+    c_df = pd.DataFrame({col: ["-"] * len(trades) for col in c_cols}, index=trades.index)
+    base_cols_2 = [c for c in display_cols if c in trades.columns]
+    trades_2 = pd.concat([trades[base_cols_2], c_df], axis=1)
+    assert "Instrument" in trades_2.columns
+    assert "Index-LTP" in trades_2.columns
+    assert "Option Type" in trades_2.columns
+    assert trades_2.loc[0, "Index-LTP"] == 24124.35
+
+
+def test_auto_paper_trade_trigger_time_and_market_window():
+    """Verifies that the 09:16 AM auto-trigger strictly adheres to the Market Window:
+    Monday - Friday, 09:15 AM - 03:15 PM, triggering at/after 09:16:00 AM up to 15:15:00 PM."""
+    from datetime import datetime
+    from scripts.schedule_oipulse_strength import (
+        is_paper_trade_auto_triggered,
+        ActiveSchedulerConfig,
+    )
+
+    ActiveSchedulerConfig.market_hours_only = True
+
+    # Monday (weekday=0) tests
+    mon_early = datetime(2026, 10, 26, 9, 15, 30)  # 09:15:30 AM
+    assert is_paper_trade_auto_triggered(mon_early) is False
+
+    mon_trigger_time = datetime(2026, 10, 26, 9, 16, 0)  # 09:16:00 AM (exact trigger point)
+    assert is_paper_trade_auto_triggered(mon_trigger_time) is True
+
+    mon_midday = datetime(2026, 10, 26, 12, 30, 0)  # 12:30:00 PM
+    assert is_paper_trade_auto_triggered(mon_midday) is True
+
+    mon_window_end = datetime(2026, 10, 26, 15, 15, 0)  # 03:15:00 PM
+    assert is_paper_trade_auto_triggered(mon_window_end) is True
+
+    mon_past_window = datetime(2026, 10, 26, 15, 15, 1)  # 03:15:01 PM
+    assert is_paper_trade_auto_triggered(mon_past_window) is False
+
+    # Weekend tests
+    sat_noon = datetime(2026, 10, 24, 10, 30, 0)  # Saturday
+    assert is_paper_trade_auto_triggered(sat_noon) is False
+
+    sun_afternoon = datetime(2026, 10, 25, 14, 0, 0)  # Sunday
+    assert is_paper_trade_auto_triggered(sun_afternoon) is False
+
+    # MockLive / Anytime mode (market_hours_only = False)
+    ActiveSchedulerConfig.market_hours_only = False
+    assert is_paper_trade_auto_triggered(sat_noon) is True
+    assert is_paper_trade_auto_triggered(mon_early) is True
+    ActiveSchedulerConfig.market_hours_only = True
+
+
+def test_execute_paper_trade_button_removed_and_watching_oi_strength_displayed():
+    """Verifies that the manual '🚀 Execute Paper Trade' button has been removed from paper_trade_app.py
+    and replaced with the 09:16 AM auto-trigger watching OI Strength message."""
+    from pathlib import Path
+    paper_file = Path(__file__).resolve().parent.parent / "app" / "ui" / "paper_trade_app.py"
+    code = paper_file.read_text(encoding="utf-8")
+
+    # Manual Execute button must be removed
+    assert "btn_run_paper_live" not in code
+    assert 'st.button("🚀 Execute Paper Trade"' not in code
+
+    # Auto-trigger check and watching for OI Strength message must be present
+    assert "is_paper_trade_auto_triggered" in code
+    assert "watching for OI Strength" in code or "watching OI Strength" in code
+    assert "09:16 AM" in code
+    assert "OI Pulse Live Strength Feed" in code
+

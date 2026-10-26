@@ -103,22 +103,22 @@ else:
         st.subheader("Exit reasons")
         by_exit = trades.groupby("exit_reason")["net_pnl"].agg(
             trades="count", net_pnl="sum", avg_trade="mean").round(2)
-        st.dataframe(by_exit, use_container_width=True)
+        st.dataframe(by_exit, width="stretch")
     with right:
         st.subheader("By side")
         by_side = trades.groupby("side")["net_pnl"].agg(
             trades="count", net_pnl="sum", avg_trade="mean").round(2)
-        st.dataframe(by_side, use_container_width=True)
+        st.dataframe(by_side, width="stretch")
         st.caption("Treat buckets under ~30 trades as noise.")
 
     st.subheader("Recent trades")
     cols = ["id", "side", "score", "entry_time", "exit_time", "quantity", "entry_price",
             "exit_price", "exit_reason", "gross_pnl", "costs", "net_pnl"]
-    # st.dataframe(trades[cols].tail(25).iloc[::-1], use_container_width=True, hide_index=True)
+    # st.dataframe(trades[cols].tail(25).iloc[::-1], width="stretch", hide_index=True)
     show_n = st.number_input("Rows to show (newest first)", min_value=5,
                              max_value=max(len(trades), 5), value=min(25, len(trades)), step=5)
     st.dataframe(trades[cols].tail(int(show_n)).iloc[::-1],
-                 use_container_width=True, hide_index=True)
+                 width="stretch", hide_index=True)
 
 # ---------- signals and risk ----------
 st.header("Signals and risk")
@@ -137,17 +137,17 @@ with b:
         st.write(f"Approved: **{int(risk['approved'].sum())}** | "
                  f"Rejected: **{int((risk['approved'] == 0).sum())}**")
         rejected = risk[risk["approved"] == 0]["reason"].str.split(r" \(").str[0].value_counts()
-        st.dataframe(rejected.rename("count"), use_container_width=True)
+        st.dataframe(rejected.rename("count"), width="stretch")
 with c:
     st.subheader("Orders by status")
-    st.dataframe(orders, use_container_width=True, hide_index=True)
+    st.dataframe(orders, width="stretch", hide_index=True)
 
 # ---------- events and placeholders ----------
 st.header("System events")
 if events.empty:
     st.success("No system events logged for this run.")
 else:
-    st.dataframe(events.head(50), use_container_width=True, hide_index=True)
+    st.dataframe(events.head(50), width="stretch", hide_index=True)
 
 st.header("AI analysis")
 st.info("AI Market Analysis and Trade RCA arrive in Phase 9.")

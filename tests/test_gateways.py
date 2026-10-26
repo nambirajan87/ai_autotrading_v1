@@ -1,5 +1,7 @@
 import pytest
+import datetime as dt
 import pandas as pd
+from unittest.mock import MagicMock
 from app.gateways.gateway_factory import get_gateway, list_supported_gateways
 from app.gateways.upstox_gateway import UpstoxGateway
 from app.gateways.kotak_gateway import KotakGateway
@@ -134,4 +136,30 @@ def test_kotak_fetch_historical_candles_chunking():
         c_from = dt.date.fromisoformat(c_kwargs["from_date"])
         c_to = dt.date.fromisoformat(c_kwargs["to_date"])
         assert (c_to - c_from).days <= 25
+
+
+def test_kotak_prevents_invalid_neosymbol_call():
+    """Verifies that non-numeric tokens like 'NIFTY' are NEVER sent to Kotak API."""
+    gw = KotakGateway()
+    mock_client = MagicMock()
+    gw._client = mock_client
+
+    # 1. get_live_market_depth with non-numeric token (e.g. "NSE_FO|NIFTY" or "NIFTY")
+    depth = gw.get_live_market_depth(symbol="NIFTY", instrument_key="NSE_FO|NIFTY")
+    assert depth is not None
+    # quotes MUST NOT have been called with "NIFTY"
+    assert mock_client.quotes.call_count == 0
+
+    # 2. fetch_historical_candles with non-numeric token
+    df = gw.fetch_historical_candles(
+        symbol="NIFTY",
+        instrument_key="NSE_FO|NIFTY",
+        timeframe_minutes=5,
+        start_date=dt.date(2026, 10, 26),
+        end_date=dt.date(2026, 10, 26),
+    )
+    # historical_data MUST NOT have been called with "nse_fo|NIFTY"
+    for call in mock_client.historical_data.call_args_list:
+        assert "nse_fo|NIFTY" not in str(call)
+
 

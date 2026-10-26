@@ -585,27 +585,48 @@ class KotakGateway(BaseBrokerGateway):
         directly from Kotak Neo quotes endpoint with sub-second response times.
         """
         tok = None
+        # 1. Check instrument_key only if the token portion is numeric digits
         if instrument_key and "|" in str(instrument_key):
-            tok = str(instrument_key).split("|")[-1]
-        elif symbol and str(symbol).isdigit():
-            tok = str(symbol)
-        elif instrument_key and str(instrument_key).isdigit():
-            tok = str(instrument_key)
+            part = str(instrument_key).split("|")[-1].strip()
+            if part.isdigit():
+                tok = part
+        elif instrument_key and str(instrument_key).strip().isdigit():
+            tok = str(instrument_key).strip()
 
-        if not tok:
+        # 2. Check symbol if it is directly a numeric token
+        if not tok and symbol and str(symbol).strip().isdigit():
+            tok = str(symbol).strip()
+
+        # 3. Resolve numeric token from symbol / tradingsymbol
+        if not tok and symbol:
+            target_sym = str(symbol).upper().replace(" ", "").strip()
             try:
                 from app.data.instrument_loader import NIFTY_STANDARD_INSTRUMENTS
-                target_sym = str(symbol).upper().replace(" ", "")
                 for item in NIFTY_STANDARD_INSTRUMENTS:
                     if item.get("tradingsymbol", "").upper() == target_sym:
-                        tok = item.get("instrument_key", "").split("|")[-1]
-                        break
+                        part = item.get("instrument_key", "").split("|")[-1].strip()
+                        if part.isdigit():
+                            tok = part
+                            break
             except Exception:
                 pass
 
-        if self._client and tok:
+            if not tok:
+                try:
+                    scrips = self.smart_search_instruments(symbol)
+                    for sc in scrips:
+                        p_sym = str(sc.get("pSymbol") or "").strip()
+                        if p_sym.isdigit():
+                            tok = p_sym
+                            break
+                except Exception:
+                    pass
+
+        # CRITICAL SAFETY: Only query Kotak quotes API if tok is confirmed numeric digits!
+        # Non-numeric tokens (e.g. "NIFTY") will cause Kotak Neo API to return 400 Bad Request ("Invalid neosymbol values").
+        if self._client and tok and str(tok).isdigit():
             try:
-                seg = "nse_fo" if ("fo" in str(instrument_key or isin if 'isin' in locals() else "").lower() or len(symbol) > 10) else "nse_cm"
+                seg = "nse_fo" if ("fo" in str(instrument_key or "").lower() or len(symbol) > 10) else "nse_cm"
                 q = self._client.quotes([{"instrument_token": str(tok), "exchange_segment": seg}])
                 if isinstance(q, list) and q and isinstance(q[0], dict):
                     data = q[0]
@@ -1308,43 +1329,56 @@ class KotakGateway(BaseBrokerGateway):
             start_d, end_d = end_d, start_d
 
         # Format neosymbol: e.g. "nse_fo|51331", "nse_cm|2885"
-        neosym = str(instrument_key or symbol or "").strip()
-        if "|" in neosym:
-            seg, tok = neosym.split("|", 1)
-            seg_lower = seg.lower()
-            if "fo" in seg_lower:
-                neosym = f"nse_fo|{tok}"
-            elif "cm" in seg_lower or "eq" in seg_lower or "index" in seg_lower:
-                neosym = f"nse_cm|{tok}"
-            else:
-                neosym = f"{seg_lower}|{tok}"
-        elif neosym.isdigit():
-            neosym = f"nse_fo|{neosym}"
-        else:
-            token_found = None
+        tok = None
+        seg = "nse_fo"
+        raw_key = str(instrument_key or "").strip()
+        raw_sym = str(symbol or "").strip()
+
+        # 1. Try to extract numeric token from instrument_key
+        if "|" in raw_key:
+            s_part, t_part = raw_key.split("|", 1)
+            if t_part.strip().isdigit():
+                tok = t_part.strip()
+                seg = "nse_fo" if "fo" in s_part.lower() else "nse_cm"
+        elif raw_key.isdigit():
+            tok = raw_key
+
+        # 2. Try to extract numeric token from symbol
+        if not tok:
+            if "|" in raw_sym:
+                s_part, t_part = raw_sym.split("|", 1)
+                if t_part.strip().isdigit():
+                    tok = t_part.strip()
+                    seg = "nse_fo" if "fo" in s_part.lower() else "nse_cm"
+            elif raw_sym.isdigit():
+                tok = raw_sym
+
+        # 3. Resolve numeric token from symbol name
+        if not tok and raw_sym:
+            target_sym = raw_sym.upper().replace(" ", "")
             try:
                 from app.data.instrument_loader import NIFTY_STANDARD_INSTRUMENTS
-                target_sym = (symbol or neosym).upper().replace(" ", "")
                 for item in NIFTY_STANDARD_INSTRUMENTS:
                     if item.get("tradingsymbol", "").upper() == target_sym:
-                        ikey = item.get("instrument_key", "")
-                        if "|" in ikey:
-                            token_found = ikey.split("|")[-1]
+                        part = item.get("instrument_key", "").split("|")[-1].strip()
+                        if part.isdigit():
+                            tok = part
+                            seg = "nse_fo" if "fo" in item.get("instrument_key", "").lower() else "nse_cm"
                             break
             except Exception:
                 pass
-            if not token_found:
+            if not tok:
                 try:
-                    scrips = self.smart_search_instruments(symbol or neosym)
+                    scrips = self.smart_search_instruments(raw_sym)
                     for sc in scrips:
-                        p_sym = str(sc.get("pSymbol") or "")
-                        if p_sym:
-                            token_found = p_sym
+                        p_sym = str(sc.get("pSymbol") or "").strip()
+                        if p_sym.isdigit():
+                            tok = p_sym
                             break
                 except Exception:
                     pass
-            if token_found:
-                neosym = f"nse_fo|{token_found}"
+
+        neosym = f"{seg}|{tok}" if (tok and str(tok).isdigit()) else None
 
         # Build date chunks: 25 calendar days max to strictly stay under Kotak 30-day API limit
         chunk_days = 25

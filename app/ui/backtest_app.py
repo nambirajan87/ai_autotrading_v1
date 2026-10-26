@@ -679,7 +679,7 @@ def render_backtest_module():
                 "IP": r.get("client_ip", ""),
                 "Event": r.get("event_type", ""),
             } for r in recent_logs])
-            st.dataframe(log_df, use_container_width=True, hide_index=True)
+            st.dataframe(log_df, width="stretch", hide_index=True)
         else:
             st.caption("No audit entries recorded yet.")
 
@@ -2393,11 +2393,11 @@ def render_backtest_module():
                     by_exit = trades.groupby("exit_reason")["net_pnl"].agg(
                         Trades="count", Net_PnL="sum", Avg_Trade="mean"
                     ).round(2)
-                    st.dataframe(by_exit, use_container_width=True)
+                    st.dataframe(by_exit, width="stretch")
                 else:
                     empty_exit = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                     empty_exit.index.name = "exit_reason"
-                    st.dataframe(empty_exit, use_container_width=True)
+                    st.dataframe(empty_exit, width="stretch")
 
             with b2:
                 st.subheader("Option Type PE: By Exit Reason")
@@ -2406,11 +2406,11 @@ def render_backtest_module():
                     by_exit_pe = pe_trades.groupby("exit_reason")["net_pnl"].agg(
                         Trades="count", Net_PnL="sum", Avg_Trade="mean"
                     ).round(2)
-                    st.dataframe(by_exit_pe, use_container_width=True)
+                    st.dataframe(by_exit_pe, width="stretch")
                 else:
                     empty_pe = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                     empty_pe.index.name = "exit_reason"
-                    st.dataframe(empty_pe, use_container_width=True)
+                    st.dataframe(empty_pe, width="stretch")
 
             with b3:
                 st.subheader("Option Type CE: By Exit Reason")
@@ -2419,11 +2419,11 @@ def render_backtest_module():
                     by_exit_ce = ce_trades.groupby("exit_reason")["net_pnl"].agg(
                         Trades="count", Net_PnL="sum", Avg_Trade="mean"
                     ).round(2)
-                    st.dataframe(by_exit_ce, use_container_width=True)
+                    st.dataframe(by_exit_ce, width="stretch")
                 else:
                     empty_ce = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                     empty_ce.index.name = "exit_reason"
-                    st.dataframe(empty_ce, use_container_width=True)
+                    st.dataframe(empty_ce, width="stretch")
 
             # Trades Table
             st.subheader("Trade Audit Trail (All Executions)")
@@ -2583,7 +2583,7 @@ def render_backtest_module():
                 )
             st.dataframe(
                 trades[cols].tail(int(show_n)).iloc[::-1],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "Instrument": st.column_config.TextColumn(
@@ -2716,7 +2716,7 @@ def render_backtest_module():
 
             st.dataframe(
                 trades_2.tail(int(show_n_2)).iloc[::-1],
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
                 column_config={
                     "Instrument": st.column_config.TextColumn(
@@ -2754,135 +2754,6 @@ def render_backtest_module():
             )
         else:
             st.info("No trades executed during this period with the current strategy threshold settings.")
-
-        # ---------------- Historical Raw Data Table ----------------
-        st.markdown("---")
-        st.subheader("📊 Historical Raw Data (All Records)")
-
-        raw_candles = res.get("raw_df")
-        if raw_candles is None or raw_candles.empty:
-            raw_candles = res.get("indicators_df")
-        if raw_candles is None or raw_candles.empty:
-            sym = run_data.get("symbol", st.session_state.symbol).lower()
-            tf = st.session_state.get("timeframe", 5)
-            for fb in [f"data/{sym}_{tf}m.csv", f"data/{sym}_5m.csv", "data/upstox_5m.csv", "data/reliance_5m.csv"]:
-                if os.path.exists(fb):
-                    raw_candles = load_csv(fb)
-                    break
-
-        if raw_candles is not None and not raw_candles.empty:
-            req_cols = ["timestamp", "open", "high", "low", "close", "volume"]
-            avail_cols = [c for c in req_cols if c in raw_candles.columns]
-            df_raw = raw_candles[avail_cols].copy()
-
-            # Filter strictly based on the date range selected
-            date_from = run_data.get("date_from") or str(st.session_state.get("start_date", ""))
-            date_to = run_data.get("date_to") or str(st.session_state.get("end_date", ""))
-
-            ts_series = pd.to_datetime(df_raw["timestamp"])
-            mask = pd.Series(True, index=df_raw.index)
-            if date_from:
-                try:
-                    mask &= (ts_series.dt.date >= pd.to_datetime(date_from).date())
-                except Exception:
-                    pass
-            if date_to:
-                try:
-                    mask &= (ts_series.dt.date <= pd.to_datetime(date_to).date())
-                except Exception:
-                    pass
-
-            filtered_raw = df_raw[mask].sort_values("timestamp").reset_index(drop=True)
-            matched_date_range = not filtered_raw.empty
-            if matched_date_range and date_to:
-                try:
-                    f_max_date = pd.to_datetime(filtered_raw["timestamp"]).dt.date.max()
-                    req_to_date = pd.to_datetime(date_to).date()
-                    if f_max_date < req_to_date:
-                        st.warning(
-                            f"⚠️ **Truncated Date Alert**: Historical Raw Data only extends up to **{f_max_date}**, "
-                            f"which is earlier than your requested end date (**{req_to_date}**). "
-                            f"Total {len(filtered_raw):,} candles loaded."
-                        )
-                except Exception:
-                    pass
-            if not matched_date_range:
-                min_avail = str(ts_series.dt.date.min())
-                max_avail = str(ts_series.dt.date.max())
-                st.warning(
-                    f"⚠️ Note: Candle dataset does not contain records for requested date range (`{date_from}` to `{date_to}`). "
-                    f"Displaying all records available in this backtest dataset (`{min_avail}` to `{max_avail}`)."
-                )
-                filtered_raw = df_raw.sort_values("timestamp").reset_index(drop=True)
-
-            # 7th column: Direction Of Change
-            # 1st row: blank
-            # Row 2+: if close > prev close -> 🟢 UP (green button/flag)
-            #         if close < prev close -> 🔴 DOWN (red button/flag)
-            diff = filtered_raw["close"].diff()
-            direction_col = pd.Series("", index=filtered_raw.index, dtype=str)
-            direction_col[diff > 0] = "🟢 UP"
-            direction_col[diff < 0] = "🔴 DOWN"
-            if len(direction_col) > 0:
-                direction_col.iloc[0] = ""
-
-            filtered_raw["Direction Of Change"] = direction_col
-            filtered_raw["timestamp"] = filtered_raw["timestamp"].astype(str)
-
-            if matched_date_range:
-                st.caption(
-                    f"Displaying all **{len(filtered_raw):,}** records based on selected date range "
-                    f"(`{date_from or 'start'}` to `{date_to or 'end'}`). "
-                    "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
-                )
-            else:
-                st.caption(
-                    f"Displaying all **{len(filtered_raw):,}** records from dataset "
-                    f"(`{ts_series.dt.date.min()}` to `{ts_series.dt.date.max()}`). "
-                    "**Direction Of Change**: 🟢 Green flag/button if Close > Prev Close, 🔴 Red flag/button if Close < Prev Close (1st row is blank)."
-                )
-
-            def style_direction_cell(val):
-                if "UP" in str(val) or "🟢" in str(val):
-                    return "background-color: rgba(38, 166, 154, 0.22); color: #26a69a; font-weight: 700; border-radius: 4px;"
-                elif "DOWN" in str(val) or "🔴" in str(val):
-                    return "background-color: rgba(239, 83, 80, 0.22); color: #ef5350; font-weight: 700; border-radius: 4px;"
-                return ""
-
-            styled_raw = filtered_raw.style.map(
-                style_direction_cell, subset=["Direction Of Change"]
-            ).format({
-                "open": "{:.2f}",
-                "high": "{:.2f}",
-                "low": "{:.2f}",
-                "close": "{:.2f}",
-                "volume": "{:,.0f}",
-            })
-
-            st.dataframe(
-                styled_raw,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "timestamp": st.column_config.TextColumn("timestamp"),
-                    "open": st.column_config.NumberColumn("open", format="%.2f"),
-                    "high": st.column_config.NumberColumn("high", format="%.2f"),
-                    "low": st.column_config.NumberColumn("low", format="%.2f"),
-                    "close": st.column_config.NumberColumn("close", format="%.2f"),
-                    "volume": st.column_config.NumberColumn("volume", format="%d"),
-                    "Direction Of Change": st.column_config.TextColumn("Direction Of Change"),
-                }
-            )
-
-            csv_bytes = filtered_raw.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download Historical Raw Data (CSV)",
-                data=csv_bytes,
-                file_name=f"{run_data.get('symbol', st.session_state.symbol)}_raw_candles_{date_from}_{date_to}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.info("No historical raw candle data available for this run.")
 
         st.markdown("<br>", unsafe_allow_html=True)
         res_b1, res_b2 = st.columns(2)

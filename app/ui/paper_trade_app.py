@@ -79,6 +79,282 @@ def parse_time_param(val, default_time: time) -> time:
     return default_time
 
 
+
+def render_paper_trade_hud_and_watchtower(
+    is_live_running: bool,
+    active_open_trade: Optional[dict],
+    live_ltp: float,
+    candles_df: Optional[pd.DataFrame],
+    timeframe_m: int,
+    strategy_sq_time: time,
+    rem_seconds: int,
+    next_check_str: str,
+    latest_score: int,
+    sig_disp: str,
+    sig_color: str,
+    long_th: int,
+    short_th: int,
+    lot_size: int,
+    selected_strat: str,
+    active_instrument: str,
+    snooze_min: int = 0,
+    last_exit_dt: Optional[datetime] = None,
+):
+    """
+    Renders Hybrid Live Trade Status:
+    1. Persistent Top HUD Ribbon (Stopwatch, Bar Countdown, Proximity Track Bar, P&L)
+    2. Collapsible 'Trade Watchtower' 4-Card Deck (In-depth lifecycle, target/SL delta, P&L, signal radar)
+    """
+    now_dt = datetime.now()
+    tf_val = max(1, timeframe_m)
+
+    # Square-off Countdown
+    sq_dt = datetime.combine(now_dt.date(), strategy_sq_time)
+    if sq_dt > now_dt:
+        sq_rem_sec = int((sq_dt - now_dt).total_seconds())
+        sq_h, rem_sq = divmod(sq_rem_sec, 3600)
+        sq_m, sq_s = divmod(rem_sq, 60)
+        sq_rem_str = f"{sq_h:02d}h {sq_m:02d}m {sq_s:02d}s"
+    else:
+        sq_rem_str = "00h 00m 00s (Reached)"
+
+    # Cooldown remaining
+    cooldown_str = None
+    if snooze_min > 0 and last_exit_dt:
+        s_end = last_exit_dt + timedelta(minutes=snooze_min)
+        if now_dt < s_end:
+            rem_s = int((s_end - now_dt).total_seconds())
+            sm, ss = divmod(rem_s, 60)
+            cooldown_str = f"{sm:02d}m {ss:02d}s"
+
+    if active_open_trade is not None:
+        tid = active_open_trade.get("trade_id") or active_open_trade.get("id") or 5001
+        e_side = str(active_open_trade.get("side", "LONG")).upper()
+        e_p = float(active_open_trade.get("entry_price", live_ltp))
+        trade_qty = int(active_open_trade.get("quantity", lot_size))
+        tgt = float(active_open_trade.get("target") or 0.0)
+        sl = float(active_open_trade.get("stop_loss") or 0.0)
+        trade_sym = str(active_open_trade.get("symbol") or active_instrument)
+
+        e_time_str = active_open_trade.get("entry_time") or ""
+        elapsed_str = "00m 00s"
+        if e_time_str:
+            try:
+                e_dt = pd.to_datetime(e_time_str)
+                elapsed_sec = max(0, int((now_dt - e_dt).total_seconds()))
+                eh, er = divmod(elapsed_sec, 3600)
+                em, es = divmod(er, 60)
+                elapsed_str = f"{eh:02d}:{em:02d}:{es:02d}" if eh > 0 else f"{em:02d}m {es:02d}s"
+            except Exception:
+                pass
+
+        candle_count = 1
+        if candles_df is not None and not candles_df.empty and e_time_str:
+            try:
+                c_after = candles_df[pd.to_datetime(candles_df["timestamp"]) >= pd.to_datetime(e_time_str)]
+                candle_count = max(1, len(c_after))
+            except Exception:
+                pass
+
+        gross_pnl = (live_ltp - e_p) * trade_qty if e_side == "LONG" else (e_p - live_ltp) * trade_qty
+        pnl_pct = ((live_ltp - e_p) / e_p * 100.0) if e_p > 0 and e_side == "LONG" else ((e_p - live_ltp) / e_p * 100.0 if e_p > 0 else 0.0)
+        charges = 40.0
+        net_pnl = gross_pnl - charges
+        pnl_color = "#00e676" if net_pnl >= 0 else "#ff5252"
+        pnl_bg = "rgba(0, 230, 118, 0.15)" if net_pnl >= 0 else "rgba(255, 82, 82, 0.15)"
+        pnl_sign = "+" if net_pnl >= 0 else ""
+
+        if e_side == "LONG":
+            dist_tgt_pts = max(0.0, tgt - live_ltp) if tgt > 0 else 0.0
+            dist_tgt_pct = (dist_tgt_pts / live_ltp * 100.0) if live_ltp > 0 else 0.0
+            dist_sl_pts = max(0.0, live_ltp - sl) if sl > 0 else 0.0
+            dist_sl_pct = (dist_sl_pts / live_ltp * 100.0) if live_ltp > 0 else 0.0
+            prog_pct = max(0.0, min(100.0, ((live_ltp - sl) / (tgt - sl)) * 100.0)) if (tgt > sl and sl > 0) else 50.0
+        else:
+            dist_tgt_pts = max(0.0, live_ltp - tgt) if tgt > 0 else 0.0
+            dist_tgt_pct = (dist_tgt_pts / live_ltp * 100.0) if live_ltp > 0 else 0.0
+            dist_sl_pts = max(0.0, sl - live_ltp) if sl > 0 else 0.0
+            dist_sl_pct = (dist_sl_pts / live_ltp * 100.0) if live_ltp > 0 else 0.0
+            prog_pct = max(0.0, min(100.0, ((sl - live_ltp) / (sl - tgt)) * 100.0)) if (sl > tgt and tgt > 0) else 50.0
+
+        rr_ratio = abs(tgt - e_p) / abs(e_p - sl) if abs(e_p - sl) > 0.01 else 2.0
+        phase_badge = "🟢 PROFIT RUNNING" if gross_pnl > 0 else ("🟡 AT BREAKEVEN" if abs(gross_pnl) < 1.0 else "🔴 UNDER WATER")
+        phase_color = "#00e676" if gross_pnl > 0 else ("#ffd600" if abs(gross_pnl) < 1.0 else "#ff5252")
+
+        # 1. Top HUD Ribbon
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.96)); border: 1px solid rgba(59, 130, 246, 0.45); border-radius: 10px; padding: 14px 18px; margin: 12px 0 16px 0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="background: rgba(0, 230, 118, 0.2); color: #00e676; border: 1px solid #00e676; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.85rem; letter-spacing: 0.5px;">
+                        🟢 TRADE #{tid} ACTIVE
+                    </span>
+                    <span style="color: #f8fafc; font-weight: 600; font-size: 0.95rem;">
+                        {trade_sym} ({e_side} x{trade_qty})
+                    </span>
+                    <span style="background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.3); padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: 600;">
+                        Candle #{candle_count} ({tf_val}m)
+                    </span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 14px; font-size: 0.88rem; color: #cbd5e1;">
+                    <span>⏱️ <b>In Trade:</b> <span style="color: #38bdf8; font-weight: 700; font-family: monospace; font-size: 0.95rem;">{elapsed_str}</span></span>
+                    <span>⏳ <b>Bar Close:</b> <span style="color: #fbbf24; font-weight: 700; font-family: monospace;">{rem_seconds}s</span></span>
+                    <span>🛑 <b>Sq-Off:</b> <span style="color: #f87171; font-weight: 700; font-family: monospace;">{sq_rem_str}</span></span>
+                    <span style="background: {pnl_bg}; color: {pnl_color}; border: 1px solid {pnl_color}; padding: 3px 10px; border-radius: 6px; font-weight: 700; font-size: 0.92rem;">
+                        {pnl_sign}₹{net_pnl:,.2f} ({pnl_pct:+.2f}%)
+                    </span>
+                </div>
+            </div>
+            
+            <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 10px 14px;">
+                <div style="display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 6px;">
+                    <span style="color: #ef4444; font-weight: 600;">🛑 SL: ₹{sl:.2f} <span style="color: #94a3b8; font-weight: normal;">({dist_sl_pts:.2f} pts away)</span></span>
+                    <span style="color: #38bdf8; font-weight: 600;">🔵 Entry: ₹{e_p:.2f} &nbsp;|&nbsp; Current LTP: <b style="color: #ffffff;">₹{live_ltp:.2f}</b></span>
+                    <span style="color: #10b981; font-weight: 600;">🎯 Target: ₹{tgt:.2f} <span style="color: #94a3b8; font-weight: normal;">({dist_tgt_pts:.2f} pts away)</span></span>
+                </div>
+                <div style="height: 10px; width: 100%; background: #334155; border-radius: 5px; position: relative; overflow: hidden;">
+                    <div style="position: absolute; left: 0; top: 0; bottom: 0; width: {prog_pct:.1f}%; background: linear-gradient(90deg, #ef4444 0%, #3b82f6 50%, #10b981 100%); border-radius: 5px; transition: width 0.3s ease;"></div>
+                </div>
+                <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #94a3b8; margin-top: 5px;">
+                    <span>Risk Cushion: <b style="color: #cbd5e1;">{dist_sl_pct:.1f}%</b></span>
+                    <span style="color: {phase_color}; font-weight: 600;">{phase_badge}</span>
+                    <span>Distance to Target: <b style="color: #cbd5e1;">{dist_tgt_pct:.1f}%</b> remaining</span>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 2. Collapsible Watchtower Command Deck
+        with st.expander("🔭 Trade Watchtower — In-Depth Lifecycle, Risk & Trajectory Deck", expanded=True):
+            w_col1, w_col2, w_col3, w_col4 = st.columns(4)
+            with w_col1:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">⏱️ Lifecycle Clock</div>
+                    <div style="font-size: 1.35rem; font-weight: 700; color: #38bdf8; font-family: monospace; margin: 4px 0;">{elapsed_str}</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Entry Time:</b> {e_time_str}</div>
+                        <div><b>Bar Progression:</b> Candle #{candle_count} ({tf_val}m)</div>
+                        <div><b>Sq-Off In:</b> <span style="color: #f87171; font-weight: 600;">{sq_rem_str}</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col2:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🎯 Target / SL Proximity</div>
+                    <div style="font-size: 1.15rem; font-weight: 700; color: #10b981; margin: 4px 0;">₹{tgt:.2f} <span style="font-size: 0.82rem; color: #94a3b8; font-weight: normal;">(+{dist_tgt_pts:.2f} pts)</span></div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Stop-Loss:</b> <span style="color: #ef4444; font-weight: 600;">₹{sl:.2f}</span> (-{dist_sl_pts:.2f} pts)</div>
+                        <div><b>Risk Cushion:</b> {dist_sl_pct:.1f}% | <b>Target Dist:</b> {dist_tgt_pct:.1f}%</div>
+                        <div><b>Risk/Reward Ratio:</b> 1 : {rr_ratio:.2f}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col3:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">📈 P&L & Trajectory</div>
+                    <div style="font-size: 1.35rem; font-weight: 700; color: {pnl_color}; margin: 4px 0;">{pnl_sign}₹{net_pnl:,.2f}</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Gross P&L:</b> ₹{gross_pnl:,.2f} ({pnl_pct:+.2f}%)</div>
+                        <div><b>Charges & Brokerage:</b> ₹{charges:.2f}</div>
+                        <div><b>Phase:</b> <span style="color: {phase_color}; font-weight: 600;">{phase_badge}</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col4:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🧭 Engine & Signal Radar</div>
+                    <div style="font-size: 1.15rem; font-weight: 700; color: {sig_color}; margin: 4px 0;">{sig_disp} (Score: {latest_score})</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Next Bar Close:</b> <span style="color: #fbbf24; font-weight: 600;">{next_check_str}</span> ({rem_seconds}s)</div>
+                        <div><b>Thresholds:</b> Long &ge; {long_th} | Short &le; {short_th}</div>
+                        <div><b>Strategy:</b> <span style="color: #38bdf8;">{selected_strat[:22]}</span></div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+    else:
+        # Scanning / Standby mode
+        cooldown_badge = f"""<span style="background: rgba(234, 179, 8, 0.2); color: #eab308; border: 1px solid #eab308; padding: 2px 8px; border-radius: 4px; font-weight: 600;">⏸️ Cooldown: {cooldown_str}</span>""" if cooldown_str else ""
+        st.markdown(f"""
+        <div style="background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.96)); border: 1px solid rgba(59, 130, 246, 0.45); border-radius: 10px; padding: 14px 18px; margin: 12px 0 16px 0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+            <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
+                <div style="display: flex; align-items: center; gap: 10px;">
+                    <span style="background: rgba(59, 130, 246, 0.2); color: #60a5fa; border: 1px solid #3b82f6; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 0.85rem; letter-spacing: 0.5px;">
+                        📡 SCANNING FOR SIGNALS
+                    </span>
+                    <span style="color: #f8fafc; font-weight: 600; font-size: 0.95rem;">
+                        {active_instrument} (Timeframe: {tf_val}m)
+                    </span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 14px; font-size: 0.88rem; color: #cbd5e1;">
+                    <span>⏱️ <b>Next Signal Check:</b> <span style="color: #fbbf24; font-weight: 700; font-family: monospace;">{next_check_str}</span> (<b>{rem_seconds}s</b>)</span>
+                    <span>🛑 <b>Session Sq-Off:</b> <span style="color: #f87171; font-weight: 700; font-family: monospace;">{sq_rem_str}</span></span>
+                    {cooldown_badge}
+                </div>
+            </div>
+            <div style="margin-top: 10px; font-size: 0.82rem; color: #94a3b8; display: flex; justify-content: space-between; align-items: center; border-top: 1px solid rgba(148, 163, 184, 0.15); padding-top: 8px;">
+                <span>Consensus Score: <b style="color: {sig_color};">{latest_score}</b> (Long threshold: <b>>={long_th}</b> | Short threshold: <b><={short_th}</b>)</span>
+                <span>Continuous 2s Kotak Live LTP & Strategy Monitor Active</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander("🔭 Trade Watchtower — Standby & Strategy Parameters Deck", expanded=False):
+            w_col1, w_col2, w_col3, w_col4 = st.columns(4)
+            with w_col1:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">⏱️ Execution Timing</div>
+                    <div style="font-size: 1.15rem; font-weight: 700; color: #38bdf8; margin: 4px 0;">STANDBY / SCANNING</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Sq-off Time:</b> {strategy_sq_time.strftime('%H:%M')} IST</div>
+                        <div><b>Session Closes In:</b> <span style="color: #f87171; font-weight: 600;">{sq_rem_str}</span></div>
+                        <div><b>Cooldown:</b> {cooldown_str or 'None (Ready)'}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col2:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🎯 Strategy & Target Rules</div>
+                    <div style="font-size: 1.15rem; font-weight: 700; color: #10b981; margin: 4px 0;">{selected_strat[:20]}</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Timeframe:</b> {tf_val} Minutes</div>
+                        <div><b>Lot Size:</b> {lot_size} Qty</div>
+                        <div><b>Next Bar Check:</b> {next_check_str} ({rem_seconds}s)</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col3:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">📈 Price & Market Radar</div>
+                    <div style="font-size: 1.35rem; font-weight: 700; color: #ffffff; margin: 4px 0;">₹{live_ltp:.2f}</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Active Contract:</b> {active_instrument}</div>
+                        <div><b>Status:</b> Ready for new signal</div>
+                        <div><b>Broker API:</b> Kotak Neo Live Priority</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+            with w_col4:
+                st.markdown(f"""
+                <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
+                    <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🧭 Consensus Signal Radar</div>
+                    <div style="font-size: 1.15rem; font-weight: 700; color: {sig_color}; margin: 4px 0;">{sig_disp} (Score: {latest_score})</div>
+                    <div style="font-size: 0.8rem; color: #cbd5e1; line-height: 1.5;">
+                        <div><b>Long Trigger:</b> Score &ge; {long_th}</div>
+                        <div><b>Short Trigger:</b> Score &le; {short_th}</div>
+                        <div><b>Engine Status:</b> 🟢 Active Continuous Scan</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+
 def render_paper_trade_module():
     # Record visit for auditing
     record_session_visit()
@@ -149,6 +425,8 @@ def render_paper_trade_module():
     if st.sidebar.button("👁️ View Run", type="primary", use_container_width=True, key="paper_btn_view_run"):
         st.session_state.paper_selected_strategy = selected_strat
         st.rerun()
+
+
 
     st.sidebar.markdown("---")
     with st.sidebar.expander("⚠️ Danger Zone", expanded=False):
@@ -328,6 +606,7 @@ def render_paper_trade_module():
     # Check date settings against current date
     date_is_current = (strat_from == today_str and strat_to == today_str)
     is_mkt_open, mkt_msg = check_market_trading_hours()
+    mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
 
     pt_col1, pt_col2, pt_col3 = st.columns([3, 2, 2])
     with pt_col1:
@@ -339,55 +618,98 @@ def render_paper_trade_module():
         mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
         st.markdown(f"**Market Status:** {mkt_badge}")
         st.caption(f"🛡️ **Auto Square-off Time:** `{strategy_sq_time.strftime('%H:%M')} IST` (RiskConfig)")
-    with pt_col3:
-        if not date_is_current:
-            if st.button(f"📅 Set Dates to Current Date ({today_str})", key="quick_set_current_date", use_container_width=True):
-                inst_cfg["start_date"] = today_str
-                inst_cfg["end_date"] = today_str
-                save_strategy(selected_strat, ind_cfg, risk_cfg, cost_cfg, instrument=inst_cfg)
-                st.success(f"Updated {selected_strat} dates to current date ({today_str})!")
-                st.rerun()
+    # Auto-align dates to current date for paper trading session
+    if not date_is_current:
+        inst_cfg["start_date"] = today_str
+        inst_cfg["end_date"] = today_str
+        save_strategy(selected_strat, ind_cfg, risk_cfg, cost_cfg, instrument=inst_cfg)
+        strat_from = today_str
+        strat_to = today_str
+        date_is_current = True
 
-    exec_col1, exec_col2 = st.columns([2, 4])
+    # Render OI Pulse Live Strength Feed
+    from app.strategy.oipulse_resolver import get_live_oipulse_status
+    from scripts.schedule_oipulse_strength import is_paper_trade_auto_triggered, ActiveSchedulerConfig
+
+    oi_status = get_live_oipulse_status(underlying=inst_cfg.get("underlying") or "NIFTY")
+
+    st.markdown("##### 📡 OI Pulse Live Strength Feed (1-Min Backend Triggers)")
+    oi_c1, oi_c2, oi_c3, oi_c4, oi_c5, oi_c6 = st.columns(6)
+    oi_c1.metric("Trigger No", f"#{oi_status.get('trigger_no', 1)}")
+    t_time_val = str(oi_status.get("trigger_time", "")).split(" ")[-1] if oi_status.get("trigger_time") else "09:16:00"
+    oi_c2.metric("Trigger Time", t_time_val)
+    oi_c3.metric("OI Pulse Date", str(oi_status.get("date") or today_str))
+    oi_c4.metric("OI Pulse Time", str(oi_status.get("time") or "09:16"))
+    oi_c5.metric("OI Pulse LTP", f"₹{float(oi_status.get('ltp', 0.0)):,.2f}")
+    strength_disp = str(oi_status.get("strength_str", "0%"))
+    oi_c6.metric("OI Strength", strength_disp, help="Real-time OI Strength from OI Pulse scheduler")
+
+    now_curr_time = datetime.now().time()
+    auto_trigger_eligible = is_paper_trade_auto_triggered()
+    user_paused = st.session_state.get("paper_user_paused", False)
     is_live_running = st.session_state.get("paper_executing_live", False)
 
+    # Auto-trigger "Execute Paper Trade" at 09:16 AM during market window (or mock live) without manual button
+    if auto_trigger_eligible and not user_paused and not is_live_running:
+        if now_curr_time < strategy_sq_time:
+            st.session_state.paper_executing_live = True
+            st.session_state.paper_live_start_time = datetime.now().strftime("%H:%M:%S")
+            st.session_state.paper_auto_triggered = True
+            is_live_running = True
+            st.rerun()
+
+    exec_col1, exec_col2 = st.columns([2, 5])
+
     with exec_col1:
-        if not is_live_running:
-            if st.button("🚀 Execute Paper Trade", type="primary", use_container_width=True, key="btn_run_paper_live"):
-                now_curr_time = datetime.now().time()
-                if not date_is_current:
-                    st.error(
-                        f"❌ Date Validation Error: Strategy From Date ('{strat_from}') and To Date ('{strat_to}') "
-                        f"must be set to current date ('{today_str}') for Paper Trade execution. "
-                        "Please click 'Set Dates to Current Date' above before executing."
-                    )
-                elif not is_mkt_open:
-                    st.error(
-                        f"🛑 **Market Hours Validation Failed:** {mkt_msg} "
-                        "Execution cannot be started after market hours (Regular trading: 09:15:00 to 15:30:00 IST)."
-                    )
-                elif now_curr_time >= strategy_sq_time:
-                    st.error(
-                        f"🛑 **Square-off Time Validation Failed:** Current time ({datetime.now().strftime('%H:%M:%S')}) is at/past the strategy Square-off Time ({strategy_sq_time.strftime('%H:%M')} IST) defined in Risk Parameters. "
-                        "Paper trade execution cannot be started past square-off time."
-                    )
-                else:
-                    st.session_state.paper_executing_live = True
-                    st.session_state.paper_live_start_time = datetime.now().strftime("%H:%M:%S")
-                    st.rerun()
-        else:
+        if is_live_running:
             if st.button("⏹️ Stop Paper Trade Session", type="secondary", use_container_width=True, key="btn_stop_paper_live"):
                 st.session_state.paper_executing_live = False
+                st.session_state.paper_user_paused = True
                 st.rerun()
+        elif user_paused:
+            if st.button("▶️ Resume Watching OI Strength", type="primary", use_container_width=True, key="btn_resume_paper_live"):
+                st.session_state.paper_user_paused = False
+                st.session_state.paper_executing_live = True
+                st.session_state.paper_live_start_time = datetime.now().strftime("%H:%M:%S")
+                st.rerun()
+        else:
+            st.markdown(
+                """
+                <div style="background: rgba(33, 150, 243, 0.08); border: 1px dashed rgba(33, 150, 243, 0.35); border-radius: 8px; padding: 12px; text-align: center;">
+                    <div style="font-size: 0.85rem; font-weight: 700; color: #64b5f6;">⚡ AUTO-TRIGGER MODE</div>
+                    <div style="font-size: 0.75rem; color: #94a3b8; margin-top: 2px;">Market Window: Mon-Fri 09:15-15:15<br>Auto Starts at 09:16 AM</div>
+                    <div style="font-size: 0.72rem; color: #00e676; margin-top: 4px; font-weight: 600;">Manual Button Removed</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
     with exec_col2:
         if is_live_running:
-            st.info(
-                f"⚡ **Paper Trade Active:** Watching **{active_instrument}** with **Kotak Neo Live Priority** | "
-                f"Auto-refresh: **2 seconds** | Session Started: **{st.session_state.get('paper_live_start_time', '')}**"
+            st.success(
+                f"🟢 **Auto-Trigger Active (09:16 AM Market Window):** Execution engine auto-triggered and is continuously **watching for OI Strength** "
+                f"for **{active_instrument}**.\n\n"
+                f"📡 **OI Pulse Status:** Triggering every 1 min (:13s) &bull; Market Window: **Monday - Friday, 09:15 AM - 03:15 PM** &bull; "
+                f"Trigger Active: **09:16:00 IST** &bull; Auto-Refresh: **2 seconds** &bull; Session Started: **{st.session_state.get('paper_live_start_time', '')}**"
+            )
+        elif user_paused:
+            st.warning(
+                "⏸️ **Paper Trade Session Paused by User:** Watching OI Strength is temporarily paused. "
+                "Click **'▶️ Resume Watching OI Strength'** on the left to re-engage continuous scanning."
             )
         else:
-            st.caption("Engine in Standby. Click **Execute Paper Trade** during regular market hours (09:15 to 15:30 IST) to engage live simulation.")
+            if datetime.now().weekday() < 5 and now_curr_time < time(9, 16):
+                st.info(
+                    "⏳ **OI Pulse Scheduler Armed:** Market Window: **Monday - Friday, 09:15 AM - 03:15 PM**.\n\n"
+                    "Auto-trigger is scheduled for **09:16 AM** (waiting for 1st minute OI candle close). "
+                    "The engine will automatically start and watch for OI Strength. Manual execute button has been removed."
+                )
+            else:
+                st.info(
+                    f"🛡️ **OI Pulse Scheduler Standby (Market Window: Mon - Fri, 09:15 AM - 03:15 PM):** {mkt_msg}\n\n"
+                    "Paper trade auto-trigger is on standby. At **09:16 AM** on the next trading session, "
+                    "execution will automatically engage and watch for OI Strength without requiring any manual button click."
+                )
 
     # ---------------- Active Execution Engine & Live Kotak Chart ----------------
     active_open_trade = None
@@ -436,7 +758,7 @@ def render_paper_trade_module():
     if live_ltp <= 0 and candles_df is not None and not candles_df.empty:
         live_ltp = float(candles_df.iloc[-1]["close"])
 
-    # Display Live Ticker & Order Book metrics
+        # Display Live Ticker & Order Book metrics
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     m_col1.metric("Live Tick (LTP)", f"₹{live_ltp:,.2f}", f"Feed: {depth.get('status', 'LIVE')}")
     if candles_df is not None and not candles_df.empty:
@@ -518,6 +840,39 @@ def render_paper_trade_module():
         </div>
         """, unsafe_allow_html=True)
 
+        # Cooldown / Snooze Check for Timer HUD
+        hud_snooze_min = int(risk_cfg.get("snooze_minutes", 0) or ind_cfg.get("snooze_minutes", 0) or 0)
+        hud_last_exit = st.session_state.get("paper_last_exit_time")
+        if not hud_last_exit and not real_trades.empty and "exit_time" in real_trades.columns:
+            valid_exits = real_trades["exit_time"].dropna()
+            if not valid_exits.empty:
+                try:
+                    hud_last_exit = pd.to_datetime(valid_exits.iloc[-1])
+                except Exception:
+                    pass
+
+        # Render Hybrid Option 1 (HUD Ribbon) & Collapsible Option 2 (Trade Watchtower)
+        render_paper_trade_hud_and_watchtower(
+            is_live_running=is_live_running,
+            active_open_trade=active_open_trade,
+            live_ltp=live_ltp,
+            candles_df=candles_df,
+            timeframe_m=timeframe_m,
+            strategy_sq_time=strategy_sq_time,
+            rem_seconds=rem_seconds,
+            next_check_str=next_check_str,
+            latest_score=latest_score,
+            sig_disp=sig_disp,
+            sig_color=sig_color,
+            long_th=long_th,
+            short_th=short_th,
+            lot_size=int(inst_cfg.get("lot_size", 65)),
+            selected_strat=selected_strat,
+            active_instrument=active_instrument,
+            snooze_min=hud_snooze_min,
+            last_exit_dt=hud_last_exit,
+        )
+
     # If live running, check market hours and strategy square-off time; if past square-off or market closed, auto square off and stop
     if is_live_running:
         now_time = datetime.now().time()
@@ -547,11 +902,31 @@ def render_paper_trade_module():
         lot_size = int(inst_cfg.get("lot_size", 65))
         now_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+        # Cooldown / Snooze Period Check (Fix 1)
+        snooze_min = int(risk_cfg.get("snooze_minutes", 0) or ind_cfg.get("snooze_minutes", 0) or 0)
+        last_exit_dt = st.session_state.get("paper_last_exit_time")
+        if not last_exit_dt and not real_trades.empty and "exit_time" in real_trades.columns:
+            valid_exits = real_trades["exit_time"].dropna()
+            if not valid_exits.empty:
+                try:
+                    last_exit_dt = pd.to_datetime(valid_exits.iloc[-1])
+                except Exception:
+                    pass
+
+        snooze_active = False
+        if snooze_min > 0 and last_exit_dt is not None:
+            elapsed_sec = (datetime.now() - last_exit_dt).total_seconds()
+            if 0 <= elapsed_sec < snooze_min * 60:
+                snooze_active = True
+                rem_m = int((snooze_min * 60 - elapsed_sec) // 60)
+                rem_s = int((snooze_min * 60 - elapsed_sec) % 60)
+                st.info(f"⏳ **Cooldown Active:** Waiting **{rem_m}m {rem_s}s** after previous trade exit ({snooze_min}m snooze). New entries are blocked.")
+
         if active_open_trade is None:
             now_time = datetime.now().time()
             if now_time >= strategy_sq_time or now_time > strategy_entry_end:
                 st.info(f"⏳ Current time ({now_time.strftime('%H:%M:%S')}) is past Strategy Entry End ({strategy_entry_end.strftime('%H:%M')}) / Square-off ({strategy_sq_time.strftime('%H:%M')}) from Risk Parameters. New entries are blocked.")
-            else:
+            elif not snooze_active:
                 # Check for new entry signal strictly within market hours & strategy entry window
                 trade_symbol = active_instrument
                 if fo_mode == "OIPulse Mode":
@@ -569,13 +944,31 @@ def render_paper_trade_module():
                     tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
                     sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
                     next_tid = 5000 + len(real_trades) + 1
+
+                    # Dynamic Position Sizing (Fix 2)
+                    from app.risk.position_sizing import calculate_quantity
+                    risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
+                    max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
+                    max_quantity = int(risk_cfg.get("max_quantity", 5000))
+                    room = capital * max_exp_pct
+                    calc_qty = calculate_quantity(
+                        capital=capital,
+                        risk_pct=risk_pct,
+                        entry=entry_p,
+                        stop=sl_p,
+                        lot_size=lot_size,
+                        max_exposure_value=room,
+                        max_quantity=max_quantity,
+                    )
+                    trade_qty = calc_qty if calc_qty > 0 else lot_size
+
                     paper_db.save_active_trade(
                         strategy_name=selected_strat,
                         symbol=trade_symbol,
                         session_date=today_str,
                         trade_id=next_tid,
                         side="LONG",
-                        quantity=lot_size,
+                        quantity=trade_qty,
                         entry_time=now_time_str,
                         entry_price=entry_p,
                         stop_loss=sl_p,
@@ -583,7 +976,7 @@ def render_paper_trade_module():
                         score=latest_score,
                         regime="TRENDING",
                     )
-                    st.toast(f"🟢 Executed LONG Trade #{next_tid} on {trade_symbol} @ ₹{entry_p:.2f}!", icon="🟢")
+                    st.toast(f"🟢 Executed LONG Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🟢")
                     st.rerun()
 
                 elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
@@ -591,13 +984,31 @@ def render_paper_trade_module():
                     tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
                     sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
                     next_tid = 5000 + len(real_trades) + 1
+
+                    # Dynamic Position Sizing (Fix 2)
+                    from app.risk.position_sizing import calculate_quantity
+                    risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
+                    max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
+                    max_quantity = int(risk_cfg.get("max_quantity", 5000))
+                    room = capital * max_exp_pct
+                    calc_qty = calculate_quantity(
+                        capital=capital,
+                        risk_pct=risk_pct,
+                        entry=entry_p,
+                        stop=sl_p,
+                        lot_size=lot_size,
+                        max_exposure_value=room,
+                        max_quantity=max_quantity,
+                    )
+                    trade_qty = calc_qty if calc_qty > 0 else lot_size
+
                     paper_db.save_active_trade(
                         strategy_name=selected_strat,
                         symbol=trade_symbol,
                         session_date=today_str,
                         trade_id=next_tid,
                         side="SHORT",
-                        quantity=lot_size,
+                        quantity=trade_qty,
                         entry_time=now_time_str,
                         entry_price=entry_p,
                         stop_loss=sl_p,
@@ -605,22 +1016,21 @@ def render_paper_trade_module():
                         score=latest_score,
                         regime="TRENDING",
                     )
-                    st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {trade_symbol} @ ₹{entry_p:.2f}!", icon="🔴")
+                    st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🔴")
                     st.rerun()
 
         elif active_open_trade is not None:
             # Active trade is running: check for Square-off time, Target, or Stop Loss trigger
             e_side = active_open_trade.get("side", "LONG")
             e_p = float(active_open_trade.get("entry_price", live_ltp))
+            trade_qty = int(active_open_trade.get("quantity", lot_size))
             tgt = float(active_open_trade.get("target") or 0.0)
             sl = float(active_open_trade.get("stop_loss") or 0.0)
             row_db_id = active_open_trade.get("id")
 
             now_time = datetime.now().time()
             exit_triggered = None
-            if now_time >= strategy_sq_time:
-                exit_triggered = "SQUARE_OFF"
-            elif not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time:
+            if now_time >= strategy_sq_time or (not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time):
                 exit_triggered = "SQUARE_OFF"
             elif e_side == "LONG":
                 if tgt > 0 and live_ltp >= tgt:
@@ -634,22 +1044,36 @@ def render_paper_trade_module():
                     exit_triggered = "STOP_LOSS"
 
             if exit_triggered:
-                gross = (live_ltp - e_p) * lot_size if e_side == "LONG" else (e_p - live_ltp) * lot_size
-                peak_pct = max(0.0, (live_ltp - e_p) / e_p * 100.0) if e_side == "LONG" else max(0.0, (e_p - live_ltp) / e_p * 100.0)
+                # Realistic Stop Loss & Target execution bounds (Fix 3)
+                tick_size = float(risk_cfg.get("tick_size", 0.05))
+                if exit_triggered == "STOP_LOSS":
+                    fill_price = round(max(sl - tick_size, live_ltp), 2) if e_side == "LONG" else round(min(sl + tick_size, live_ltp), 2)
+                elif exit_triggered == "TARGET":
+                    fill_price = round(tgt, 2)
+                else:
+                    fill_price = live_ltp
+
+                # Full Round-Trip Brokerage Accounting (Fix 4: Buy leg ₹20 + Sell leg ₹20 = ₹40)
+                round_trip_charges = float(cost_cfg.get("flat_cost_per_order", 20.0)) * 2
+
+                gross = (fill_price - e_p) * trade_qty if e_side == "LONG" else (e_p - fill_price) * trade_qty
+                peak_pct = max(0.0, (fill_price - e_p) / e_p * 100.0) if e_side == "LONG" else max(0.0, (e_p - fill_price) / e_p * 100.0)
                 paper_db.close_active_trade(
                     trade_id_or_row_id=row_db_id,
                     exit_time=now_time_str,
-                    exit_price=live_ltp,
+                    exit_price=fill_price,
                     exit_reason=exit_triggered,
                     gross_pnl=round(gross, 2),
-                    charges=20.0,
+                    charges=round_trip_charges,
                     peak_gain_pct=round(peak_pct, 2),
                 )
+                st.session_state.paper_last_exit_time = datetime.now()
+
                 if exit_triggered == "SQUARE_OFF":
                     st.session_state.paper_executing_live = False
                     st.toast(f"🔔 Strategy Square-off ({strategy_sq_time.strftime('%H:%M')}) triggered from Risk Parameters! Position closed.", icon="⏹️")
                 else:
-                    st.toast(f"⏹️ Trade exited via {exit_triggered} at ₹{live_ltp:.2f}! Net P&L: ₹{gross - 20:,.2f}", icon="⏹️")
+                    st.toast(f"⏹️ Trade exited via {exit_triggered} at ₹{fill_price:.2f}! Net P&L: ₹{gross - round_trip_charges:,.2f}", icon="⏹️")
                 st.rerun()
 
     # Display Interactive Plotly Candlestick Chart (Current Date - strictly up to 15:30)
@@ -807,28 +1231,116 @@ def render_paper_trade_module():
                     monthly_pnl = monthly_pnl.sort_values("month_key").set_index("month_label")["net_pnl"]
                     st.bar_chart(monthly_pnl)
 
-        import re
-        def get_trade_opt_type(row):
-            for k in ("Option Type", "option_type", "opt_type"):
-                if k in row and pd.notna(row[k]):
-                    v = str(row[k]).strip().upper()
-                    if v in ("CE", "PE"):
-                        return v
-            sym = str(row.get("symbol") or active_instrument or "").strip().upper()
-            m = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym) or re.search(r"\b(CE|PE)\b", sym)
-            if m:
-                return m.group(1)
-            cfg_opt = str(inst_cfg.get("option_type") or "").strip().upper()
-            if "CE" in cfg_opt:
-                return "CE"
-            elif "PE" in cfg_opt:
-                return "PE"
-            return "-"
+        import sqlite3
+        db_oi_file = PROJECT_ROOT / "data" / "backtest.db"
+        oi_conn = None
+        if os.path.exists(db_oi_file):
+            try:
+                oi_conn = sqlite3.connect(db_oi_file)
+            except Exception:
+                oi_conn = None
+        oi_cur = oi_conn.cursor() if oi_conn else None
 
-        if not real_trades.empty and "Option Type" not in real_trades.columns:
-            real_trades["Option Type"] = real_trades.apply(get_trade_opt_type, axis=1)
-        if not trades.empty and "Option Type" not in trades.columns:
-            trades["Option Type"] = trades.apply(get_trade_opt_type, axis=1)
+        c_ts_map = {}
+        if candles_df is not None and not candles_df.empty and "timestamp" in candles_df.columns:
+            for _, c_row in candles_df.iterrows():
+                ts_key = str(c_row["timestamp"])[:19]
+                val = c_row.get("ltp", c_row.get("close"))
+                if val is not None and pd.notna(val):
+                    c_ts_map[ts_key] = float(val)
+
+        import re
+        def get_trade_instrument_and_opt_type(row):
+            # 1. Resolve active constructed instrument name
+            sym = str(row.get("symbol") or "").strip()
+            if not sym or sym.lower() in ("none", "nan", ""):
+                sym = str(active_instrument or inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or underlying_name or "").strip()
+
+            cfg_sym = str(inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "").strip()
+            cfg_eq = str(inst_cfg.get("equity_name") or active_instrument or "").strip()
+
+            if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                if cfg_sym and cfg_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_sym.upper()):
+                    sym = cfg_sym
+                elif cfg_eq and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq.upper()) and "OIPulse" not in cfg_eq:
+                    sym = cfg_eq
+
+            # 2. Resolve Index-LTP from oi_strength table
+            idx_ltp = np.nan
+            for k in ("index_ltp", "Index-LTP", "index_price"):
+                if k in row and pd.notna(row[k]):
+                    try:
+                        idx_ltp = round(float(row[k]), 2)
+                        break
+                    except Exception:
+                        pass
+
+            if pd.isna(idx_ltp):
+                e_ts = row.get("entry_time") or row.get("signal_time")
+                if e_ts and pd.notna(e_ts):
+                    try:
+                        dt = pd.to_datetime(e_ts)
+                        d_str = dt.strftime("%d-%m-%Y")
+                        t_str = dt.strftime("%H:%M:%S")
+
+                        if oi_cur:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time = ? LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                            if not r_ltp:
+                                oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time <= ? ORDER BY Time DESC LIMIT 1", (d_str, t_str))
+                                r_ltp = oi_cur.fetchone()
+                            if not r_ltp:
+                                oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time >= ? ORDER BY Time ASC LIMIT 1", (d_str, t_str))
+                                r_ltp = oi_cur.fetchone()
+                            if r_ltp and r_ltp[0] is not None:
+                                idx_ltp = round(float(r_ltp[0]), 2)
+                    except Exception:
+                        pass
+
+                    if pd.isna(idx_ltp):
+                        ts_k = str(e_ts)[:19]
+                        if ts_k in c_ts_map:
+                            idx_ltp = round(c_ts_map[ts_k], 2)
+
+            # 3. Resolve Option Type (CE or PE)
+            opt_t = ""
+            for k in ("opt_type", "option_type", "Option Type"):
+                if k in row and pd.notna(row[k]) and str(row[k]).strip() and str(row[k]).strip().lower() != "none":
+                    opt_t = str(row[k]).strip().upper()
+                    break
+
+            if not opt_t or opt_t == "-":
+                sym_upper = sym.upper()
+                m_sym = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym_upper) or re.search(r"\b(CE|PE)\b", sym_upper)
+                if m_sym:
+                    opt_t = m_sym.group(1)
+                elif sym in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                    cfg_opt = str(inst_cfg.get("option_type") or "").upper()
+                    cfg_eq_upper = cfg_eq.upper()
+                    m_eq = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq_upper)
+                    if "CE" in cfg_opt:
+                        opt_t = "CE"
+                    elif "PE" in cfg_opt:
+                        opt_t = "PE"
+                    elif m_eq:
+                        opt_t = m_eq.group(1)
+                    else:
+                        opt_t = "-"
+                else:
+                    opt_t = "-"
+
+            return pd.Series([sym, idx_ltp, opt_t], index=["Instrument", "Index-LTP", "Option Type"])
+
+        if not real_trades.empty:
+            real_trades[["Instrument", "Index-LTP", "Option Type"]] = real_trades.apply(get_trade_instrument_and_opt_type, axis=1)
+        if not trades.empty:
+            trades[["Instrument", "Index-LTP", "Option Type"]] = trades.apply(get_trade_instrument_and_opt_type, axis=1)
+
+        if oi_conn:
+            try:
+                oi_conn.close()
+            except Exception:
+                pass
 
         # Breakdowns
         b1, b2, b3 = st.columns(3)
@@ -924,7 +1436,7 @@ def render_paper_trade_module():
         df_trail["Display_ID"] = df_trail.apply(format_trade_id_display, axis=1)
 
         cols_wanted = [
-            "Display_ID", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
+            "Display_ID", "Instrument", "Index-LTP", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
             "quantity", "entry_price", "Margin used", "peak_gain",
             "5%", "10%", "15%", "20%", "25%", "30%",
             "exit_price", "stop_loss", "target",
@@ -945,7 +1457,7 @@ def render_paper_trade_module():
                 return ["color: #888888; font-style: italic; background-color: rgba(255, 255, 255, 0.02);"] * len(row)
             return [""] * len(row)
 
-        styled_trail = df_trail[display_cols].style.apply(highlight_active_rows, axis=1).format({
+        format_dict = {
             "entry_price": "₹{:.2f}",
             "exit_price": "₹{:.2f}",
             "gross_pnl": "₹{:+,.2f}",
@@ -954,7 +1466,9 @@ def render_paper_trade_module():
             "Margin used": "₹{:,.2f}",
             "stop_loss": "₹{:.2f}",
             "target": "₹{:.2f}",
-        }, na_rep="-")
+            "Index-LTP": "{:.2f}",
+        }
+        styled_trail = df_trail[display_cols].style.apply(highlight_active_rows, axis=1).format(format_dict, na_rep="-")
 
         st.dataframe(
             styled_trail,
@@ -962,6 +1476,8 @@ def render_paper_trade_module():
             hide_index=True,
             column_config={
                 "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily paper trade run identifier mapped to Strategy Name"),
+                "Instrument": st.column_config.TextColumn("Instrument", help="Active constructed instrument / contract symbol (option chain name)"),
+                "Index-LTP": st.column_config.NumberColumn("Index-LTP", help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)", format="%.2f"),
                 "Option Type": st.column_config.TextColumn("Option Type", help="Option contract type: CE (Call) or PE (Put)"),
                 "session_date": st.column_config.TextColumn("Session Date"),
                 "status": st.column_config.TextColumn("Status", help="ACTIVE (Open), CLOSED, or NO_TRADE"),
@@ -1056,128 +1572,20 @@ def render_paper_trade_module():
             )
 
         styled_trail_2 = trades_2.style.apply(highlight_active_rows, axis=1)
-        st.dataframe(styled_trail_2, use_container_width=True, hide_index=True)
+        st.dataframe(
+            styled_trail_2,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily paper trade run identifier mapped to Strategy Name"),
+                "Instrument": st.column_config.TextColumn("Instrument", help="Active constructed instrument / contract symbol (option chain name)"),
+                "Index-LTP": st.column_config.NumberColumn("Index-LTP", help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)", format="%.2f"),
+                "Option Type": st.column_config.TextColumn("Option Type", help="Option contract type: CE (Call) or PE (Put)"),
+            },
+        )
 
     else:
         st.info(f"No paper trades recorded yet for strategy `{selected_strat}` within the previous one month.")
-
-    # ==============================================================================
-    # Historical Raw Data (All Records)
-    # Filtered strictly for regular market trading hours (09:15:00 to 15:30:00 IST)
-    # ==============================================================================
-    st.markdown("---")
-    st.subheader("📊 Historical Raw Data (All Records)")
-
-    executed_dates = paper_db.get_executed_dates_for_strategy(selected_strat, max_days=30)
-    if not executed_dates and not trades.empty:
-        # Fallback to unique dates in trades table
-        executed_dates = [
-            str(d) for d in trades["session_date"].dropna().unique()
-            if str(d) >= one_month_ago_str
-        ]
-
-    # Load raw candles from local store / Kotak cache
-    timeframe_val = int(inst_cfg.get("timeframe", 5))
-    raw_df = pd.DataFrame()
-
-    candle_files = [
-        f"data/{active_instrument.lower()}_{timeframe_val}m.csv",
-        f"data/{active_instrument.lower()}_5m.csv",
-        "data/nifty26oct22500pe_5m.csv",
-        "data/nifty26oct22500pe_1m.csv",
-        "data/nifty_5m.csv",
-    ]
-    for cf in candle_files:
-        if os.path.exists(cf):
-            raw_df = load_csv(cf)
-            if raw_df is not None and not raw_df.empty:
-                break
-
-    if raw_df is not None and not raw_df.empty:
-        raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"])
-        if raw_df["timestamp"].dt.tz is not None:
-            raw_df["timestamp"] = raw_df["timestamp"].dt.tz_localize(None)
-
-        # Filter strictly for regular market hours (09:15 to 15:30)
-        raw_df = raw_df[
-            (raw_df["timestamp"].dt.time >= time(9, 15, 0)) &
-            (raw_df["timestamp"].dt.time <= time(15, 30, 0))
-        ].reset_index(drop=True)
-
-        # Filter strictly for previous one month
-        mask_month = (raw_df["timestamp"].dt.date >= one_month_ago) & (raw_df["timestamp"].dt.date <= today)
-
-        # Also filter strictly for dates where paper trades were executed
-        if executed_dates:
-            exec_dates_set = set(pd.to_datetime(d).date() for d in executed_dates)
-            mask_exec = raw_df["timestamp"].dt.date.isin(exec_dates_set)
-            filtered_raw = raw_df[mask_month & mask_exec].copy()
-            if filtered_raw.empty:
-                filtered_raw = raw_df[mask_month].copy()
-        else:
-            filtered_raw = raw_df[mask_month].copy()
-
-        if not filtered_raw.empty:
-            filtered_raw = filtered_raw.sort_values("timestamp").reset_index(drop=True)
-
-            # Direction Of Change
-            diff = filtered_raw["close"].diff()
-            direction_col = pd.Series("", index=filtered_raw.index, dtype=str)
-            direction_col[diff > 0] = "🟢 UP"
-            direction_col[diff < 0] = "🔴 DOWN"
-            if len(direction_col) > 0:
-                direction_col.iloc[0] = ""
-            filtered_raw["Direction Of Change"] = direction_col
-
-            def style_direction_cell(val):
-                if "UP" in str(val) or "🟢" in str(val):
-                    return "background-color: rgba(38, 166, 154, 0.22); color: #26a69a; font-weight: 700; border-radius: 4px;"
-                elif "DOWN" in str(val) or "🔴" in str(val):
-                    return "background-color: rgba(239, 83, 80, 0.22); color: #ef5350; font-weight: 700; border-radius: 4px;"
-                return ""
-
-            styled_raw = filtered_raw.style.map(
-                style_direction_cell, subset=["Direction Of Change"]
-            ).format({
-                "open": "{:.2f}",
-                "high": "{:.2f}",
-                "low": "{:.2f}",
-                "close": "{:.2f}",
-                "volume": "{:,.0f}",
-            })
-
-            st.caption(
-                f"Displaying **{len(filtered_raw):,}** historical records for paper trade executed dates within the previous 1 month "
-                f"(`{one_month_ago_str}` to `{today_str}`) strictly between 09:15:00 and 15:30:00 IST. Older data is excluded."
-            )
-
-            st.dataframe(
-                styled_raw,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "timestamp": st.column_config.TextColumn("timestamp"),
-                    "open": st.column_config.NumberColumn("open", format="%.2f"),
-                    "high": st.column_config.NumberColumn("high", format="%.2f"),
-                    "low": st.column_config.NumberColumn("low", format="%.2f"),
-                    "close": st.column_config.NumberColumn("close", format="%.2f"),
-                    "volume": st.column_config.NumberColumn("volume", format="%d"),
-                    "Direction Of Change": st.column_config.TextColumn("Direction Of Change"),
-                },
-            )
-
-            csv_bytes = filtered_raw.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download Historical Raw Data (CSV)",
-                data=csv_bytes,
-                file_name=f"{active_instrument}_paper_trade_raw_candles_{one_month_ago_str}_{today_str}.csv",
-                mime="text/csv",
-                key="btn_dl_raw_candles_paper",
-            )
-        else:
-            st.info(f"No historical raw candles found for paper trade executed dates between `{one_month_ago_str}` and `{today_str}`.")
-    else:
-        st.info("No raw candle dataset available for this instrument.")
 
     # ---------------- 2-Second Live Auto Refresh Loop ----------------
     if is_live_running:

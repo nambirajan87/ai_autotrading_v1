@@ -23,28 +23,142 @@ Usage:
 import sys
 import os
 import time
+import json
+import socket
+import shutil
+import subprocess
 import sqlite3
 import argparse
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional, Dict, Any, Tuple
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 DEBUG_PORT = 9222
 DEBUG_ADDRESS = f"127.0.0.1:{DEBUG_PORT}"
+OIPULSE_SIGNIN_URL = "https://oipulse.com/signin/"
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "backtest.db"
 _THREAD_NAME = "OIPulseSchedulerWorker"
+_LAST_CHROME_LAUNCH_TIME = 0.0
+
+def is_port_open(port: int = DEBUG_PORT, host: str = "127.0.0.1") -> bool:
+    """Checks if the Chrome remote debugging port is open and listening."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.3)
+            return s.connect_ex((host, port)) == 0
+    except Exception:
+        return False
+
+def get_chrome_executable() -> str | None:
+    """Discovers the Chrome executable path across standard installation locations."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%PROGRAMFILES%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%PROGRAMFILES(X86)%\Google\Chrome\Application\chrome.exe"),
+    ]
+    for p in candidates:
+        if p and os.path.exists(p):
+            return p
+
+    for name in ["chrome", "chrome.exe", "google-chrome"]:
+        found = shutil.which(name)
+        if found and os.path.exists(found):
+            return found
+    return None
+
+def ensure_chrome_running(url: str = OIPULSE_SIGNIN_URL, port: int = DEBUG_PORT, timeout: float = 6.0) -> bool:
+    """
+    Ensures Google Chrome is running with remote debugging enabled on the specified port.
+    If port is not active, triggers Chrome to open with the specified URL (https://oipulse.com/signin/).
+    """
+    global _LAST_CHROME_LAUNCH_TIME
+
+    if is_port_open(port):
+        return True
+
+    now = time.time()
+    # Debounce launch attempts within 10 seconds to avoid duplicate windows on reruns
+    if now - _LAST_CHROME_LAUNCH_TIME < 10.0:
+        deadline = now + min(timeout, 3.0)
+        while time.time() < deadline:
+            if is_port_open(port):
+                return True
+            time.sleep(0.3)
+        return is_port_open(port)
+
+    _LAST_CHROME_LAUNCH_TIME = now
+
+    chrome_path = get_chrome_executable()
+    if not chrome_path:
+        print("[!] Warning: Google Chrome executable not found in standard paths.")
+        return False
+
+    profile_dir = os.path.expandvars(r"%USERPROFILE%\ChromeOIProfile")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    print("=" * 65)
+    print(f"[*] Port {port} not active. Launching Chrome with remote debugging...")
+    print(f"    Target URL  : {url}")
+    print(f"    Debug Port  : {port}")
+    print(f"    User Profile: {profile_dir}")
+    print("=" * 65)
+
+    cmd = [
+        chrome_path,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        url
+    ]
+
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
+
+        subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+            close_fds=True
+        )
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.4)
+            if is_port_open(port):
+                print(f"[OK] Chrome remote debugging successfully started on port {port}!\n")
+                return True
+
+        if is_port_open(port):
+            return True
+
+        print(f"[!] Notice: Chrome process initiated, waiting for port {port} to bind.\n")
+        return False
+    except Exception as e:
+        print(f"[!] Error launching Chrome on port {port}: {e}")
+        return False
+
 
 def ensure_db_schema(db_path: Path = DEFAULT_DB_PATH):
     """
     Ensures table 'oi_strength' exists with all required columns,
-    including 'Trigger_Time'. Refills any NULL or empty Trigger_Time values.
+    including 'Trigger_Time' and 'Trigger_Count'. Enables WAL mode for high concurrency.
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=5000;")
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS oi_strength (
@@ -53,15 +167,18 @@ def ensure_db_schema(db_path: Path = DEFAULT_DB_PATH):
             Time TEXT,
             LTP REAL,
             Strength TEXT,
-            Trigger_Time TEXT
+            Trigger_Time TEXT,
+            Trigger_Count INTEGER
         )
     """)
 
-    # Check if Trigger_Time column exists
+    # Check if columns exist
     c.execute("PRAGMA table_info(oi_strength);")
     cols = [r[1] for r in c.fetchall()]
     if "Trigger_Time" not in cols:
         c.execute("ALTER TABLE oi_strength ADD COLUMN Trigger_Time TEXT;")
+    if "Trigger_Count" not in cols:
+        c.execute("ALTER TABLE oi_strength ADD COLUMN Trigger_Count INTEGER;")
 
     # Refill any empty or NULL Trigger_Time with current datetime
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -77,10 +194,14 @@ def save_record_to_db(record: dict, db_path: Path = DEFAULT_DB_PATH) -> int:
     """
     Inserts a single extracted Row 1 record into the oi_strength table.
     Returns the newly inserted row ID.
+    Using the same transaction / thread id, updates ActiveSchedulerConfig.last_row and live cache JSON
+    so the results page UI reflects the current values with zero DB transactions.
     """
     ensure_db_schema(db_path)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=5.0)
     c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA busy_timeout=5000;")
 
     date_val = str(record.get("Date", "")).strip()
     time_val = str(record.get("Time", "")).strip()
@@ -92,23 +213,83 @@ def save_record_to_db(record: dict, db_path: Path = DEFAULT_DB_PATH) -> int:
 
     strength_val = str(record.get("Strength", "")).strip()
     trigger_time = str(record.get("Trigger_Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))).strip()
+    trigger_count = int(record.get("Trigger_Count", 0) or 0)
 
     c.execute("""
-        INSERT OR REPLACE INTO oi_strength (Date, Time, LTP, Strength, Trigger_Time)
-        VALUES (?, ?, ?, ?, ?)
-    """, (date_val, time_val, ltp_val, strength_val, trigger_time))
+        INSERT OR REPLACE INTO oi_strength (Date, Time, LTP, Strength, Trigger_Time, Trigger_Count)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (date_val, time_val, ltp_val, strength_val, trigger_time, trigger_count))
 
     new_id = c.lastrowid
     conn.commit()
     conn.close()
+
+    # Using the same execution/thread, update in-memory cache directly (zero UI-to-DB transactions)
+    curr_thread_id = threading.get_ident()
+    auto_triggered = is_paper_trade_auto_triggered()
+    payload = {
+        "id": new_id,
+        "Date": date_val,
+        "Time": time_val,
+        "LTP": ltp_val,
+        "Strength": strength_val,
+        "Trigger_Time": trigger_time,
+        "Trigger_Count": trigger_count,
+        "thread_id": curr_thread_id,
+        "ts": time.time(),
+        "auto_paper_trade_active": auto_triggered,
+        "auto_paper_trade_time": "09:16:00",
+        "market_window": "Monday - Friday, 09:15 AM - 03:15 PM",
+        "status": "WATCHING_OI_STRENGTH" if auto_triggered else "STANDBY",
+    }
+    ActiveSchedulerConfig.last_row = payload
+    ActiveSchedulerConfig.trigger_count = trigger_count
+    ActiveSchedulerConfig.last_update_ts = time.time()
+    ActiveSchedulerConfig.last_thread_id = curr_thread_id
+
+    # Write atomic live cache JSON so any external process or UI tab syncs with zero SQLite transactions
+    try:
+        cache_path = db_path.parent / "oipulse_live_cache.json" if isinstance(db_path, Path) else Path(db_path).parent / "oipulse_live_cache.json"
+        tmp_path = cache_path.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        tmp_path.replace(cache_path)
+    except Exception:
+        pass
+
     return new_id
 
+AUTO_PAPER_TRIGGER_HOUR = 9
+AUTO_PAPER_TRIGGER_MIN = 16
 MARKET_START_HOUR = 9
 MARKET_START_MIN = 15
 MARKET_END_HOUR = 15
 MARKET_END_MIN = 15
 
-def get_next_trigger(now: datetime, batch_minutes: int = 1, offset_seconds: int = 10, market_hours_only: bool = True) -> datetime:
+def is_paper_trade_auto_triggered(now: Optional[datetime] = None) -> bool:
+    """
+    Checks if the current time and market window satisfies the 09:16 AM auto-trigger condition:
+    - Market Window: Monday - Friday, 09:15 AM - 03:15 PM
+    - Auto-trigger condition: fires at/after 09:16:00 AM up to 03:15:00 PM
+    - If market_hours_only is False (24x7 / MockLive): returns True anytime
+    """
+    if not getattr(ActiveSchedulerConfig, "market_hours_only", True):
+        return True
+
+    from datetime import time as dtime
+    if now is None:
+        now = datetime.now()
+
+    # Skip weekends (Saturday=5, Sunday=6)
+    if now.weekday() >= 5:
+        return False
+
+    t = now.time()
+    start_t = dtime(AUTO_PAPER_TRIGGER_HOUR, AUTO_PAPER_TRIGGER_MIN, 0)
+    end_t = dtime(MARKET_END_HOUR, MARKET_END_MIN, 0)
+    return start_t <= t <= end_t
+
+def get_next_trigger(now: datetime, batch_minutes: int = 1, offset_seconds: int = 13, market_hours_only: bool = True) -> datetime:
     """
     Calculates the exact next trigger datetime aligned to:
       minute % batch_minutes == 0 AND second == offset_seconds
@@ -174,6 +355,11 @@ class OIPulseDriver:
             except Exception:
                 self.driver = None
 
+        if not is_port_open(DEBUG_PORT):
+            ensure_chrome_running(url=OIPULSE_SIGNIN_URL, port=DEBUG_PORT)
+            if not is_port_open(DEBUG_PORT):
+                return None
+
         options = webdriver.ChromeOptions()
         options.add_experimental_option("debuggerAddress", self.address)
         try:
@@ -183,12 +369,8 @@ class OIPulseDriver:
             self.driver = None
             return None
 
-    def fetch_row1(self):
-        """Extracts Row 1 values: Date, Time, LTP, Strength."""
-        driver = self.connect()
-        if not driver:
-            return None
-
+    def fetch_row1(self, max_retries: int = 3, retry_delay: float = 0.8):
+        """Extracts Row 1 values: Date, Time, LTP, Strength with immediate retries if table DOM is re-rendering."""
         js_extract = """
         var row1 = null;
         var trs = document.querySelectorAll('tbody tr');
@@ -228,21 +410,129 @@ class OIPulseDriver:
             Strength: rStrength
         };
         """
-        try:
-            return driver.execute_script(js_extract)
-        except Exception as e:
-            print(f"[!] Extraction error: {e}")
-            return None
+        for attempt in range(max_retries):
+            driver = self.connect()
+            if not driver:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                continue
+
+            try:
+                res = driver.execute_script(js_extract)
+                if res and res.get("Date") and res.get("LTP") and res.get("Strength"):
+                    return res
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[!] Extraction error: {e}")
+
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+
+        return None
 
 class ActiveSchedulerConfig:
     batch_minutes = 1
-    offset_seconds = 10
+    offset_seconds = 13
     market_hours_only = True
+    trigger_count = 0
+    last_row = {}
+    last_update_ts = 0.0
+    last_thread_id = None
+    auto_paper_trade_triggered = False
+    auto_paper_trade_time = "09:16:00"
+    market_window_desc = "Monday - Friday, 09:15 AM - 03:15 PM"
 
-def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Path = DEFAULT_DB_PATH, run_once: bool = False, market_hours_only: bool = True, verbose: bool = True):
-    ActiveSchedulerConfig.batch_minutes = batch_minutes
-    ActiveSchedulerConfig.offset_seconds = offset_seconds
+def set_scheduler_market_hours_mode(market_hours_only: bool):
+    """Dynamically sets whether the scheduler restricts triggers to market hours."""
     ActiveSchedulerConfig.market_hours_only = market_hours_only
+
+def get_latest_oipulse_row(db_path: Path = DEFAULT_DB_PATH, prefer_memory: bool = False) -> Optional[dict]:
+    """Retrieves the latest triggered OI Pulse Row 1 record, always ensuring the latest trigger is reflected."""
+    in_mem = getattr(ActiveSchedulerConfig, "last_row", None)
+    cache_path = db_path.parent / "oipulse_live_cache.json" if isinstance(db_path, Path) else Path(db_path).parent / "oipulse_live_cache.json"
+
+    # Sync from live cache file if newer
+    if cache_path.exists():
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                file_row = json.load(f)
+            if file_row and file_row.get("LTP") is not None and file_row.get("Strength"):
+                if not in_mem or file_row.get("Trigger_Count", 0) > in_mem.get("Trigger_Count", 0) or file_row.get("id", 0) > in_mem.get("id", 0):
+                    in_mem = file_row
+                    ActiveSchedulerConfig.last_row = file_row
+                    ActiveSchedulerConfig.trigger_count = file_row.get("Trigger_Count", 0)
+        except Exception:
+            pass
+
+    if not os.path.exists(db_path):
+        return in_mem if in_mem else None
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=3.0)
+        c = conn.cursor()
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA busy_timeout=5000;")
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='oi_strength'")
+        if not c.fetchone():
+            conn.close()
+            return in_mem if in_mem else None
+
+        c.execute("PRAGMA table_info(oi_strength);")
+        cols = [r[1] for r in c.fetchall()]
+        has_tc = "Trigger_Count" in cols
+
+        c.execute("SELECT id, Date, Time, LTP, Strength, Trigger_Time" + (", Trigger_Count" if has_tc else "") + " FROM oi_strength ORDER BY id DESC LIMIT 1")
+        row = c.fetchone()
+        conn.close()
+        if not row:
+            return in_mem if in_mem else None
+
+        tc = row[6] if has_tc and len(row) > 6 and row[6] else None
+        if tc is None or tc > 50000:
+            active_tc = getattr(ActiveSchedulerConfig, "trigger_count", 0)
+            if active_tc and 0 < active_tc < 50000:
+                tc = active_tc
+            else:
+                baseline = 82680
+                try:
+                    conn2 = sqlite3.connect(db_path, timeout=3.0)
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT MAX(id) FROM oi_strength WHERE Date != ?", (row[1],))
+                    m = c2.fetchone()
+                    conn2.close()
+                    if m and m[0]:
+                        baseline = m[0]
+                except Exception:
+                    pass
+                tc = max(1, row[0] - baseline)
+
+        db_res = {
+            "id": row[0],
+            "Date": row[1] or "",
+            "Time": row[2] or "",
+            "LTP": float(row[3]) if row[3] is not None else 0.0,
+            "Strength": str(row[4]) if row[4] else "0%",
+            "Trigger_Time": row[5] or "",
+            "Trigger_Count": tc,
+        }
+
+        # If in_mem has a higher trigger count or higher id, prefer in_mem; otherwise use db_res and sync in_mem
+        if in_mem and (in_mem.get("id", 0) > db_res["id"] or in_mem.get("Trigger_Count", 0) > db_res.get("Trigger_Count", 0)):
+            return in_mem
+
+        ActiveSchedulerConfig.last_row = db_res
+        ActiveSchedulerConfig.trigger_count = tc
+        return db_res
+    except Exception:
+        return in_mem if in_mem else None
+
+def run_scheduler(batch_minutes: Optional[int] = None, offset_seconds: Optional[int] = None, db_path: Path = DEFAULT_DB_PATH, run_once: bool = False, market_hours_only: Optional[bool] = None, verbose: bool = True):
+    if batch_minutes is not None:
+        ActiveSchedulerConfig.batch_minutes = batch_minutes
+    if offset_seconds is not None:
+        ActiveSchedulerConfig.offset_seconds = offset_seconds
+    if market_hours_only is not None:
+        ActiveSchedulerConfig.market_hours_only = market_hours_only
 
     if verbose:
         print("=" * 65)
@@ -251,6 +541,7 @@ def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Pat
         print(f"Batch Time     : {ActiveSchedulerConfig.batch_minutes} minute(s)")
         print(f"Trigger Target : Every {ActiveSchedulerConfig.batch_minutes}m at :{ActiveSchedulerConfig.offset_seconds:02d}s (hh:mm:{ActiveSchedulerConfig.offset_seconds:02d})")
         print(f"Market Window  : {'Monday - Friday, 09:15 AM - 03:15 PM' if ActiveSchedulerConfig.market_hours_only else '24x7 (Anytime)'}")
+        print(f"Paper Trigger  : Auto-trigger 'Execute Paper Trade' at 09:16 AM (Watching OI Strength)")
         print(f"Attached Port  : {DEBUG_PORT}")
         print(f"Target DB      : {db_path} -> table 'oi_strength'")
         print("=" * 65 + "\n")
@@ -291,6 +582,14 @@ def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Pat
         curr_market_only = ActiveSchedulerConfig.market_hours_only
 
         now = datetime.now()
+        auto_trig = is_paper_trade_auto_triggered(now)
+        if auto_trig and not getattr(ActiveSchedulerConfig, "auto_paper_trade_triggered", False):
+            ActiveSchedulerConfig.auto_paper_trade_triggered = True
+            if verbose:
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [AUTO-TRIGGER] 09:16 AM reached -> Auto-triggering 'Execute Paper Trade' (Watching OI Strength)...\n")
+        elif not auto_trig:
+            ActiveSchedulerConfig.auto_paper_trade_triggered = False
+
         next_trigger = get_next_trigger(now, curr_batch, curr_offset, market_hours_only=curr_market_only)
         sleep_sec = (next_trigger - now).total_seconds()
 
@@ -304,10 +603,11 @@ def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Pat
         if sleep_sec > 0:
             time.sleep(sleep_sec)
 
-        # Trigger execution at hh:mm:10
+        # Trigger execution at hh:mm:offset_seconds
         trigger_time = datetime.now()
         trigger_str = trigger_time.strftime("%Y-%m-%d %H:%M:%S")
         trigger_count += 1
+        ActiveSchedulerConfig.trigger_count = trigger_count
 
         if verbose:
             print(f"\n[{trigger_str}] [TRIGGER #{trigger_count}] Fetching Row 1...")
@@ -315,7 +615,12 @@ def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Pat
 
         if data:
             data["Trigger_Time"] = trigger_str
+            data["Trigger_Count"] = trigger_count
             row_id = save_record_to_db(data, db_path)
+            data["id"] = row_id
+            ActiveSchedulerConfig.last_row = data
+            ActiveSchedulerConfig.trigger_count = trigger_count
+            ActiveSchedulerConfig.last_update_ts = time.time()
             if verbose:
                 print("+-------------------------------------------------------------+")
                 print(f"| Trigger   : {trigger_str:<48}|")
@@ -328,20 +633,37 @@ def run_scheduler(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Pat
                 print(f"   -> Inserted into oi_strength table (ID: {row_id})\n")
         else:
             if verbose:
-                print("[!] Notice: Chrome session on port 9222 not reachable or table not ready.")
+                if not is_port_open(DEBUG_PORT):
+                    print(f"[!] Notice: Chrome session on port {DEBUG_PORT} not reachable. Attempting auto-launch...")
+                else:
+                    print(f"[!] Notice: Chrome session on port {DEBUG_PORT} is connected, but OI Pulse table not loaded yet.")
+                    print("    (Please log in at https://oipulse.com/signin/ and keep the Trending OI table open)")
                 print("    Will retry automatically on next trigger interval.\n")
 
         # Brief pause to ensure we don't double trigger in the same second
         time.sleep(1.0)
 
-def start_oipulse_scheduler_background(batch_minutes: int = 1, offset_seconds: int = 10, db_path: Path = DEFAULT_DB_PATH, market_hours_only: bool = True) -> bool:
+def start_oipulse_scheduler_background(batch_minutes: Optional[int] = None, offset_seconds: Optional[int] = None, db_path: Path = DEFAULT_DB_PATH, market_hours_only: Optional[bool] = None, auto_launch_chrome: bool = True) -> bool:
     """
     Starts the scheduler as a background daemon thread.
     Safe across Streamlit server reruns (checks if already running and updates config dynamically).
     """
-    ActiveSchedulerConfig.batch_minutes = batch_minutes
-    ActiveSchedulerConfig.offset_seconds = offset_seconds
-    ActiveSchedulerConfig.market_hours_only = market_hours_only
+    if batch_minutes is not None:
+        ActiveSchedulerConfig.batch_minutes = batch_minutes
+    if offset_seconds is not None:
+        ActiveSchedulerConfig.offset_seconds = offset_seconds
+    if market_hours_only is not None:
+        ActiveSchedulerConfig.market_hours_only = market_hours_only
+
+    b_min = ActiveSchedulerConfig.batch_minutes
+    o_sec = ActiveSchedulerConfig.offset_seconds
+    m_only = ActiveSchedulerConfig.market_hours_only
+
+    if auto_launch_chrome:
+        try:
+            ensure_chrome_running(url=OIPULSE_SIGNIN_URL, port=DEBUG_PORT)
+        except Exception as e:
+            print(f"[!] Warning: Chrome auto-launch encountered error: {e}")
 
     for t in threading.enumerate():
         if t.name == _THREAD_NAME and t.is_alive():
@@ -349,14 +671,14 @@ def start_oipulse_scheduler_background(batch_minutes: int = 1, offset_seconds: i
 
     def _worker():
         try:
-            window_desc = "Mon-Fri 09:15-15:15" if market_hours_only else "24x7"
-            print(f"[OI Pulse Scheduler] Background thread started (Interval: {batch_minutes}m, Trigger: :{offset_seconds:02d}s, Window: {window_desc}, DB: {db_path.name})")
+            window_desc = "Mon-Fri 09:15-15:15" if m_only else "24x7"
+            print(f"[OI Pulse Scheduler] Background thread started (Interval: {b_min}m, Trigger: :{o_sec:02d}s, Window: {window_desc}, DB: {db_path.name})")
             run_scheduler(
-                batch_minutes=batch_minutes,
-                offset_seconds=offset_seconds,
+                batch_minutes=b_min,
+                offset_seconds=o_sec,
                 db_path=db_path,
                 run_once=False,
-                market_hours_only=market_hours_only,
+                market_hours_only=m_only,
                 verbose=True
             )
         except Exception as e:
@@ -369,7 +691,7 @@ def start_oipulse_scheduler_background(batch_minutes: int = 1, offset_seconds: i
 def main():
     parser = argparse.ArgumentParser(description="OI Pulse Live Strength Scheduler")
     parser.add_argument("-b", "--batch", type=int, default=1, help="Batch time in minutes (default: 1)")
-    parser.add_argument("-s", "--offset", type=int, default=10, help="Offset seconds in minute to trigger on (default: 10)")
+    parser.add_argument("-s", "--offset", type=int, default=13, help="Offset seconds in minute to trigger on (default: 13)")
     parser.add_argument("--db", type=str, default=str(DEFAULT_DB_PATH), help="Target SQLite DB path")
     parser.add_argument("--once", action="store_true", help="Fetch Row 1 once immediately, insert into DB, and exit")
     parser.add_argument("--anytime", action="store_true", help="Run 24x7 without restricting to Mon-Fri 09:15-15:15 market hours")

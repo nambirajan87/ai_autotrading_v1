@@ -427,17 +427,27 @@ class LiveTradeDatabase:
         strategy_name: str,
         symbol: Optional[str] = None,
         max_days: int = 30,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieves all live trades for the strategy within the previous one month (max_days).
+        Retrieves all live trades for the strategy within the date range or previous one month (max_days).
         Older records are strictly excluded.
         Also synthesizes 'No Trade' records for session days evaluated with 0 trades.
         """
-        from datetime import date, timedelta
-        cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
+        if start_date:
+            cutoff_date = str(start_date)
+        else:
+            from datetime import date, timedelta
+            cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
 
         query = "SELECT * FROM live_trades WHERE strategy_name = ? AND (session_date >= ? OR (session_date IS NULL AND entry_time >= ?))"
         params: List[Any] = [strategy_name, cutoff_date, cutoff_date]
+        if end_date:
+            end_date_str = str(end_date)
+            end_date_ts = f"{end_date_str} 23:59:59" if len(end_date_str) == 10 else end_date_str
+            query += " AND (session_date <= ? OR (session_date IS NULL AND entry_time <= ?))"
+            params.extend([end_date_str, end_date_ts])
         if symbol and symbol != "ALL":
             query += " AND symbol = ?"
             params.append(symbol)
@@ -449,6 +459,11 @@ class LiveTradeDatabase:
             # Also check for 'NO_TRADE' sessions
             sess_query = "SELECT * FROM live_sessions WHERE strategy_name = ? AND (total_trades = 0 OR status = 'NO_TRADE') AND created_at >= ?"
             sess_params: List[Any] = [strategy_name, cutoff_date]
+            if end_date:
+                end_date_str = str(end_date)
+                end_date_ts = f"{end_date_str} 23:59:59" if len(end_date_str) == 10 else end_date_str
+                sess_query += " AND created_at <= ?"
+                sess_params.append(end_date_ts)
             if symbol and symbol != "ALL":
                 sess_query += " AND symbol = ?"
                 sess_params.append(symbol)
@@ -495,12 +510,22 @@ class LiveTradeDatabase:
         strategy_name: str,
         symbol: Optional[str] = None,
         max_days: int = 30,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> List[str]:
-        """Returns unique dates (within previous one month) when live trades were executed."""
-        from datetime import date, timedelta
-        cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
+        """Returns unique dates (within date range or previous one month) when live trades were executed."""
+        if start_date:
+            cutoff_date = str(start_date)
+        else:
+            from datetime import date, timedelta
+            cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
         query = "SELECT DISTINCT COALESCE(session_date, SUBSTR(entry_time, 1, 10)) as dt FROM live_trades WHERE strategy_name = ? AND status != 'NO_TRADE' AND (session_date >= ? OR entry_time >= ?)"
         params: List[Any] = [strategy_name, cutoff_date, cutoff_date]
+        if end_date:
+            end_date_str = str(end_date)
+            end_date_ts = f"{end_date_str} 23:59:59" if len(end_date_str) == 10 else end_date_str
+            query += " AND (session_date <= ? OR entry_time <= ?)"
+            params.extend([end_date_str, end_date_ts])
         if symbol and symbol != "ALL":
             query += " AND symbol = ?"
             params.append(symbol)

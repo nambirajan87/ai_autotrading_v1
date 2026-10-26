@@ -345,6 +345,7 @@ def render_live_trade_module():
     # Check date settings against current date
     date_is_current = (strat_from == today_str and strat_to == today_str)
     is_mkt_open, mkt_msg = check_market_trading_hours()
+    mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
 
     pt_col1, pt_col2, pt_col3 = st.columns([3, 2, 2])
     with pt_col1:
@@ -481,7 +482,7 @@ def render_live_trade_module():
     if live_ltp <= 0 and candles_df is not None and not candles_df.empty:
         live_ltp = float(candles_df.iloc[-1]["close"])
 
-    # Display Live Ticker & Order Book metrics
+        # Display Live Ticker & Order Book metrics
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
     m_col1.metric("Live Tick (LTP)", f"₹{live_ltp:,.2f}", f"Kotak: {depth.get('status', 'LIVE')}")
     if candles_df is not None and not candles_df.empty:
@@ -646,7 +647,7 @@ def render_live_trade_module():
                 entry_fill_price = float(entry_order.fill_price or entry_p)
 
                 # Place Target limit order
-                gw.place_target_order(
+                tgt_order = gw.place_target_order(
                     symbol=trade_symbol,
                     side="SELL",
                     quantity=lot_size,
@@ -654,7 +655,7 @@ def render_live_trade_module():
                 )
 
                 # Place Stop Loss SL-M order
-                gw.place_stoploss_order(
+                sl_order = gw.place_stoploss_order(
                     symbol=trade_symbol,
                     side="SELL",
                     quantity=lot_size,
@@ -696,7 +697,7 @@ def render_live_trade_module():
                 entry_fill_price = float(entry_order.fill_price or entry_p)
 
                 # Place Target limit order
-                gw.place_target_order(
+                tgt_order = gw.place_target_order(
                     symbol=trade_symbol,
                     side="BUY",
                     quantity=lot_size,
@@ -704,7 +705,7 @@ def render_live_trade_module():
                 )
 
                 # Place Stop Loss SL-M order
-                gw.place_stoploss_order(
+                sl_order = gw.place_stoploss_order(
                     symbol=trade_symbol,
                     side="BUY",
                     quantity=lot_size,
@@ -739,9 +740,7 @@ def render_live_trade_module():
 
             now_time = datetime.now().time()
             exit_triggered = None
-            if now_time >= strategy_sq_time:
-                exit_triggered = "SQUARE_OFF"
-            elif not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time:
+            if now_time >= strategy_sq_time or (not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time):
                 exit_triggered = "SQUARE_OFF"
             elif e_side == "LONG":
                 if tgt > 0 and live_ltp >= tgt:
@@ -956,28 +955,116 @@ def render_live_trade_module():
                     monthly_pnl = monthly_pnl.sort_values("month_key").set_index("month_label")["net_pnl"]
                     st.bar_chart(monthly_pnl)
 
-        import re
-        def get_trade_opt_type(row):
-            for k in ("Option Type", "option_type", "opt_type"):
-                if k in row and pd.notna(row[k]):
-                    v = str(row[k]).strip().upper()
-                    if v in ("CE", "PE"):
-                        return v
-            sym = str(row.get("symbol") or active_instrument or "").strip().upper()
-            m = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym) or re.search(r"\b(CE|PE)\b", sym)
-            if m:
-                return m.group(1)
-            cfg_opt = str(inst_cfg.get("option_type") or "").strip().upper()
-            if "CE" in cfg_opt:
-                return "CE"
-            elif "PE" in cfg_opt:
-                return "PE"
-            return "-"
+        import sqlite3
+        db_oi_file = PROJECT_ROOT / "data" / "backtest.db"
+        oi_conn = None
+        if os.path.exists(db_oi_file):
+            try:
+                oi_conn = sqlite3.connect(db_oi_file)
+            except Exception:
+                oi_conn = None
+        oi_cur = oi_conn.cursor() if oi_conn else None
 
-        if not real_trades.empty and "Option Type" not in real_trades.columns:
-            real_trades["Option Type"] = real_trades.apply(get_trade_opt_type, axis=1)
-        if not trades.empty and "Option Type" not in trades.columns:
-            trades["Option Type"] = trades.apply(get_trade_opt_type, axis=1)
+        c_ts_map = {}
+        if candles_df is not None and not candles_df.empty and "timestamp" in candles_df.columns:
+            for _, c_row in candles_df.iterrows():
+                ts_key = str(c_row["timestamp"])[:19]
+                val = c_row.get("ltp", c_row.get("close"))
+                if val is not None and pd.notna(val):
+                    c_ts_map[ts_key] = float(val)
+
+        import re
+        def get_trade_instrument_and_opt_type(row):
+            # 1. Resolve active constructed instrument name
+            sym = str(row.get("symbol") or "").strip()
+            if not sym or sym.lower() in ("none", "nan", ""):
+                sym = str(active_instrument or inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or underlying_name or "").strip()
+
+            cfg_sym = str(inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "").strip()
+            cfg_eq = str(inst_cfg.get("equity_name") or active_instrument or "").strip()
+
+            if sym in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                if cfg_sym and cfg_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY") and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_sym.upper()):
+                    sym = cfg_sym
+                elif cfg_eq and re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq.upper()) and "OIPulse" not in cfg_eq:
+                    sym = cfg_eq
+
+            # 2. Resolve Index-LTP from oi_strength table
+            idx_ltp = np.nan
+            for k in ("index_ltp", "Index-LTP", "index_price"):
+                if k in row and pd.notna(row[k]):
+                    try:
+                        idx_ltp = round(float(row[k]), 2)
+                        break
+                    except Exception:
+                        pass
+
+            if pd.isna(idx_ltp):
+                e_ts = row.get("entry_time") or row.get("signal_time")
+                if e_ts and pd.notna(e_ts):
+                    try:
+                        dt = pd.to_datetime(e_ts)
+                        d_str = dt.strftime("%d-%m-%Y")
+                        t_str = dt.strftime("%H:%M:%S")
+
+                        if oi_cur:
+                            oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time = ? LIMIT 1", (d_str, t_str))
+                            r_ltp = oi_cur.fetchone()
+                            if not r_ltp:
+                                oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time <= ? ORDER BY Time DESC LIMIT 1", (d_str, t_str))
+                                r_ltp = oi_cur.fetchone()
+                            if not r_ltp:
+                                oi_cur.execute("SELECT LTP FROM oi_strength WHERE Date = ? AND Time >= ? ORDER BY Time ASC LIMIT 1", (d_str, t_str))
+                                r_ltp = oi_cur.fetchone()
+                            if r_ltp and r_ltp[0] is not None:
+                                idx_ltp = round(float(r_ltp[0]), 2)
+                    except Exception:
+                        pass
+
+                    if pd.isna(idx_ltp):
+                        ts_k = str(e_ts)[:19]
+                        if ts_k in c_ts_map:
+                            idx_ltp = round(c_ts_map[ts_k], 2)
+
+            # 3. Resolve Option Type (CE or PE)
+            opt_t = ""
+            for k in ("opt_type", "option_type", "Option Type"):
+                if k in row and pd.notna(row[k]) and str(row[k]).strip() and str(row[k]).strip().lower() != "none":
+                    opt_t = str(row[k]).strip().upper()
+                    break
+
+            if not opt_t or opt_t == "-":
+                sym_upper = sym.upper()
+                m_sym = re.search(r"(?:^|[_\-\s\d])(CE|PE)$", sym_upper) or re.search(r"\b(CE|PE)\b", sym_upper)
+                if m_sym:
+                    opt_t = m_sym.group(1)
+                elif sym in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                    cfg_opt = str(inst_cfg.get("option_type") or "").upper()
+                    cfg_eq_upper = cfg_eq.upper()
+                    m_eq = re.search(r"(?:\d+[\s\-_]?|\b)(CE|PE)$", cfg_eq_upper)
+                    if "CE" in cfg_opt:
+                        opt_t = "CE"
+                    elif "PE" in cfg_opt:
+                        opt_t = "PE"
+                    elif m_eq:
+                        opt_t = m_eq.group(1)
+                    else:
+                        opt_t = "-"
+                else:
+                    opt_t = "-"
+
+            return pd.Series([sym, idx_ltp, opt_t], index=["Instrument", "Index-LTP", "Option Type"])
+
+        if not real_trades.empty:
+            real_trades[["Instrument", "Index-LTP", "Option Type"]] = real_trades.apply(get_trade_instrument_and_opt_type, axis=1)
+        if not trades.empty:
+            trades[["Instrument", "Index-LTP", "Option Type"]] = trades.apply(get_trade_instrument_and_opt_type, axis=1)
+
+        if oi_conn:
+            try:
+                oi_conn.close()
+            except Exception:
+                pass
 
         # Breakdowns
         b1, b2, b3 = st.columns(3)
@@ -1073,7 +1160,7 @@ def render_live_trade_module():
         df_trail["Display_ID"] = df_trail.apply(format_trade_id_display, axis=1)
 
         cols_wanted = [
-            "Display_ID", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
+            "Display_ID", "Instrument", "Index-LTP", "Option Type", "side", "regime", "Calculated_Score", "session_date", "entry_time", "exit_time",
             "quantity", "entry_price", "Margin used", "peak_gain",
             "5%", "10%", "15%", "20%", "25%", "30%",
             "exit_price", "stop_loss", "target",
@@ -1094,7 +1181,7 @@ def render_live_trade_module():
                 return ["color: #888888; font-style: italic; background-color: rgba(255, 255, 255, 0.02);"] * len(row)
             return [""] * len(row)
 
-        styled_trail = df_trail[display_cols].style.apply(highlight_active_rows, axis=1).format({
+        format_dict = {
             "entry_price": "₹{:.2f}",
             "exit_price": "₹{:.2f}",
             "gross_pnl": "₹{:+,.2f}",
@@ -1103,7 +1190,9 @@ def render_live_trade_module():
             "Margin used": "₹{:,.2f}",
             "stop_loss": "₹{:.2f}",
             "target": "₹{:.2f}",
-        }, na_rep="-")
+            "Index-LTP": "{:.2f}",
+        }
+        styled_trail = df_trail[display_cols].style.apply(highlight_active_rows, axis=1).format(format_dict, na_rep="-")
 
         st.dataframe(
             styled_trail,
@@ -1111,6 +1200,8 @@ def render_live_trade_module():
             hide_index=True,
             column_config={
                 "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
+                "Instrument": st.column_config.TextColumn("Instrument", help="Active constructed instrument / contract symbol (option chain name)"),
+                "Index-LTP": st.column_config.NumberColumn("Index-LTP", help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)", format="%.2f"),
                 "Option Type": st.column_config.TextColumn("Option Type", help="Option contract type: CE (Call) or PE (Put)"),
                 "session_date": st.column_config.TextColumn("Session Date"),
                 "status": st.column_config.TextColumn("Status", help="ACTIVE (Open), CLOSED, or NO_TRADE"),
@@ -1205,128 +1296,20 @@ def render_live_trade_module():
             )
 
         styled_trail_2 = trades_2.style.apply(highlight_active_rows, axis=1)
-        st.dataframe(styled_trail_2, use_container_width=True, hide_index=True)
+        st.dataframe(
+            styled_trail_2,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
+                "Instrument": st.column_config.TextColumn("Instrument", help="Active constructed instrument / contract symbol (option chain name)"),
+                "Index-LTP": st.column_config.NumberColumn("Index-LTP", help="Underlying Index LTP from oi_strength table at trade entry (used to validate constructed option strike)", format="%.2f"),
+                "Option Type": st.column_config.TextColumn("Option Type", help="Option contract type: CE (Call) or PE (Put)"),
+            },
+        )
 
     else:
         st.info(f"No live trades recorded yet for strategy `{selected_strat}` within the previous one month.")
-
-    # ==============================================================================
-    # Historical Raw Data (All Records)
-    # Filtered strictly for regular market trading hours (09:15:00 to 15:30:00 IST)
-    # ==============================================================================
-    st.markdown("---")
-    st.subheader("📊 Historical Raw Data (All Records)")
-
-    executed_dates = live_db.get_executed_dates_for_strategy(selected_strat, max_days=30)
-    if not executed_dates and not trades.empty:
-        # Fallback to unique dates in trades table
-        executed_dates = [
-            str(d) for d in trades["session_date"].dropna().unique()
-            if str(d) >= one_month_ago_str
-        ]
-
-    # Load raw candles from local store / Kotak cache
-    timeframe_val = int(inst_cfg.get("timeframe", 5))
-    raw_df = pd.DataFrame()
-
-    candle_files = [
-        f"data/{active_instrument.lower()}_{timeframe_val}m.csv",
-        f"data/{active_instrument.lower()}_5m.csv",
-        "data/nifty26oct22500pe_5m.csv",
-        "data/nifty26oct22500pe_1m.csv",
-        "data/nifty_5m.csv",
-    ]
-    for cf in candle_files:
-        if os.path.exists(cf):
-            raw_df = load_csv(cf)
-            if raw_df is not None and not raw_df.empty:
-                break
-
-    if raw_df is not None and not raw_df.empty:
-        raw_df["timestamp"] = pd.to_datetime(raw_df["timestamp"])
-        if raw_df["timestamp"].dt.tz is not None:
-            raw_df["timestamp"] = raw_df["timestamp"].dt.tz_localize(None)
-
-        # Filter strictly for regular market hours (09:15 to 15:30)
-        raw_df = raw_df[
-            (raw_df["timestamp"].dt.time >= time(9, 15, 0)) &
-            (raw_df["timestamp"].dt.time <= time(15, 30, 0))
-        ].reset_index(drop=True)
-
-        # Filter strictly for previous one month
-        mask_month = (raw_df["timestamp"].dt.date >= one_month_ago) & (raw_df["timestamp"].dt.date <= today)
-
-        # Also filter strictly for dates where live trades were executed
-        if executed_dates:
-            exec_dates_set = set(pd.to_datetime(d).date() for d in executed_dates)
-            mask_exec = raw_df["timestamp"].dt.date.isin(exec_dates_set)
-            filtered_raw = raw_df[mask_month & mask_exec].copy()
-            if filtered_raw.empty:
-                filtered_raw = raw_df[mask_month].copy()
-        else:
-            filtered_raw = raw_df[mask_month].copy()
-
-        if not filtered_raw.empty:
-            filtered_raw = filtered_raw.sort_values("timestamp").reset_index(drop=True)
-
-            # Direction Of Change
-            diff = filtered_raw["close"].diff()
-            direction_col = pd.Series("", index=filtered_raw.index, dtype=str)
-            direction_col[diff > 0] = "🟢 UP"
-            direction_col[diff < 0] = "🔴 DOWN"
-            if len(direction_col) > 0:
-                direction_col.iloc[0] = ""
-            filtered_raw["Direction Of Change"] = direction_col
-
-            def style_direction_cell(val):
-                if "UP" in str(val) or "🟢" in str(val):
-                    return "background-color: rgba(38, 166, 154, 0.22); color: #26a69a; font-weight: 700; border-radius: 4px;"
-                elif "DOWN" in str(val) or "🔴" in str(val):
-                    return "background-color: rgba(239, 83, 80, 0.22); color: #ef5350; font-weight: 700; border-radius: 4px;"
-                return ""
-
-            styled_raw = filtered_raw.style.map(
-                style_direction_cell, subset=["Direction Of Change"]
-            ).format({
-                "open": "{:.2f}",
-                "high": "{:.2f}",
-                "low": "{:.2f}",
-                "close": "{:.2f}",
-                "volume": "{:,.0f}",
-            })
-
-            st.caption(
-                f"Displaying **{len(filtered_raw):,}** historical records for live trade executed dates within the previous 1 month "
-                f"(`{one_month_ago_str}` to `{today_str}`) strictly between 09:15:00 and 15:30:00 IST. Older data is excluded."
-            )
-
-            st.dataframe(
-                styled_raw,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "timestamp": st.column_config.TextColumn("timestamp"),
-                    "open": st.column_config.NumberColumn("open", format="%.2f"),
-                    "high": st.column_config.NumberColumn("high", format="%.2f"),
-                    "low": st.column_config.NumberColumn("low", format="%.2f"),
-                    "close": st.column_config.NumberColumn("close", format="%.2f"),
-                    "volume": st.column_config.NumberColumn("volume", format="%d"),
-                    "Direction Of Change": st.column_config.TextColumn("Direction Of Change"),
-                },
-            )
-
-            csv_bytes = filtered_raw.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download Historical Raw Data (CSV)",
-                data=csv_bytes,
-                file_name=f"{active_instrument}_live_trade_raw_candles_{one_month_ago_str}_{today_str}.csv",
-                mime="text/csv",
-                key="btn_dl_raw_candles_live",
-            )
-        else:
-            st.info(f"No historical raw candles found for live trade executed dates between `{one_month_ago_str}` and `{today_str}`.")
-    else:
-        st.info("No raw candle dataset available for this instrument.")
 
     # ---------------- 2-Second Live Auto Refresh Loop ----------------
     if is_live_running:

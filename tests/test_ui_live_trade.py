@@ -236,3 +236,75 @@ def test_live_trade_constant_sections_timing_and_content():
     assert "Signal bar close check -> Last Signal Bar:" in sec2_text
     assert "Continuous 2s LTP, chart & exit monitoring active." in sec2_text
 
+
+def test_strategy_period_display_resolution_from_strategy_config_live():
+    strat_def = get_strategy("NIFTY26OCT22500PE_BOTH_PAPERTRADE_TEST_HUL_ST")
+    assert strat_def is not None
+    inst_cfg = strat_def.get("instrument", {})
+
+    today_str = str(date.today())
+    one_month_ago_str = str(date.today() - timedelta(days=30))
+
+    strat_from = str(
+        inst_cfg.get("start_date")
+        or inst_cfg.get("from_date")
+        or inst_cfg.get("date_from")
+        or strat_def.get("start_date")
+        or strat_def.get("from_date")
+        or strat_def.get("date_from")
+        or strat_def.get("config", {}).get("instrument", {}).get("start_date")
+        or one_month_ago_str
+    )
+    strat_to = str(
+        inst_cfg.get("end_date")
+        or inst_cfg.get("to_date")
+        or inst_cfg.get("date_to")
+        or strat_def.get("end_date")
+        or strat_def.get("to_date")
+        or strat_def.get("date_to")
+        or strat_def.get("config", {}).get("instrument", {}).get("end_date")
+        or today_str
+    )
+
+    # Strategy dates must be from stored strategy config (2026-09-21 to 2026-10-20)
+    assert strat_from == "2026-09-21"
+    assert strat_to == "2026-10-20"
+
+
+def test_live_database_start_and_end_date_filtering(temp_live_db):
+    temp_live_db.save_active_trade(
+        strategy_name="DATE_RANGE_LIVE_TEST",
+        symbol="NIFTY26OCT22500PE",
+        session_date="2026-10-05",
+        trade_id=201,
+        side="LONG",
+        quantity=65,
+        entry_time="2026-10-05 10:00:00",
+        entry_price=100.0,
+    )
+    temp_live_db.save_active_trade(
+        strategy_name="DATE_RANGE_LIVE_TEST",
+        symbol="NIFTY26OCT22500PE",
+        session_date="2026-10-15",
+        trade_id=202,
+        side="SHORT",
+        quantity=65,
+        entry_time="2026-10-15 10:00:00",
+        entry_price=120.0,
+    )
+
+    # Filter between 2026-10-01 and 2026-10-10 (should only get 2026-10-05)
+    t1 = temp_live_db.get_accumulated_trades_for_strategy(
+        "DATE_RANGE_LIVE_TEST", start_date="2026-10-01", end_date="2026-10-10"
+    )
+    assert len(t1) == 1
+    assert t1[0]["session_date"] == "2026-10-05"
+
+    # Filter between 2026-10-10 and 2026-10-20 (should only get 2026-10-15)
+    t2 = temp_live_db.get_accumulated_trades_for_strategy(
+        "DATE_RANGE_LIVE_TEST", start_date="2026-10-10", end_date="2026-10-20"
+    )
+    assert len(t2) == 1
+    assert t2[0]["session_date"] == "2026-10-15"
+
+

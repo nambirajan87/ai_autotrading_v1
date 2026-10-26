@@ -692,17 +692,25 @@ class PaperTradeDatabase:
         strategy_name: str,
         symbol: Optional[str] = None,
         max_days: int = 30,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Retrieves all paper trades for the strategy within the previous one month (max_days).
+        Retrieves all paper trades for the strategy within the date range or previous one month (max_days).
         Older records are strictly excluded.
         Also synthesizes 'No Trade' records for days when the strategy was evaluated with 0 trades.
         """
-        from datetime import date, timedelta
-        cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
+        if start_date:
+            cutoff_date = str(start_date)
+        else:
+            from datetime import date, timedelta
+            cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
 
         query = "SELECT * FROM paper_trades WHERE strategy_name = ? AND session_date >= ?"
         params: List[Any] = [strategy_name, cutoff_date]
+        if end_date:
+            query += " AND session_date <= ?"
+            params.append(str(end_date))
         if symbol and symbol != "ALL":
             query += " AND symbol = ?"
             params.append(symbol)
@@ -714,6 +722,9 @@ class PaperTradeDatabase:
             # Also check for 'NO_TRADE' sessions
             run_query = "SELECT * FROM paper_runs WHERE strategy_name = ? AND session_date >= ? AND (total_trades = 0 OR status = 'NO_TRADE')"
             run_params: List[Any] = [strategy_name, cutoff_date]
+            if end_date:
+                run_query += " AND session_date <= ?"
+                run_params.append(str(end_date))
             if symbol and symbol != "ALL":
                 run_query += " AND symbol = ?"
                 run_params.append(symbol)
@@ -760,12 +771,20 @@ class PaperTradeDatabase:
         strategy_name: str,
         symbol: Optional[str] = None,
         max_days: int = 30,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> List[str]:
-        """Returns unique dates (within previous one month) when paper trades were executed."""
-        from datetime import date, timedelta
-        cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
+        """Returns unique dates (within date range or previous one month) when paper trades were executed."""
+        if start_date:
+            cutoff_date = str(start_date)
+        else:
+            from datetime import date, timedelta
+            cutoff_date = (date.today() - timedelta(days=max_days)).isoformat()
         query = "SELECT DISTINCT session_date FROM paper_trades WHERE strategy_name = ? AND session_date >= ? AND status != 'NO_TRADE'"
         params: List[Any] = [strategy_name, cutoff_date]
+        if end_date:
+            query += " AND session_date <= ?"
+            params.append(str(end_date))
         if symbol and symbol != "ALL":
             query += " AND symbol = ?"
             params.append(symbol)

@@ -30,11 +30,20 @@ except Exception:
 
 # Run the unified application on every execution and rerun
 from app.ui.main_app import render_unified_suite
-from scripts.schedule_oipulse_strength import start_oipulse_scheduler_background
+from scripts.schedule_oipulse_strength import (
+    start_oipulse_scheduler_background,
+    ensure_chrome_running,
+)
 
-# Start OI Pulse Strength Scheduler daemon on server startup (triggers at hh:mm:10)
+# Auto-launch Chrome with remote debugging on port 9222 for OI Pulse signin on server startup
 try:
-    start_oipulse_scheduler_background(batch_minutes=1, offset_seconds=10)
+    ensure_chrome_running(url="https://oipulse.com/signin/", port=9222)
+except Exception as e:
+    print(f"[!] Warning: Could not auto-trigger Chrome on startup: {e}")
+
+# Start OI Pulse Strength Scheduler daemon on server startup (triggers dynamically using ActiveSchedulerConfig)
+try:
+    start_oipulse_scheduler_background()
 except Exception as e:
     print(f"[!] Warning: Could not initialize OI Pulse scheduler: {e}")
 

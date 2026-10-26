@@ -132,4 +132,3 @@ class BaseBrokerGateway(ABC):
             "asks": [{"orders": 3, "quantity": 195, "price": round(ref_ltp + tick * (i + 1), 2)} for i in range(5)],
             "timestamp": datetime.now().strftime("%H:%M:%S"),
         }
-

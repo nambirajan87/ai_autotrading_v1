@@ -403,3 +403,130 @@ def resolve_oipulse_option(
         "has_signal": has_signal,
         "signal": signal,
     }
+
+
+def get_live_oipulse_status(
+    underlying: str = "NIFTY",
+    db_path: str = "data/backtest.db",
+) -> Dict[str, Any]:
+    """
+    Fetches the latest dynamic 1-minute OI Pulse trigger from the SQLite DB/scheduler,
+    and calculates the active rotating option contract according to OI Pulse logic:
+    OI Pulse Strength > CE/PE > OI Pulse LTP > Strike price > Nearest Tuesday expiry.
+    """
+    from scripts.schedule_oipulse_strength import get_latest_oipulse_row
+    from pathlib import Path
+
+    row = get_latest_oipulse_row(Path(db_path), prefer_memory=True)
+    if not row:
+        now = datetime.now()
+        day_name = now.strftime("%A")
+        if day_name in ("Saturday", "Sunday"):
+            day_name = "Friday"
+        return {
+            "has_data": False,
+            "trigger_no": 1,
+            "trigger_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "date": now.strftime("%d-%m-%Y"),
+            "time": now.strftime("%H:%M"),
+            "ltp": 22600.0,
+            "strength_str": "0%",
+            "strength_val": 0.0,
+            "option_type": "No Signal",
+            "strike": None,
+            "expiry_display": "",
+            "expiry_code": "",
+            "resolved_symbol": underlying,
+            "has_active_instrument": False,
+            "active_instrument": None,
+            "weekday": day_name,
+            "adjustment": WEEKDAY_ADJUSTMENTS.get(day_name, 0),
+        }
+
+    raw_tc = row.get("Trigger_Count")
+    raw_id = row.get("id") or 1
+    if raw_tc and 0 < int(raw_tc) < 50000:
+        trigger_no = int(raw_tc)
+    elif raw_id > 50000:
+        trigger_no = max(1, raw_id - 82680)
+    else:
+        trigger_no = raw_id
+    trigger_time = row.get("Trigger_Time") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    date_str = str(row.get("Date") or "").strip()
+    time_str = str(row.get("Time") or "").strip()
+    ltp = float(row.get("LTP") or 0.0)
+    strength_str = str(row.get("Strength") or "0%").strip()
+    strength_val = parse_strength_value(strength_str)
+    if strength_val is None:
+        strength_val = 0.0
+
+    candle_dt = None
+    if date_str:
+        for fmt in ("%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                d = datetime.strptime(date_str, fmt).date()
+                t = None
+                if time_str and time_str.upper() != "EOD":
+                    for t_fmt in ("%H:%M:%S", "%H:%M"):
+                        try:
+                            t = datetime.strptime(time_str, t_fmt).time()
+                            break
+                        except ValueError:
+                            pass
+                if t is None:
+                    t = datetime.min.time().replace(hour=15, minute=15)
+                candle_dt = datetime.combine(d, t)
+                break
+            except ValueError:
+                pass
+
+    if candle_dt is None:
+        candle_dt = datetime.now()
+
+    current_day = candle_dt.strftime("%A")
+    if current_day in ("Saturday", "Sunday"):
+        current_day = "Friday"
+
+    und = underlying.strip().upper()
+    strike, option_type = calculate_oipulse_strike_and_type(ltp, current_day, strength_val, underlying=und)
+
+    expiry_date, (expiry_display, expiry_code) = resolve_nearest_expiry_date(
+        candle_dt.date(), underlying=und
+    )
+
+    has_active = False
+    active_inst = None
+    resolved_sym = und
+
+    if strike is not None and option_type in ("CE", "PE"):
+        cand_sym = f"{und}{expiry_code}{strike}{option_type}"
+        is_valid, _ = validate_oipulse_contract_symbol(cand_sym, underlying=und)
+        if is_valid:
+            resolved_sym = cand_sym
+            active_inst = cand_sym
+            has_active = True
+        else:
+            resolved_sym = cand_sym
+            active_inst = None
+            has_active = False
+
+    return {
+        "has_data": True,
+        "trigger_no": trigger_no,
+        "trigger_time": trigger_time,
+        "date": date_str,
+        "time": time_str,
+        "ltp": ltp,
+        "strength_str": strength_str,
+        "strength_val": strength_val,
+        "option_type": option_type,
+        "strike": strike,
+        "expiry_display": expiry_display,
+        "expiry_code": expiry_code,
+        "resolved_symbol": resolved_sym,
+        "has_active_instrument": has_active,
+        "active_instrument": active_inst,
+        "weekday": current_day,
+        "adjustment": WEEKDAY_ADJUSTMENTS.get(current_day, 0),
+    }
+
