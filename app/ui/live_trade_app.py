@@ -27,7 +27,6 @@ except ImportError:
     make_subplots = None
     HAS_PLOTLY = False
 
-from app.data.historical_data import load_csv
 from app.data.instrument_loader import (
     DEFAULT_INDEX_EXPIRIES,
     INDEX_LOT_SIZES,
@@ -500,16 +499,7 @@ def render_live_trade_module():
             start_date=today,
             end_date=today,
         )
-    if underlying_candles is None or underlying_candles.empty:
-        for fb in [
-            f"data/{underlying_name.lower()}_{timeframe_m}m.csv",
-            f"data/{underlying_name.lower()}_5m.csv",
-            "data/nifty_5m.csv",
-            "data/nifty_1m.csv",
-        ]:
-            if os.path.exists(fb):
-                underlying_candles = load_csv(fb)
-                break
+    # No historical CSV fallback in live/paper trading
 
     if underlying_candles is not None and not underlying_candles.empty:
         underlying_candles["timestamp"] = pd.to_datetime(underlying_candles["timestamp"])
@@ -1267,11 +1257,11 @@ def render_live_trade_module():
                 by_exit = real_trades.groupby("exit_reason")["net_pnl"].agg(
                     Trades="count", Net_PnL="sum", Avg_Trade="mean"
                 ).round(2)
-                st.dataframe(by_exit, use_container_width=True)
+                st.dataframe(by_exit, width="stretch")
             else:
                 empty_exit = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                 empty_exit.index.name = "exit_reason"
-                st.dataframe(empty_exit, use_container_width=True)
+                st.dataframe(empty_exit, width="stretch")
 
         with b2:
             st.subheader("Option Type PE: By Exit Reason")
@@ -1280,11 +1270,11 @@ def render_live_trade_module():
                 by_exit_pe = pe_trades.groupby("exit_reason")["net_pnl"].agg(
                     Trades="count", Net_PnL="sum", Avg_Trade="mean"
                 ).round(2)
-                st.dataframe(by_exit_pe, use_container_width=True)
+                st.dataframe(by_exit_pe, width="stretch")
             else:
                 empty_pe = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                 empty_pe.index.name = "exit_reason"
-                st.dataframe(empty_pe, use_container_width=True)
+                st.dataframe(empty_pe, width="stretch")
 
         with b3:
             st.subheader("Option Type CE: By Exit Reason")
@@ -1293,11 +1283,11 @@ def render_live_trade_module():
                 by_exit_ce = ce_trades.groupby("exit_reason")["net_pnl"].agg(
                     Trades="count", Net_PnL="sum", Avg_Trade="mean"
                 ).round(2)
-                st.dataframe(by_exit_ce, use_container_width=True)
+                st.dataframe(by_exit_ce, width="stretch")
             else:
                 empty_ce = pd.DataFrame(columns=["Trades", "Net_PnL", "Avg_Trade"])
                 empty_ce.index.name = "exit_reason"
-                st.dataframe(empty_ce, use_container_width=True)
+                st.dataframe(empty_ce, width="stretch")
 
     # ==============================================================================
     # Trade Audit Trail (All Executions)
@@ -1389,7 +1379,7 @@ def render_live_trade_module():
 
         st.dataframe(
             styled_trail,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
@@ -1485,13 +1475,13 @@ def render_live_trade_module():
                 file_name=f"live_trade_audit_trail_2_{selected_strat}.csv",
                 mime="text/csv",
                 key="dl_trade_audit_trail_2_live",
-                use_container_width=True,
+                width="stretch",
             )
 
         styled_trail_2 = trades_2.style.apply(highlight_active_rows, axis=1)
         st.dataframe(
             styled_trail_2,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Display_ID": st.column_config.TextColumn("Trade Identifier", help="Daily live trade run identifier mapped to Strategy Name"),
