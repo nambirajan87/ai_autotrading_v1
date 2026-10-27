@@ -43,6 +43,16 @@ from app.strategy.custom_strategy import (
     score_custom_row,
 )
 from app.strategy.strategy_store import get_strategy, list_strategy_names, save_strategy
+from app.strategy.oipulse_resolver import (
+    calculate_oipulse_strike_and_type,
+    calculate_option_price,
+    get_live_oipulse_status,
+    get_or_fetch_active_option_candles,
+    parse_oipulse_contract_symbol,
+    resolve_nearest_expiry_date,
+    resolve_oipulse_option,
+    validate_oipulse_contract_symbol,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -188,13 +198,44 @@ def render_live_trade_module():
     strategy_entry_start = parse_time_param(risk_cfg.get("entry_start"), time(9, 20))
     strategy_entry_end = parse_time_param(risk_cfg.get("entry_end"), time(15, 0))
 
+    # Fetch accumulated live trades for this strategy within previous 1 month
+    accumulated_trades_list = live_db.get_accumulated_trades_for_strategy(selected_strat, max_days=30)
+    trades = pd.DataFrame(accumulated_trades_list) if accumulated_trades_list else pd.DataFrame()
+
+    active_open_trade = None
+    if not trades.empty and "status" in trades.columns:
+        open_rows = trades[trades["status"] == "ACTIVE"]
+        if not open_rows.empty:
+            active_open_trade = open_rows.iloc[0].to_dict()
+
     # Resolve active instrument
     fo_mode = inst_cfg.get("fo_mode", "Normal Mode")
-    active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
-    if fo_mode == "OIPulse Mode":
-        active_instrument = inst_cfg.get("underlying") or "NIFTY"
+    underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
+    oi_status = get_live_oipulse_status(underlying=underlying_name)
+
+    # 10-Step Lifecycle:
+    # If active open position exists (Step 7/8/9), Step 2 Strike Rotation is STOPPED!
+    if active_open_trade is not None:
+        active_instrument = str(active_open_trade.get("symbol"))
+    elif fo_mode == "OIPulse Mode":
+        # Step 1: Check OI Strength breakout (>50 or <-50)
+        strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
+        if strength_val > 50 or strength_val < -50:
+            # Step 2: Construct Active Instrument
+            cand = oi_status.get("active_instrument")
+            # Step 3: Validate check
+            if cand:
+                is_valid, _ = validate_oipulse_contract_symbol(cand, underlying=underlying_name)
+                active_instrument = cand if is_valid else None
+            else:
+                active_instrument = None
+        else:
+            # Step 1: Standby (Neutral band)
+            active_instrument = None
     elif active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
         active_instrument = "NIFTY26OCT22500PE"
+    else:
+        active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
 
     # Current date and previous 1 month date window (strictly 30 days)
     today = date.today()
@@ -212,15 +253,19 @@ def render_live_trade_module():
     tsl_info = " | Trailing SL: Model B Active" + (" (Runner)" if tsl_runner else "") if tsl_on else ""
 
     # Page Heading: Display "Strategy Name" as Heading
-    st.header(f"Results: {selected_strat} ({active_instrument})")
+    if fo_mode == "OIPulse Mode":
+        if active_open_trade is not None:
+            st.header(f"Results: {selected_strat} ({active_instrument} — In Trade)")
+        elif active_instrument:
+            st.header(f"Results: {selected_strat} ({active_instrument})")
+        else:
+            st.header(f"Results: {selected_strat} ({underlying_name} Option Chain — Standby)")
+    else:
+        st.header(f"Results: {selected_strat} ({active_instrument})")
     st.caption(f"Strategy: `{selected_strat}` | Period: {one_month_ago_str} to {today_str} | Live Kotak Trade Engine{tsl_info} | Square-off Time: **{strategy_sq_time.strftime('%H:%M')} IST**")
 
     # Notice
     st.warning("⚠️ **Notice:** Past results do not predict future results. Changing parameters after seeing results turns this data into in-sample data.")
-
-    # Fetch accumulated live trades for this strategy within previous 1 month
-    accumulated_trades_list = live_db.get_accumulated_trades_for_strategy(selected_strat, max_days=30)
-    trades = pd.DataFrame(accumulated_trades_list) if accumulated_trades_list else pd.DataFrame()
 
     real_trades = (
         trades[trades["status"] != "NO_TRADE"].copy()
@@ -437,37 +482,81 @@ def render_live_trade_module():
                 st.rerun()
 
     # ---------------- Active Execution Engine & Live Kotak Chart ----------------
-    active_open_trade = None
-    if not trades.empty and "status" in trades.columns:
-        open_rows = trades[trades["status"] == "ACTIVE"]
-        if not open_rows.empty:
-            active_open_trade = open_rows.iloc[0].to_dict()
+    timeframe_m = int(inst_cfg.get("timeframe", 1))
 
-    depth = gw.get_live_market_depth(active_instrument, inst_cfg.get("instrument_key"))
-    live_ltp = float(depth.get("ltp") or 0.0)
-
-    # Fetch today's intraday candles
-    timeframe_m = int(inst_cfg.get("timeframe", 5))
-    candles_df = gw.fetch_historical_candles(
-        symbol=active_instrument,
+    # Fetch underlying intraday candles from Kotak gateway or local fallbacks
+    underlying_candles = gw.fetch_historical_candles(
+        symbol=underlying_name,
         instrument_key=inst_cfg.get("instrument_key", ""),
         timeframe_minutes=timeframe_m,
         start_date=today,
         end_date=today,
     )
-
-    if candles_df is None or candles_df.empty:
-        # Fallback to local files for testing/offline replay
-        fallbacks = [
-            f"data/{active_instrument.lower()}_{timeframe_m}m.csv",
-            f"data/{active_instrument.lower()}_5m.csv",
-            "data/nifty26oct22500pe_5m.csv",
-            "data/nifty26oct22500pe_1m.csv",
-        ]
-        for fb in fallbacks:
+    if underlying_candles is None or underlying_candles.empty:
+        for fb in [
+            f"data/{underlying_name.lower()}_{timeframe_m}m.csv",
+            f"data/{underlying_name.lower()}_5m.csv",
+            "data/nifty_5m.csv",
+            "data/nifty_1m.csv",
+        ]:
             if os.path.exists(fb):
-                candles_df = load_csv(fb)
+                underlying_candles = load_csv(fb)
                 break
+
+    if underlying_candles is not None and not underlying_candles.empty:
+        underlying_candles["timestamp"] = pd.to_datetime(underlying_candles["timestamp"])
+        if underlying_candles["timestamp"].dt.tz is not None:
+            underlying_candles["timestamp"] = underlying_candles["timestamp"].dt.tz_localize(None)
+        underlying_candles = underlying_candles[
+            (underlying_candles["timestamp"].dt.time >= time(9, 15, 0)) &
+            (underlying_candles["timestamp"].dt.time <= time(15, 30, 0))
+        ].reset_index(drop=True)
+
+    underlying_ltp = float(oi_status.get("ltp") or 0.0)
+    if underlying_ltp <= 0.0 and underlying_candles is not None and not underlying_candles.empty:
+        underlying_ltp = float(underlying_candles.iloc[-1]["close"])
+    if underlying_ltp <= 0.0:
+        q_und = gw.get_ltp(underlying_name)
+        if q_und and float(q_und) > 0:
+            underlying_ltp = float(q_und)
+
+    # Step 4: After finding Active Instrument is valid (or in active trade), fetch live candles from Kotak & display Active Instrument chart
+    if active_instrument:
+        candles_df = get_or_fetch_active_option_candles(
+            contract_symbol=active_instrument,
+            underlying_candles=underlying_candles,
+            gateway=gw,
+            timeframe_minutes=timeframe_m,
+            start_date=today,
+            end_date=today,
+            underlying=underlying_name,
+        )
+        if candles_df is None or candles_df.empty:
+            candles_df = underlying_candles
+
+        opt_quote = gw.get_ltp(active_instrument)
+        if opt_quote and float(opt_quote) > 0:
+            live_ltp = float(opt_quote)
+        else:
+            parsed = parse_oipulse_contract_symbol(active_instrument, underlying=underlying_name)
+            if parsed:
+                exp_dt, _ = resolve_nearest_expiry_date(datetime.now().date(), underlying=parsed["underlying"])
+                calc_p = calculate_option_price(
+                    underlying_price=underlying_ltp,
+                    strike_price=float(parsed["strike"]),
+                    option_type=parsed["option_type"],
+                    candle_dt=datetime.now(),
+                    expiry_dt=exp_dt,
+                )
+                live_ltp = round(max(calc_p, 1.0), 2)
+            elif candles_df is not None and not candles_df.empty:
+                live_ltp = float(candles_df.iloc[-1]["close"])
+            else:
+                live_ltp = 100.0
+    else:
+        # Step 1: Standby (Neutral Band) - Display underlying index
+        candles_df = underlying_candles
+        live_ltp = underlying_ltp
 
     # Strictly filter candles to regular market trading hours (09:15:00 to 15:30:00 IST)
     if candles_df is not None and not candles_df.empty:
@@ -479,12 +568,12 @@ def render_live_trade_module():
             (candles_df["timestamp"].dt.time <= time(15, 30, 0))
         ].reset_index(drop=True)
 
-    if live_ltp <= 0 and candles_df is not None and not candles_df.empty:
-        live_ltp = float(candles_df.iloc[-1]["close"])
-
-        # Display Live Ticker & Order Book metrics
+    # Display Live Ticker & Order Book metrics
     m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-    m_col1.metric("Live Tick (LTP)", f"₹{live_ltp:,.2f}", f"Kotak: {depth.get('status', 'LIVE')}")
+    if active_instrument:
+        m_col1.metric("Option Tick (LTP)", f"₹{live_ltp:,.2f}", f"Contract: {active_instrument}")
+    else:
+        m_col1.metric("Underlying LTP", f"₹{live_ltp:,.2f}", f"OI Strength: {oi_status.get('strength_str', '0%')}")
     if candles_df is not None and not candles_df.empty:
         m_col2.metric("Day High", f"₹{max(float(candles_df['high'].max()), live_ltp):,.2f}")
         m_col3.metric("Day Low", f"₹{min(float(candles_df['low'].min()), live_ltp):,.2f}")
@@ -620,100 +709,82 @@ def render_live_trade_module():
         if active_open_trade is None and not risk_blocked:
             # Check for new entry signal strictly within market hours & strategy entry window
             if fo_mode == "OIPulse Mode":
-                from app.strategy.oipulse_resolver import (
-                    resolve_oipulse_option,
-                    calculate_option_price,
-                    get_live_oipulse_status,
-                )
-                underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
-                oi_status = get_live_oipulse_status(underlying=underlying_name)
-                oi_res = resolve_oipulse_option(
-                    underlying=underlying_name,
-                    candle_dt=datetime.now(),
-                    live_ltp=live_ltp,
-                    live_strength=oi_status.get("strength_val"),
-                )
+                strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
 
-                # CRITICAL FIX: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
+                # Step 1: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
                 # Trade must NEVER be executed using NIFTY instrument directly.
-                if not oi_res.get("has_signal") or not oi_res.get("is_valid_symbol") or oi_res.get("option_type") not in ("CE", "PE"):
+                if not (strength_val > 50 or strength_val < -50):
                     st.info(
-                        f"📡 **OI Pulse Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
+                        f"📡 **Step 1: Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
                         f"(within neutral band -50% to +50%). Trade entry blocked: Waiting for momentum breakout (> +50% for CE, < -50% for PE) "
                         f"before constructing active option contract from {underlying_name} Option Chain. "
                         f"Underlying '{underlying_name}' will NOT be traded directly."
                     )
+                elif not active_instrument or active_instrument in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                    st.error(f"🛑 Cannot execute trade: Active instrument '{active_instrument}' is invalid or is raw index.")
                 else:
-                    opt_type = oi_res["option_type"]  # "CE" or "PE"
-                    trade_symbol = oi_res["resolved_symbol"]
+                    opt_type = str(oi_status.get("option_type", "")).upper()
+                    trade_symbol = active_instrument
 
-                    if trade_symbol == underlying_name or trade_symbol in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
-                        st.error(f"Cannot execute trade: Resolved symbol '{trade_symbol}' is underlying index, not option contract.")
-                    else:
-                        signal_matched = False
-                        if opt_type == "CE" and latest_score >= long_th and side_val in ("BOTH", "LONG"):
-                            signal_matched = True
-                        elif opt_type == "PE" and latest_score <= short_th and side_val in ("BOTH", "SHORT"):
-                            signal_matched = True
+                    # Step 5 & Step 7: Check strategy conditions on live candle close
+                    signal_matched = False
+                    if opt_type == "CE" and latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                        signal_matched = True
+                    elif opt_type == "PE" and latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                        signal_matched = True
 
-                        if signal_matched:
-                            opt_price = float(gw.get_ltp(trade_symbol) or 0.0)
-                            if opt_price <= 0:
-                                opt_price = calculate_option_price(
-                                    underlying_price=live_ltp,
-                                    strike_price=float(oi_res["strike"]),
-                                    option_type=opt_type,
-                                    candle_dt=datetime.now(),
-                                    expiry_dt=oi_res["expiry_date"],
-                                )
-                            entry_p = round(max(opt_price, 10.0), 2)
-                            tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
-                            sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
-                            next_tid = 6000 + len(real_trades) + 1
+                    if signal_matched:
+                        entry_p = live_ltp
+                        tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                        sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                        next_tid = 6000 + len(real_trades) + 1
 
-                            # Trigger Live Orders on Kotak for option contract
-                            entry_order = gw.place_market_order(
-                                symbol=trade_symbol,
-                                side="BUY",
-                                quantity=lot_size,
-                                reference_price=entry_p,
-                            )
-                            entry_fill_time = entry_order.fill_time or now_time_str
-                            entry_fill_price = float(entry_order.fill_price or entry_p)
+                        # Trigger Live Orders on Kotak for option contract
+                        entry_order = gw.place_market_order(
+                            symbol=trade_symbol,
+                            side="BUY",
+                            quantity=lot_size,
+                            reference_price=entry_p,
+                        )
+                        entry_fill_time = entry_order.fill_time or now_time_str
+                        entry_fill_price = float(entry_order.fill_price or entry_p)
 
-                            # Place Target limit order
-                            tgt_order = gw.place_target_order(
-                                symbol=trade_symbol,
-                                side="SELL",
-                                quantity=lot_size,
-                                target_price=tgt_p,
-                            )
+                        # Place Target limit order
+                        tgt_order = gw.place_target_order(
+                            symbol=trade_symbol,
+                            side="SELL",
+                            quantity=lot_size,
+                            target_price=tgt_p,
+                        )
 
-                            # Place Stop Loss SL-M order
-                            sl_order = gw.place_stoploss_order(
-                                symbol=trade_symbol,
-                                side="SELL",
-                                quantity=lot_size,
-                                stoploss_price=sl_p,
-                            )
+                        # Place Stop Loss SL-M order
+                        sl_order = gw.place_stoploss_order(
+                            symbol=trade_symbol,
+                            side="SELL",
+                            quantity=lot_size,
+                            stoploss_price=sl_p,
+                        )
 
-                            # Add active record in Live Trade database
-                            live_db.save_active_trade(
-                                strategy_name=selected_strat,
-                                symbol=trade_symbol,
-                                session_date=today_str,
-                                trade_id=next_tid,
-                                side="LONG",
-                                quantity=lot_size,
-                                entry_time=entry_fill_time,
-                                entry_price=entry_fill_price,
-                                stop_loss=sl_p,
-                                target=tgt_p,
-                                score=latest_score,
-                                regime="TRENDING",
-                            )
-                            st.toast(f"🟢 Kotak Live: Executed LONG {opt_type} Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
-                            st.rerun()
+                        # Step 7 & 8: Add active record in Live Trade database
+                        # Once saved, active_open_trade is active, so Step 2 (Strike Rotation) STOPS!
+                        live_db.save_active_trade(
+                            strategy_name=selected_strat,
+                            symbol=trade_symbol,
+                            session_date=today_str,
+                            trade_id=next_tid,
+                            side="LONG",
+                            quantity=lot_size,
+                            entry_time=entry_fill_time,
+                            entry_price=entry_fill_price,
+                            stop_loss=sl_p,
+                            target=tgt_p,
+                            score=latest_score,
+                            regime="TRENDING",
+                            gateway="KOTAK",
+                            index_ltp=underlying_ltp,
+                        )
+                        st.toast(f"🟢 Kotak Live: Executed LONG {opt_type} Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
+                        st.rerun()
 
             else:
                 # Normal Mode (fo_mode != "OIPulse Mode"):
@@ -764,6 +835,8 @@ def render_live_trade_module():
                         target=tgt_p,
                         score=latest_score,
                         regime="TRENDING",
+                        gateway="KOTAK",
+                        index_ltp=underlying_ltp,
                     )
                     st.toast(f"🟢 Kotak Live: Executed LONG Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
                     st.rerun()
@@ -814,6 +887,8 @@ def render_live_trade_module():
                         target=tgt_p,
                         score=latest_score,
                         regime="TRENDING",
+                        gateway="KOTAK",
+                        index_ltp=underlying_ltp,
                     )
                     st.toast(f"🔴 Kotak Live: Executed SHORT Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🔴")
                     st.rerun()
@@ -884,17 +959,23 @@ def render_live_trade_module():
             rows=2, cols=1,
             shared_xaxes=True,
             vertical_spacing=0.04,
-            subplot_titles=(f"📈 Live Current Date Kotak Chart: {active_instrument} ({timeframe_m}m - Market Hours 09:15 to 15:30)", "📊 Volume"),
+            subplot_titles=(
+                f"📈 Live Current Date Kotak Chart: {active_instrument} ({timeframe_m}m - Market Hours 09:15 to 15:30)"
+                if active_instrument
+                else f"📈 Standby Chart: {underlying_name} Underlying Index (Waiting for OI Breakout >50 or <-50)",
+                "📊 Volume",
+            ),
             row_heights=[0.75, 0.25],
         )
         plot_slice = candles_df.tail(60).copy()
+        chart_inst_name = active_instrument if active_instrument else f"{underlying_name} (Standby)"
         fig.add_trace(go.Candlestick(
             x=plot_slice["timestamp"].astype(str),
             open=plot_slice["open"],
             high=plot_slice["high"],
             low=plot_slice["low"],
             close=plot_slice["close"],
-            name=active_instrument,
+            name=chart_inst_name,
             increasing_line_color="#00e676",
             decreasing_line_color="#ff5252",
         ), row=1, col=1)

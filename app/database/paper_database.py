@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS paper_trades (
     status TEXT DEFAULT 'CLOSED',
     regime TEXT DEFAULT 'TRENDING',
     peak_gain_pct REAL DEFAULT 0.0,
+    index_ltp REAL,
     FOREIGN KEY(run_id) REFERENCES paper_runs(id) ON DELETE CASCADE
 );
 
@@ -97,6 +98,7 @@ class PaperTradeDatabase:
                 ("status", "TEXT DEFAULT 'CLOSED'"),
                 ("regime", "TEXT DEFAULT 'TRENDING'"),
                 ("peak_gain_pct", "REAL DEFAULT 0.0"),
+                ("index_ltp", "REAL DEFAULT NULL"),
             ]:
                 try:
                     self.conn.execute(f"ALTER TABLE paper_trades ADD COLUMN {col} {col_def}")
@@ -596,6 +598,7 @@ class PaperTradeDatabase:
         target: Optional[float] = None,
         score: Optional[int] = None,
         regime: str = "TRENDING",
+        index_ltp: Optional[float] = None,
     ) -> int:
         """Persists a newly opened active paper trade."""
         with self.conn:
@@ -605,8 +608,8 @@ class PaperTradeDatabase:
                     strategy_name, symbol, session_date, trade_id,
                     side, quantity, entry_time, entry_price, exit_time, exit_price,
                     exit_reason, gross_pnl, charges, net_pnl, stop_loss, target, score,
-                    status, regime, peak_gain_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0.0, 'OPEN', 0.0, 20.0, -20.0, ?, ?, ?, 'ACTIVE', ?, 0.0)
+                    status, regime, peak_gain_pct, index_ltp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', 0.0, 'OPEN', 0.0, 20.0, -20.0, ?, ?, ?, 'ACTIVE', ?, 0.0, ?)
                 """,
                 (
                     strategy_name,
@@ -621,6 +624,7 @@ class PaperTradeDatabase:
                     target,
                     score,
                     regime,
+                    index_ltp,
                 ),
             )
             return cur.lastrowid

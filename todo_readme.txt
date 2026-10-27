@@ -408,3 +408,22 @@ Market Window  : Monday - Friday, 09:15 AM - 03:15 PM
 Attached Port  : 9222
 Target DB      : C:\AI Course\ai_autotrading_v1\data\backtest.db -> table 'oi_strength'
 ==================================================================
+PAPERTRADE_TEST_OI_V2
+in this strategy "Trade Direction" is provided as "LONG" trade side
+Also Locked to LONG: Indicator 11 (Higher High) which should take only Long trades.
+But in recent paper trade, SHORT trade was executed using NIFTY Instrument (Hope used fallback mechanisim), and also OI pulse strength is  not in between >50 or <-50.
+Then why the system takes the trade.?
+
+step1: wait for the OI Strength to become >50 or <-50
+step2: if OI Strength >50, Find OptionType,StrikePrice,Expiry (use LTP to calculate CE, STRIKE price and nesrest Expiry) and construct Active Instrument 
+step3: After fiding Active Instrument, run a validate check whetther the constructed Active Instrument is valid or not, continue only if it is valid, else error out in ui.
+step4: After fiding Active Instrument, is valid, then fetch the live candles from kotak and display the  Active Instrument chart.
+step5: Using valid Active Instrument, using the default strategy values ("Trade Direction", "candle interval", etc, etc), start monitoring the live kotak candle
+step6: During this monitoring time, keep watchout for OI Strength is changing(>50 or <-50), to decide the rotate of new STRIKE price, if got evidence for OI Strength changes, then goto step2 and continue from there (Important, because the momentum changes)
+step7: In case, If the live candle close matches the strategy conditions, then only the trade entry should be executed and  Open Position  will be created. If Open Position is created, then step2 should be stopped (important). If No Open Position found, then step2 should be continued (important)
+step8: Now we have a Open Position: and Add the trade record in "Trade Audit Trail" table with Valid Active Instrument and Index-LTP 
+step9: Now keep monitoring to close the trade with Target or Stop loss or Square off.
+step10: if Target achieved or stop loss achieved, then zero open position, so goto step1 for initiating the next new trade.
+
+Note: With this latest changes Update the Paper Trade Workflow Diagram (Paper Trading Engine — Complete Workflow & Architecture Flow), also this fix should be done for the Live trade as well.
+==================================================================

@@ -307,6 +307,117 @@ def fetch_option_market_candles(
     return None
 
 
+def build_option_candles_from_underlying(
+    underlying_df: pd.DataFrame,
+    strike_price: float,
+    option_type: str,
+    expiry_dt: date,
+    iv: float = 0.14,
+    r: float = 0.07,
+) -> pd.DataFrame:
+    """
+    Synthesizes realistic option OHLC candles from underlying index candles using BSM pricing.
+    Ensures valid high/low bounds and standard option volume.
+    """
+    if underlying_df is None or underlying_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for _, row in underlying_df.iterrows():
+        ts = pd.to_datetime(row["timestamp"])
+        cd_dt = ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else datetime.now()
+
+        o_p = calculate_option_price(row["open"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+        c_p = calculate_option_price(row["close"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+
+        if option_type == "CE":
+            h_p = calculate_option_price(row["high"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+            l_p = calculate_option_price(row["low"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+        else:
+            h_p = calculate_option_price(row["low"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+            l_p = calculate_option_price(row["high"], strike_price, option_type, cd_dt, expiry_dt, iv, r)
+
+        real_high = max(h_p, o_p, c_p)
+        real_low = max(0.5, min(l_p, o_p, c_p))
+        vol = int(row.get("volume", 50000))
+
+        rows.append({
+            "timestamp": ts,
+            "open": round(o_p, 2),
+            "high": round(real_high, 2),
+            "low": round(real_low, 2),
+            "close": round(c_p, 2),
+            "volume": vol,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def get_or_fetch_active_option_candles(
+    contract_symbol: str,
+    underlying_candles: Optional[pd.DataFrame] = None,
+    gateway: Optional[Any] = None,
+    timeframe_minutes: int = 1,
+    start_date: Any = None,
+    end_date: Any = None,
+    underlying: str = "NIFTY",
+) -> Optional[pd.DataFrame]:
+    """
+    Retrieves or synthesizes live candles for the active option contract:
+    1. Try broker gateway (Kotak Neo historical candles)
+    2. Try local cache in data/options/{symbol}.csv or data/{symbol_lower}_{tf}m.csv
+    3. Synthesize from underlying_candles using parsed strike & expiry
+    """
+    # 1. Gateway or local cache
+    cached = fetch_option_market_candles(
+        contract_symbol=contract_symbol,
+        start_date=start_date,
+        end_date=end_date,
+        timeframe_minutes=timeframe_minutes,
+        gateway=gateway,
+    )
+    if cached is not None and not cached.empty:
+        return cached
+
+    # Check local fallback patterns
+    fb_paths = [
+        os.path.join("data", f"{contract_symbol.lower()}_{timeframe_minutes}m.csv"),
+        os.path.join("data", f"{contract_symbol.lower()}_5m.csv"),
+        os.path.join("data", f"{contract_symbol.lower()}_1m.csv"),
+    ]
+    for p in fb_paths:
+        if os.path.exists(p):
+            try:
+                df = pd.read_csv(p)
+                if not df.empty and "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"])
+                    return df
+            except Exception:
+                pass
+
+    # 2. Synthesize from underlying candles
+    if underlying_candles is not None and not underlying_candles.empty:
+        parsed = parse_oipulse_contract_symbol(contract_symbol, underlying=underlying)
+        if parsed:
+            exp_dt, _ = resolve_nearest_expiry_date(
+                underlying_candles.iloc[-1]["timestamp"].date()
+                if hasattr(underlying_candles.iloc[-1]["timestamp"], "date")
+                else datetime.now().date(),
+                underlying=parsed["underlying"],
+            )
+            syn_df = build_option_candles_from_underlying(
+                underlying_df=underlying_candles,
+                strike_price=float(parsed["strike"]),
+                option_type=parsed["option_type"],
+                expiry_dt=exp_dt,
+            )
+            if not syn_df.empty:
+                return syn_df
+
+    return None
+
+
+
 def parse_strength_value(val) -> Optional[float]:
     """Parses raw strength string like '-109%', '+8%', '55%' to float."""
     if val is None:

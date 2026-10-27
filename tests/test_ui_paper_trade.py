@@ -545,11 +545,11 @@ def test_papertrade_test_oi_v2_strategy_config_and_scheduler_default():
     target_strat = strats.get("PAPERTRADE_TEST_OI_V2")
     assert target_strat is not None, "PAPERTRADE_TEST_OI_V2 strategy must exist in saved_strategies.json"
 
-    # Trade side should be BOTH to allow matching conditions for both LONG and SHORT
+    # Trade side should be LONG as required by user and locked to Indicator 11 (Higher High)
     indicators = target_strat.get("indicators", {})
     risk = target_strat.get("risk", {})
-    assert indicators.get("trade_side") == "BOTH"
-    assert risk.get("trade_side") == "BOTH"
+    assert indicators.get("trade_side") == "LONG"
+    assert risk.get("trade_side") == "LONG"
 
     # Entry start should be 09:16 matching the scheduler auto-trigger
     assert risk.get("entry_start") == "09:16"
@@ -628,6 +628,44 @@ def test_oipulse_neutral_band_blocks_trade_and_prevents_nifty_execution():
     assert bullish_res["resolved_symbol"].startswith("NIFTY")
     assert bullish_res["resolved_symbol"].endswith("CE")
     assert bullish_res["resolved_symbol"] != "NIFTY"
+
+
+def test_audit_trail_includes_index_ltp(temp_paper_db):
+    """Verifies that save_active_trade persists index_ltp and it is returned in trade audit queries."""
+    trade_dict = {
+        "trade_id": 999,
+        "side": "LONG",
+        "entry_price": 150.0,
+        "entry_time": "2026-10-27 10:16:00",
+        "quantity": 50,
+        "target": 195.0,
+        "stop_loss": 142.5,
+        "status": "OPEN",
+    }
+    saved_id = temp_paper_db.save_active_trade(
+        strategy_name="PAPERTRADE_TEST_OI_V2",
+        symbol="NIFTY26OCT22700CE",
+        session_date="2026-10-27",
+        trade_id=999,
+        side="LONG",
+        quantity=50,
+        entry_time="2026-10-27 10:16:00",
+        entry_price=150.0,
+        stop_loss=142.5,
+        target=195.0,
+        score=2,
+        regime="TRENDING",
+        index_ltp=22766.70,
+    )
+    assert saved_id is not None
+
+    trades = temp_paper_db.get_accumulated_trades_for_strategy("PAPERTRADE_TEST_OI_V2", max_days=30)
+    assert len(trades) >= 1
+    t = trades[0]
+    assert t.get("symbol") == "NIFTY26OCT22700CE"
+    assert t.get("index_ltp") == 22766.70
+
+
 
 
 

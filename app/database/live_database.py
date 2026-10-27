@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS live_trades (
     status TEXT DEFAULT 'CLOSED',
     regime TEXT DEFAULT 'TRENDING',
     peak_gain_pct REAL DEFAULT 0.0,
+    index_ltp REAL,
     FOREIGN KEY(session_id) REFERENCES live_sessions(id) ON DELETE CASCADE
 );
 
@@ -95,6 +96,7 @@ class LiveTradeDatabase:
                 ("status", "TEXT DEFAULT 'CLOSED'"),
                 ("regime", "TEXT DEFAULT 'TRENDING'"),
                 ("peak_gain_pct", "REAL DEFAULT 0.0"),
+                ("index_ltp", "REAL DEFAULT NULL"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE live_trades ADD COLUMN {col} {col_def}")
@@ -327,6 +329,7 @@ class LiveTradeDatabase:
         regime: str = "TRENDING",
         gateway: str = "KOTAK",
         session_id: Optional[int] = None,
+        index_ltp: Optional[float] = None,
     ) -> int:
         """Persists a newly opened active live trade."""
         with self._get_connection() as conn:
@@ -337,8 +340,8 @@ class LiveTradeDatabase:
                     session_id, gateway, strategy_name, symbol, session_date, trade_id,
                     side, quantity, signal_time, entry_time, entry_price, exit_time, exit_price,
                     exit_reason, gross_pnl, charges, net_pnl, stop_loss, target, score,
-                    status, regime, peak_gain_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0.0, 'OPEN', 0.0, 20.0, -20.0, ?, ?, ?, 'ACTIVE', ?, 0.0)
+                    status, regime, peak_gain_pct, index_ltp
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0.0, 'OPEN', 0.0, 20.0, -20.0, ?, ?, ?, 'ACTIVE', ?, 0.0, ?)
                 """,
                 (
                     session_id,
@@ -356,6 +359,7 @@ class LiveTradeDatabase:
                     target,
                     score,
                     regime,
+                    index_ltp,
                 ),
             )
             return cur.lastrowid

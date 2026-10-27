@@ -69,6 +69,7 @@ data/upstox_backtest_trades.csv
 data/backtest_report.txt
 data/backtest_analyse_report.txt
 data/empirical_action_plan_results.json
+data/oipulse_live_cache.json
 data/*.py
 scratch/
 
