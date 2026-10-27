@@ -234,10 +234,13 @@ def render_live_trade_module():
         else:
             # Step 1: Standby (Neutral band)
             active_instrument = None
-    elif active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
-        active_instrument = "NIFTY26OCT22500PE"
     else:
-        active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
+        raw_sym = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol")
+        if raw_sym in ("NIFTY", "BANKNIFTY", None, ""):
+            active_instrument = "NIFTY26OCT22500PE"
+        else:
+            active_instrument = raw_sym
+
 
     # Current date and previous 1 month date window (strictly 30 days)
     today = date.today()

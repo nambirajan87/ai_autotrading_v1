@@ -510,10 +510,12 @@ def render_paper_trade_module():
         else:
             # Step 1: Standby (Neutral band)
             active_instrument = None
-    elif active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
-        active_instrument = "NIFTY26OCT22500PE"
     else:
-        active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
+        raw_sym = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol")
+        if raw_sym in ("NIFTY", "BANKNIFTY", None, ""):
+            active_instrument = "NIFTY26OCT22500PE"
+        else:
+            active_instrument = raw_sym
 
     # Current date and previous 1 month date window (strictly 30 days)
     today = date.today()
@@ -671,7 +673,6 @@ def render_paper_trade_module():
     mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
 
     # Render OI Pulse Live Strength Feed & Status
-    from app.strategy.oipulse_resolver import get_live_oipulse_status
     from scripts.schedule_oipulse_strength import is_paper_trade_auto_triggered, ActiveSchedulerConfig
 
     oi_status = get_live_oipulse_status(underlying=underlying_name, ce_strength=ce_strength, pe_strength=pe_strength)

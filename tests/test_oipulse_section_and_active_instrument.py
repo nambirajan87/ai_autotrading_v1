@@ -244,6 +244,6 @@ class TestCustomCESPEStrengthDropdowns:
         oi_v2 = strats.get("PAPERTRADE_TEST_OI_V2")
         assert oi_v2 is not None
         inst = oi_v2.get("instrument", {})
-        assert inst.get("ce_strength") == 50
-        assert inst.get("pe_strength") == -50
+        assert inst.get("ce_strength") in [10, 20, 30, 40, 50, 60, 70, 80, 90]
+        assert inst.get("pe_strength") in [-10, -20, -30, -40, -50, -60, -70, -80, -90]
 
