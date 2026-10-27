@@ -1394,7 +1394,7 @@ class KotakGateway(BaseBrokerGateway):
             cursor = chunk_end + timedelta(days=1)
 
         def _fetch_single_window(target_neosym: str, c_from: str, c_to: str) -> pd.DataFrame:
-            if not self._client:
+            if not self._client or not target_neosym:
                 return pd.DataFrame()
             max_retries = 3
             for attempt in range(max_retries):
@@ -1445,7 +1445,7 @@ class KotakGateway(BaseBrokerGateway):
             return pd.DataFrame()
 
         # 1. Primary: Use Kotak Neo SDK historical_data with chunking
-        if self._client:
+        if self._client and neosym:
             chunk_dfs = []
             for idx, (c_from, c_to) in enumerate(chunks):
                 if idx > 0:
@@ -1459,7 +1459,8 @@ class KotakGateway(BaseBrokerGateway):
                 return combined
 
         # 2. Token resolution retry: If primary neosymbol returned no candles, resolve actual token from symbol
-        if self._client and (symbol or neosym):
+        target_sym_clean = str(symbol or "").upper().replace(" ", "").strip()
+        if self._client and (symbol or neosym) and target_sym_clean not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY50", "NIFTY 50"):
             try:
                 search_query = symbol or neosym
                 scrips = self.smart_search_instruments(search_query)

@@ -53,6 +53,7 @@ from app.strategy.oipulse_resolver import (
     resolve_oipulse_option,
     validate_oipulse_contract_symbol,
 )
+from app.ui.paper_trade_app import build_score_details_html
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -490,13 +491,15 @@ def render_live_trade_module():
     timeframe_m = int(inst_cfg.get("timeframe", 1))
 
     # Fetch underlying intraday candles from Kotak gateway or local fallbacks
-    underlying_candles = gw.fetch_historical_candles(
-        symbol=underlying_name,
-        instrument_key=inst_cfg.get("instrument_key", ""),
-        timeframe_minutes=timeframe_m,
-        start_date=today,
-        end_date=today,
-    )
+    underlying_candles = pd.DataFrame()
+    if underlying_name not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY 50"):
+        underlying_candles = gw.fetch_historical_candles(
+            symbol=underlying_name,
+            instrument_key=inst_cfg.get("instrument_key", ""),
+            timeframe_minutes=timeframe_m,
+            start_date=today,
+            end_date=today,
+        )
     if underlying_candles is None or underlying_candles.empty:
         for fb in [
             f"data/{underlying_name.lower()}_{timeframe_m}m.csv",
@@ -609,14 +612,15 @@ def render_live_trade_module():
     )
 
     latest_score = 0
+    latest_components: Dict[str, int] = {}
     scored_candles = pd.DataFrame()
     if candles_df is not None and not candles_df.empty:
         scored_candles = calculate_custom_indicators(candles_df, custom_cfg)
         if not scored_candles.empty:
-            scored_candles["consensus_score"] = [
-                int(sum(score_custom_row(r, custom_cfg).values())) for _, r in scored_candles.iterrows()
-            ]
+            all_comp = [score_custom_row(r, custom_cfg) for _, r in scored_candles.iterrows()]
+            scored_candles["consensus_score"] = [int(sum(c.values())) for c in all_comp]
             latest_score = int(scored_candles.iloc[-1]["consensus_score"])
+            latest_components = all_comp[-1] if all_comp else {}
 
     # Constant Display of Both Trigger & Signal Bar Check Sections during active live session
     if is_live_running:
@@ -657,6 +661,18 @@ def render_live_trade_module():
             <b style="color: #00e676;">📊 Signal bar close check</b> &nbsp;➔&nbsp; Last Signal Bar: <b>{last_bar_str}</b> (Closed at <b>{bar_closed_at_str}</b>) &nbsp;|&nbsp; Signal: <b style="color: {sig_color};">{sig_disp}</b> &nbsp;|&nbsp; Score: <b>{latest_score}</b> &nbsp;|&nbsp; <i>Continuous 2s LTP, chart & exit monitoring active.</i>
         </div>
         """, unsafe_allow_html=True)
+
+        # Section: Score details of Signal Bar Close
+        score_details_card = build_score_details_html(
+            strategy_name=selected_strat,
+            indicator_scores=latest_components,
+            ind_cfg=ind_cfg,
+            latest_score=latest_score,
+            bar_closed_at_str=bar_closed_at_str,
+            long_th=long_th,
+            short_th=short_th,
+        )
+        st.markdown(score_details_card, unsafe_allow_html=True)
 
     # If live running, check market hours and strategy square-off time; if past square-off or market closed, auto square off and stop
     if is_live_running:

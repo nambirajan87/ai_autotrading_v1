@@ -100,6 +100,123 @@ def render_html_block(html_content: str):
     st.markdown(cleaned_html, unsafe_allow_html=True)
 
 
+def build_score_details_html(
+    strategy_name: str,
+    indicator_scores: Optional[Dict[str, int]] = None,
+    ind_cfg: Optional[Dict[str, Any]] = None,
+    latest_score: int = 0,
+    bar_closed_at_str: Optional[str] = None,
+    long_th: int = 1,
+    short_th: int = -1,
+) -> str:
+    """
+    Renders the 'Score details of Signal Bar Close' section displaying all enabled indicators
+    of the active strategy, each indicator's score level with (green tick) / (red cross),
+    and the total consensus score.
+    """
+    scores = indicator_scores or {}
+    cfg = ind_cfg or {}
+    if not cfg and strategy_name:
+        strat_def = get_strategy(strategy_name)
+        if strat_def:
+            cfg = strat_def.get("indicators", {})
+
+    indicator_specs = [
+        ("ema", "ema_enabled", "EMA", True),
+        ("rsi", "rsi_enabled", "RSI", True),
+        ("macd", "macd_enabled", "MACD", True),
+        ("vwap", "vwap_enabled", "VWAP", True),
+        ("adx", "adx_enabled", "ADX", True),
+        ("volume", "volume_enabled", "Volume", True),
+        ("higher_high", "higher_high_enabled", "Higher High", False),
+        ("lower_low", "lower_low_enabled", "Lower Low", False),
+        ("supertrend", "supertrend_enabled", "Supertrend", False),
+        ("hma", "hma_enabled", "HMA", False),
+        ("bollinger", "bollinger_enabled", "Bollinger", False),
+        ("stochastic", "stoch_enabled", "Stochastic", False),
+        ("obv", "obv_enabled", "OBV", False),
+    ]
+
+    active_items = []
+    for comp_key, enable_key, label, default_on in indicator_specs:
+        is_enabled = bool(cfg.get(enable_key, default_on))
+        if is_enabled or comp_key in scores:
+            score_val = int(scores.get(comp_key, 0))
+            if score_val > 0:
+                score_str = f"{score_val} (green tick)"
+                icon = "✅"
+                badge_color = "#10b981"
+                badge_bg = "rgba(16, 185, 129, 0.15)"
+                badge_border = "rgba(16, 185, 129, 0.35)"
+            elif score_val == 0:
+                score_str = f"0 (red cross)"
+                icon = "❌"
+                badge_color = "#ef4444"
+                badge_bg = "rgba(239, 68, 68, 0.12)"
+                badge_border = "rgba(239, 68, 68, 0.3)"
+            else:
+                score_str = f"{score_val} (red cross)"
+                icon = "❌"
+                badge_color = "#f59e0b"
+                badge_bg = "rgba(245, 158, 11, 0.15)"
+                badge_border = "rgba(245, 158, 11, 0.35)"
+            active_items.append({
+                "label": label,
+                "score": score_val,
+                "score_str": score_str,
+                "icon": icon,
+                "color": badge_color,
+                "bg": badge_bg,
+                "border": badge_border,
+            })
+
+    items_html = ""
+    for item in active_items:
+        items_html += f"""
+        <div style="background: rgba(30, 41, 59, 0.7); border: 1px solid {item['border']}; border-radius: 6px; padding: 7px 12px; display: flex; justify-content: space-between; align-items: center;">
+            <span style="color: #cbd5e1; font-weight: 600; font-size: 0.88rem;">{item['label']}:</span>
+            <span style="color: {item['color']}; font-weight: 700; font-size: 0.88rem; background: {item['bg']}; border: 1px solid {item['border']}; padding: 2px 8px; border-radius: 4px;">
+                {item['score_str']} {item['icon']}
+            </span>
+        </div>
+        """
+
+    time_sub = f"Bar Closed at <b>{bar_closed_at_str}</b>" if bar_closed_at_str else "Latest Candle Close"
+
+    html = f"""
+    <div style="background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.96)); border: 1px solid rgba(16, 185, 129, 0.45); border-radius: 10px; padding: 14px 18px; margin: 0 0 16px 0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+        <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid rgba(148, 163, 184, 0.2); padding-bottom: 8px;">
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <span style="font-size: 0.98rem; font-weight: 700; color: #10b981; letter-spacing: 0.3px;">
+                    📊 Score details of Signal Bar Close
+                </span>
+                <span style="background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.35); padding: 3px 10px; border-radius: 4px; font-size: 0.82rem; font-weight: 600;">
+                    Strategy Name: {strategy_name}
+                </span>
+            </div>
+            <div style="font-size: 0.82rem; color: #94a3b8;">
+                ⏱️ {time_sub} &nbsp;|&nbsp; 🔄 <i>Refreshes dynamically with Kotak Live 2s loop</i>
+            </div>
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 8px; margin-bottom: 12px;">
+            {items_html}
+        </div>
+        <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid rgba(148, 163, 184, 0.15); padding-top: 8px; font-size: 0.92rem;">
+            <div>
+                <span style="color: #cbd5e1; font-weight: 600;">Total Score:</span>
+                <span style="color: #38bdf8; font-weight: 800; font-size: 1.15rem; margin-left: 6px;">{latest_score}</span>
+                <span style="display: none;">Total Score; {latest_score}</span>
+                <span style="font-size: 0.8rem; color: #94a3b8; margin-left: 8px;">(Threshold: Long &ge; {long_th} | Short &le; {short_th})</span>
+            </div>
+            <div style="font-size: 0.8rem; color: #94a3b8;">
+                Strategy: <b>{strategy_name}</b> &nbsp;|&nbsp; Enabled Indicators: <b>{len(active_items)}</b>
+            </div>
+        </div>
+    </div>
+    """
+    return html
+
+
 def render_paper_trade_hud_and_watchtower(
     is_live_running: bool,
     active_open_trade: Optional[dict],
@@ -119,6 +236,9 @@ def render_paper_trade_hud_and_watchtower(
     active_instrument: str,
     snooze_min: int = 0,
     last_exit_dt: Optional[datetime] = None,
+    indicator_scores: Optional[Dict[str, int]] = None,
+    ind_cfg: Optional[Dict[str, Any]] = None,
+    bar_closed_at_str: Optional[str] = None,
 ):
     """
     Renders Hybrid Live Trade Status:
@@ -243,6 +363,18 @@ def render_paper_trade_hud_and_watchtower(
         </div>
         """)
 
+        # Score details of Signal Bar Close section below Trade Active Ribbon
+        score_details_card = build_score_details_html(
+            strategy_name=selected_strat,
+            indicator_scores=indicator_scores,
+            ind_cfg=ind_cfg,
+            latest_score=latest_score,
+            bar_closed_at_str=bar_closed_at_str,
+            long_th=long_th,
+            short_th=short_th,
+        )
+        render_html_block(score_details_card)
+
         # 2. Collapsible Watchtower Command Deck
         with st.expander("🔭 Trade Watchtower — In-Depth Lifecycle, Risk & Trajectory Deck", expanded=True):
             w_col1, w_col2, w_col3, w_col4 = st.columns(4)
@@ -321,6 +453,18 @@ def render_paper_trade_hud_and_watchtower(
             </div>
         </div>
         """)
+
+        # Section: Score details of Signal Bar Close below SCANNING FOR SIGNALS
+        score_details_card = build_score_details_html(
+            strategy_name=selected_strat,
+            indicator_scores=indicator_scores,
+            ind_cfg=ind_cfg,
+            latest_score=latest_score,
+            bar_closed_at_str=bar_closed_at_str,
+            long_th=long_th,
+            short_th=short_th,
+        )
+        render_html_block(score_details_card)
 
         with st.expander("🔭 Trade Watchtower — Standby & Strategy Parameters Deck", expanded=False):
             w_col1, w_col2, w_col3, w_col4 = st.columns(4)
@@ -796,13 +940,15 @@ def render_paper_trade_module():
     timeframe_m = int(inst_cfg.get("timeframe", 1))
 
     # Fetch underlying intraday candles from Kotak gateway or local fallbacks
-    underlying_candles = gateway.fetch_historical_candles(
-        symbol=underlying_name,
-        instrument_key=inst_cfg.get("instrument_key", ""),
-        timeframe_minutes=timeframe_m,
-        start_date=today,
-        end_date=today,
-    )
+    underlying_candles = pd.DataFrame()
+    if underlying_name not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY 50"):
+        underlying_candles = gateway.fetch_historical_candles(
+            symbol=underlying_name,
+            instrument_key=inst_cfg.get("instrument_key", ""),
+            timeframe_minutes=timeframe_m,
+            start_date=today,
+            end_date=today,
+        )
     if underlying_candles is None or underlying_candles.empty:
         for fb in [
             f"data/{underlying_name.lower()}_{timeframe_m}m.csv",
@@ -915,14 +1061,15 @@ def render_paper_trade_module():
     )
 
     latest_score = 0
+    latest_components: Dict[str, int] = {}
     scored_candles = pd.DataFrame()
     if candles_df is not None and not candles_df.empty:
         scored_candles = calculate_custom_indicators(candles_df, custom_cfg)
         if not scored_candles.empty:
-            scored_candles["consensus_score"] = [
-                int(sum(score_custom_row(r, custom_cfg).values())) for _, r in scored_candles.iterrows()
-            ]
+            all_comp = [score_custom_row(r, custom_cfg) for _, r in scored_candles.iterrows()]
+            scored_candles["consensus_score"] = [int(sum(c.values())) for c in all_comp]
             latest_score = int(scored_candles.iloc[-1]["consensus_score"])
+            latest_components = all_comp[-1] if all_comp else {}
 
     # Constant Display of Both Trigger & Signal Bar Check Sections during active session
     if is_live_running:
@@ -1020,6 +1167,9 @@ def render_paper_trade_module():
             active_instrument=active_instrument,
             snooze_min=hud_snooze_min,
             last_exit_dt=hud_last_exit,
+            indicator_scores=latest_components,
+            ind_cfg=ind_cfg,
+            bar_closed_at_str=bar_closed_at_str,
         )
 
     # If live running, check market hours and strategy square-off time; if past square-off or market closed, auto square off and stop

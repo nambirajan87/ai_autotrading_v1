@@ -666,6 +666,102 @@ def test_audit_trail_includes_index_ltp(temp_paper_db):
     assert t.get("index_ltp") == 22766.70
 
 
+def test_build_score_details_html_papertrade_test_oi_v2():
+    """
+    Verifies that build_score_details_html correctly formats the section:
+    - Section header: 'Score details of Signal Bar Close'
+    - Strategy Name: 'PAPERTRADE_TEST_OI_V2'
+    - Lists enabled indicators with (green tick) / (red cross) and score values:
+      EMA: 1 (green tick)
+      RSI: 0 (red cross)
+      MACD: 1 (green tick)
+      VWAP: 1 (green tick)
+      ADX: 1 (green tick)
+      Volume: 0 (red cross)
+      Higher High: 0 (red cross)
+    - Total Score: 4
+    """
+    from app.ui.paper_trade_app import build_score_details_html
+
+    sample_scores = {
+        "ema": 1,
+        "rsi": 0,
+        "macd": 1,
+        "vwap": 1,
+        "adx": 1,
+        "volume": 0,
+        "higher_high": 0,
+    }
+    sample_cfg = {
+        "ema_enabled": True,
+        "rsi_enabled": True,
+        "macd_enabled": True,
+        "vwap_enabled": True,
+        "adx_enabled": True,
+        "volume_enabled": True,
+        "higher_high_enabled": True,
+        "lower_low_enabled": False,
+        "supertrend_enabled": False,
+        "hma_enabled": False,
+        "bollinger_enabled": False,
+        "stoch_enabled": False,
+        "obv_enabled": False,
+    }
+
+    html = build_score_details_html(
+        strategy_name="PAPERTRADE_TEST_OI_V2",
+        indicator_scores=sample_scores,
+        ind_cfg=sample_cfg,
+        latest_score=4,
+        bar_closed_at_str="14:35:00",
+        long_th=1,
+        short_th=-1,
+    )
+
+    # Validate section title
+    assert "Score details of Signal Bar Close" in html
+
+    # Validate Strategy Name
+    assert "Strategy Name: PAPERTRADE_TEST_OI_V2" in html
+
+    # Validate indicator lines
+    assert "EMA:" in html and "1 (green tick)" in html
+    assert "RSI:" in html and "0 (red cross)" in html
+    assert "MACD:" in html and "1 (green tick)" in html
+    assert "VWAP:" in html and "1 (green tick)" in html
+    assert "ADX:" in html and "1 (green tick)" in html
+    assert "Volume:" in html and "0 (red cross)" in html
+    assert "Higher High:" in html and "0 (red cross)" in html
+
+    # Validate Total Score
+    assert "Total Score:" in html and "4" in html
+
+    # Validate disabled indicators are NOT in the list
+    assert "Lower Low:" not in html
+    assert "Supertrend:" not in html
+    assert "HMA:" not in html
+
+
+def test_build_score_details_html_automatic_strategy_resolution():
+    """
+    Verifies that build_score_details_html resolves strategy config from strategy store
+    if ind_cfg is empty or omitted.
+    """
+    from app.ui.paper_trade_app import build_score_details_html
+
+    html = build_score_details_html(
+        strategy_name="PAPERTRADE_TEST_OI_V2",
+        indicator_scores={"ema": 1, "rsi": 0},
+        ind_cfg=None,
+        latest_score=1,
+    )
+    assert "Score details of Signal Bar Close" in html
+    assert "Strategy Name: PAPERTRADE_TEST_OI_V2" in html
+    assert "EMA:" in html
+    assert "RSI:" in html
+
+
+
 
 
 
