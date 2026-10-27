@@ -619,115 +619,205 @@ def render_live_trade_module():
 
         if active_open_trade is None and not risk_blocked:
             # Check for new entry signal strictly within market hours & strategy entry window
-            trade_symbol = active_instrument
             if fo_mode == "OIPulse Mode":
-                from app.strategy.oipulse_resolver import resolve_oipulse_option
+                from app.strategy.oipulse_resolver import (
+                    resolve_oipulse_option,
+                    calculate_option_price,
+                    get_live_oipulse_status,
+                )
+                underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
+                oi_status = get_live_oipulse_status(underlying=underlying_name)
                 oi_res = resolve_oipulse_option(
-                    underlying=inst_cfg.get("underlying") or "NIFTY",
+                    underlying=underlying_name,
                     candle_dt=datetime.now(),
                     live_ltp=live_ltp,
+                    live_strength=oi_status.get("strength_val"),
                 )
-                if oi_res.get("has_signal"):
+
+                # CRITICAL FIX: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
+                # Trade must NEVER be executed using NIFTY instrument directly.
+                if not oi_res.get("has_signal") or not oi_res.get("is_valid_symbol") or oi_res.get("option_type") not in ("CE", "PE"):
+                    st.info(
+                        f"📡 **OI Pulse Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
+                        f"(within neutral band -50% to +50%). Trade entry blocked: Waiting for momentum breakout (> +50% for CE, < -50% for PE) "
+                        f"before constructing active option contract from {underlying_name} Option Chain. "
+                        f"Underlying '{underlying_name}' will NOT be traded directly."
+                    )
+                else:
+                    opt_type = oi_res["option_type"]  # "CE" or "PE"
                     trade_symbol = oi_res["resolved_symbol"]
 
-            if latest_score >= long_th and side_val in ("BOTH", "LONG"):
-                entry_p = live_ltp
-                tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
-                sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
-                next_tid = 6000 + len(real_trades) + 1
+                    if trade_symbol == underlying_name or trade_symbol in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                        st.error(f"Cannot execute trade: Resolved symbol '{trade_symbol}' is underlying index, not option contract.")
+                    else:
+                        signal_matched = False
+                        if opt_type == "CE" and latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                            signal_matched = True
+                        elif opt_type == "PE" and latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                            signal_matched = True
 
-                # Trigger Live Orders on Kotak
-                entry_order = gw.place_market_order(
-                    symbol=trade_symbol,
-                    side="BUY",
-                    quantity=lot_size,
-                    reference_price=entry_p,
-                )
-                entry_fill_time = entry_order.fill_time or now_time_str
-                entry_fill_price = float(entry_order.fill_price or entry_p)
+                        if signal_matched:
+                            opt_price = float(gw.get_ltp(trade_symbol) or 0.0)
+                            if opt_price <= 0:
+                                opt_price = calculate_option_price(
+                                    underlying_price=live_ltp,
+                                    strike_price=float(oi_res["strike"]),
+                                    option_type=opt_type,
+                                    candle_dt=datetime.now(),
+                                    expiry_dt=oi_res["expiry_date"],
+                                )
+                            entry_p = round(max(opt_price, 10.0), 2)
+                            tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                            sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                            next_tid = 6000 + len(real_trades) + 1
 
-                # Place Target limit order
-                tgt_order = gw.place_target_order(
-                    symbol=trade_symbol,
-                    side="SELL",
-                    quantity=lot_size,
-                    target_price=tgt_p,
-                )
+                            # Trigger Live Orders on Kotak for option contract
+                            entry_order = gw.place_market_order(
+                                symbol=trade_symbol,
+                                side="BUY",
+                                quantity=lot_size,
+                                reference_price=entry_p,
+                            )
+                            entry_fill_time = entry_order.fill_time or now_time_str
+                            entry_fill_price = float(entry_order.fill_price or entry_p)
 
-                # Place Stop Loss SL-M order
-                sl_order = gw.place_stoploss_order(
-                    symbol=trade_symbol,
-                    side="SELL",
-                    quantity=lot_size,
-                    stoploss_price=sl_p,
-                )
+                            # Place Target limit order
+                            tgt_order = gw.place_target_order(
+                                symbol=trade_symbol,
+                                side="SELL",
+                                quantity=lot_size,
+                                target_price=tgt_p,
+                            )
 
-                # Add active record in Live Trade database
-                live_db.save_active_trade(
-                    strategy_name=selected_strat,
-                    symbol=trade_symbol,
-                    session_date=today_str,
-                    trade_id=next_tid,
-                    side="LONG",
-                    quantity=lot_size,
-                    entry_time=entry_fill_time,
-                    entry_price=entry_fill_price,
-                    stop_loss=sl_p,
-                    target=tgt_p,
-                    score=latest_score,
-                    regime="TRENDING",
-                )
-                st.toast(f"🟢 Kotak Live: Executed LONG Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
-                st.rerun()
+                            # Place Stop Loss SL-M order
+                            sl_order = gw.place_stoploss_order(
+                                symbol=trade_symbol,
+                                side="SELL",
+                                quantity=lot_size,
+                                stoploss_price=sl_p,
+                            )
 
-            elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
-                entry_p = live_ltp
-                tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
-                sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
-                next_tid = 6000 + len(real_trades) + 1
+                            # Add active record in Live Trade database
+                            live_db.save_active_trade(
+                                strategy_name=selected_strat,
+                                symbol=trade_symbol,
+                                session_date=today_str,
+                                trade_id=next_tid,
+                                side="LONG",
+                                quantity=lot_size,
+                                entry_time=entry_fill_time,
+                                entry_price=entry_fill_price,
+                                stop_loss=sl_p,
+                                target=tgt_p,
+                                score=latest_score,
+                                regime="TRENDING",
+                            )
+                            st.toast(f"🟢 Kotak Live: Executed LONG {opt_type} Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
+                            st.rerun()
 
-                # Trigger Live Orders on Kotak
-                entry_order = gw.place_market_order(
-                    symbol=trade_symbol,
-                    side="SELL",
-                    quantity=lot_size,
-                    reference_price=entry_p,
-                )
-                entry_fill_time = entry_order.fill_time or now_time_str
-                entry_fill_price = float(entry_order.fill_price or entry_p)
+            else:
+                # Normal Mode (fo_mode != "OIPulse Mode"):
+                trade_symbol = active_instrument
+                if latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                    entry_p = live_ltp
+                    tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                    sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                    next_tid = 6000 + len(real_trades) + 1
 
-                # Place Target limit order
-                tgt_order = gw.place_target_order(
-                    symbol=trade_symbol,
-                    side="BUY",
-                    quantity=lot_size,
-                    target_price=tgt_p,
-                )
+                    # Trigger Live Orders on Kotak
+                    entry_order = gw.place_market_order(
+                        symbol=trade_symbol,
+                        side="BUY",
+                        quantity=lot_size,
+                        reference_price=entry_p,
+                    )
+                    entry_fill_time = entry_order.fill_time or now_time_str
+                    entry_fill_price = float(entry_order.fill_price or entry_p)
 
-                # Place Stop Loss SL-M order
-                sl_order = gw.place_stoploss_order(
-                    symbol=trade_symbol,
-                    side="BUY",
-                    quantity=lot_size,
-                    stoploss_price=sl_p,
-                )
+                    # Place Target limit order
+                    tgt_order = gw.place_target_order(
+                        symbol=trade_symbol,
+                        side="SELL",
+                        quantity=lot_size,
+                        target_price=tgt_p,
+                    )
 
-                # Add active record in Live Trade database
-                live_db.save_active_trade(
-                    strategy_name=selected_strat,
-                    symbol=trade_symbol,
-                    session_date=today_str,
-                    trade_id=next_tid,
-                    side="SHORT",
-                    quantity=lot_size,
-                    entry_time=entry_fill_time,
-                    entry_price=entry_fill_price,
-                    stop_loss=sl_p,
-                    target=tgt_p,
-                    score=latest_score,
-                    regime="TRENDING",
-                )
-                st.toast(f"🔴 Kotak Live: Executed SHORT Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🔴")
+                    # Place Stop Loss SL-M order
+                    sl_order = gw.place_stoploss_order(
+                        symbol=trade_symbol,
+                        side="SELL",
+                        quantity=lot_size,
+                        stoploss_price=sl_p,
+                    )
+
+                    # Add active record in Live Trade database
+                    live_db.save_active_trade(
+                        strategy_name=selected_strat,
+                        symbol=trade_symbol,
+                        session_date=today_str,
+                        trade_id=next_tid,
+                        side="LONG",
+                        quantity=lot_size,
+                        entry_time=entry_fill_time,
+                        entry_price=entry_fill_price,
+                        stop_loss=sl_p,
+                        target=tgt_p,
+                        score=latest_score,
+                        regime="TRENDING",
+                    )
+                    st.toast(f"🟢 Kotak Live: Executed LONG Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🟢")
+                    st.rerun()
+
+                elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                    entry_p = live_ltp
+                    tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
+                    sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
+                    next_tid = 6000 + len(real_trades) + 1
+
+                    # Trigger Live Orders on Kotak
+                    entry_order = gw.place_market_order(
+                        symbol=trade_symbol,
+                        side="SELL",
+                        quantity=lot_size,
+                        reference_price=entry_p,
+                    )
+                    entry_fill_time = entry_order.fill_time or now_time_str
+                    entry_fill_price = float(entry_order.fill_price or entry_p)
+
+                    # Place Target limit order
+                    tgt_order = gw.place_target_order(
+                        symbol=trade_symbol,
+                        side="BUY",
+                        quantity=lot_size,
+                        target_price=tgt_p,
+                    )
+
+                    # Place Stop Loss SL-M order
+                    sl_order = gw.place_stoploss_order(
+                        symbol=trade_symbol,
+                        side="BUY",
+                        quantity=lot_size,
+                        stoploss_price=sl_p,
+                    )
+
+                    # Add active record in Live Trade database
+                    live_db.save_active_trade(
+                        strategy_name=selected_strat,
+                        symbol=trade_symbol,
+                        session_date=today_str,
+                        trade_id=next_tid,
+                        side="SHORT",
+                        quantity=lot_size,
+                        entry_time=entry_fill_time,
+                        entry_price=entry_fill_price,
+                        stop_loss=sl_p,
+                        target=tgt_p,
+                        score=latest_score,
+                        regime="TRENDING",
+                    )
+                    st.toast(f"🔴 Kotak Live: Executed SHORT Trade #{next_tid} on {trade_symbol} @ ₹{entry_fill_price:.2f}!", icon="🔴")
+                    st.rerun()
+
                 st.rerun()
 
         elif active_open_trade is not None:

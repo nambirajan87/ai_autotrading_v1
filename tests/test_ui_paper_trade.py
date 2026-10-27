@@ -558,4 +558,77 @@ def test_papertrade_test_oi_v2_strategy_config_and_scheduler_default():
     assert ActiveSchedulerConfig.default_strategy == "PAPERTRADE_TEST_OI_V2"
 
 
+def test_parse_oipulse_contract_symbol():
+    """Verifies that parse_oipulse_contract_symbol properly extracts underlying, expiry, strike, and opt_type."""
+    from app.strategy.oipulse_resolver import parse_oipulse_contract_symbol
+
+    pe_res = parse_oipulse_contract_symbol("NIFTY26OCT22400PE", underlying="NIFTY")
+    assert pe_res is not None
+    assert pe_res["underlying"] == "NIFTY"
+    assert pe_res["strike"] == 22400
+    assert pe_res["option_type"] == "PE"
+    assert pe_res["expiry_code"] == "26OCT"
+
+    ce_res = parse_oipulse_contract_symbol("NIFTY26S0124000CE", underlying="NIFTY")
+    assert ce_res is not None
+    assert ce_res["underlying"] == "NIFTY"
+    assert ce_res["strike"] == 24000
+    assert ce_res["option_type"] == "CE"
+
+    # Index symbol 'NIFTY' must NOT parse as option contract
+    assert parse_oipulse_contract_symbol("NIFTY", underlying="NIFTY") is None
+    assert parse_oipulse_contract_symbol("BANKNIFTY", underlying="BANKNIFTY") is None
+
+
+def test_oipulse_neutral_band_blocks_trade_and_prevents_nifty_execution():
+    """Verifies that when OI strength is within neutral band (-50 to +50):
+    1. resolve_oipulse_option yields has_signal=False
+    2. Trade execution is strictly blocked
+    3. Underlying 'NIFTY' is never traded directly"""
+    from datetime import datetime
+    from app.strategy.oipulse_resolver import resolve_oipulse_option
+
+    # Case 1: Real-world neutral OI strength +12%
+    neutral_res = resolve_oipulse_option(
+        underlying="NIFTY",
+        candle_dt=datetime(2026, 10, 27, 10, 16, 0),
+        live_ltp=22766.70,
+        live_strength=12.0,
+    )
+    assert neutral_res["has_signal"] is False
+    assert neutral_res["option_type"] == "No Signal"
+    assert neutral_res["strike"] is None
+    # In neutral band, resolved_symbol must NOT trigger a trade
+    assert neutral_res["signal"] == "HOLD"
+
+    # Case 2: Bearish breakout (-95%) resolves PE contract from option chain
+    bearish_res = resolve_oipulse_option(
+        underlying="NIFTY",
+        candle_dt=datetime(2026, 10, 27, 10, 16, 0),
+        live_ltp=22766.70,
+        live_strength=-95.0,
+    )
+    assert bearish_res["has_signal"] is True
+    assert bearish_res["option_type"] == "PE"
+    assert bearish_res["strike"] is not None
+    assert bearish_res["resolved_symbol"].startswith("NIFTY")
+    assert bearish_res["resolved_symbol"].endswith("PE")
+    assert bearish_res["resolved_symbol"] != "NIFTY"
+
+    # Case 3: Bullish breakout (+85%) resolves CE contract from option chain
+    bullish_res = resolve_oipulse_option(
+        underlying="NIFTY",
+        candle_dt=datetime(2026, 10, 27, 10, 16, 0),
+        live_ltp=22766.70,
+        live_strength=85.0,
+    )
+    assert bullish_res["has_signal"] is True
+    assert bullish_res["option_type"] == "CE"
+    assert bullish_res["strike"] is not None
+    assert bullish_res["resolved_symbol"].startswith("NIFTY")
+    assert bullish_res["resolved_symbol"].endswith("CE")
+    assert bullish_res["resolved_symbol"] != "NIFTY"
+
+
+
 

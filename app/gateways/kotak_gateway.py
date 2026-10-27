@@ -611,13 +611,16 @@ class KotakGateway(BaseBrokerGateway):
             except Exception:
                 pass
 
-            if not tok:
+            # CRITICAL: Do NOT run fuzzy search for base index symbols (NIFTY, BANKNIFTY, etc.)
+            # as it will match arbitrary futures/options (e.g. MIDCPNIFTY 48703) and query the wrong segment!
+            if not tok and target_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY50", "NIFTY 50"):
                 try:
                     scrips = self.smart_search_instruments(symbol)
                     for sc in scrips:
                         p_sym = str(sc.get("pSymbol") or "").strip()
                         if p_sym.isdigit():
                             tok = p_sym
+                            seg = sc.get("exchange_segment") or sc.get("pExchSeg") or "nse_fo"
                             break
                 except Exception:
                     pass
@@ -1367,13 +1370,14 @@ class KotakGateway(BaseBrokerGateway):
                             break
             except Exception:
                 pass
-            if not tok:
+            if not tok and target_sym not in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY50", "NIFTY 50"):
                 try:
                     scrips = self.smart_search_instruments(raw_sym)
                     for sc in scrips:
                         p_sym = str(sc.get("pSymbol") or "").strip()
                         if p_sym.isdigit():
                             tok = p_sym
+                            seg = sc.get("exchange_segment") or sc.get("pExchSeg") or "nse_fo"
                             break
                 except Exception:
                     pass

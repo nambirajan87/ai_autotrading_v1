@@ -466,9 +466,10 @@ def render_paper_trade_module():
 
     # Resolve active instrument
     fo_mode = inst_cfg.get("fo_mode", "Normal Mode")
+    underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
     active_instrument = inst_cfg.get("tradingsymbol") or inst_cfg.get("symbol") or "NIFTY26OCT22500PE"
     if fo_mode == "OIPulse Mode":
-        active_instrument = inst_cfg.get("underlying") or "NIFTY"
+        active_instrument = underlying_name
     elif active_instrument in ("NIFTY", "BANKNIFTY", None, ""):
         active_instrument = "NIFTY26OCT22500PE"
 
@@ -488,8 +489,12 @@ def render_paper_trade_module():
     tsl_info = " | Trailing SL: Model B Active" + (" (Runner)" if tsl_runner else "") if tsl_on else ""
 
     # Page Heading: Display "Strategy Name" as Heading
-    st.header(f"Results: {selected_strat} ({active_instrument})")
+    if fo_mode == "OIPulse Mode":
+        st.header(f"Results: {selected_strat} ({underlying_name} Option Chain)")
+    else:
+        st.header(f"Results: {selected_strat} ({active_instrument})")
     st.caption(f"Strategy: `{selected_strat}` | Period: {one_month_ago_str} to {today_str}{tsl_info} | Square-off Time: **{strategy_sq_time.strftime('%H:%M')} IST**")
+
 
     # Notice
     st.warning("⚠️ **Notice:** Past results do not predict future results. Changing parameters after seeing results turns this data into in-sample data.")
@@ -623,9 +628,22 @@ def render_paper_trade_module():
     is_mkt_open, mkt_msg = check_market_trading_hours()
     mkt_badge = "🟢 `OPEN` (09:15 - 15:30 IST)" if is_mkt_open else f"🔴 `CLOSED` ({mkt_msg})"
 
+    # Render OI Pulse Live Strength Feed & Status
+    from app.strategy.oipulse_resolver import get_live_oipulse_status
+    from scripts.schedule_oipulse_strength import is_paper_trade_auto_triggered, ActiveSchedulerConfig
+
+    oi_status = get_live_oipulse_status(underlying=underlying_name)
+
     pt_col1, pt_col2, pt_col3 = st.columns([3, 2, 2])
     with pt_col1:
-        st.markdown(f"**Active Instrument:** `{active_instrument}` &nbsp;|&nbsp; **Segment:** `{inst_cfg.get('market_segment', 'NSE F&O')}`")
+        if fo_mode == "OIPulse Mode":
+            if oi_status.get("has_active_instrument") and oi_status.get("active_instrument"):
+                inst_badge = f"`{oi_status['active_instrument']}` ({oi_status.get('option_type')} Strike {oi_status.get('strike')})"
+            else:
+                inst_badge = f"*Standby* (Neutral OI Strength: `{oi_status.get('strength_str', '0%')}` &bull; Waiting for >50% or <-50%)"
+            st.markdown(f"**Underlying:** `{underlying_name}` &nbsp;|&nbsp; **Constructed Active Instrument:** {inst_badge} &nbsp;|&nbsp; **Mode:** `OIPulse Mode`")
+        else:
+            st.markdown(f"**Active Instrument:** `{active_instrument}` &nbsp;|&nbsp; **Segment:** `{inst_cfg.get('market_segment', 'NSE F&O')}`")
         st.caption(f"Strategy Dates: **{strat_from}** to **{strat_to}** | Today's Date: **{today_str}**")
     with pt_col2:
         date_badge = "🟢 Strategy Dates Validated (Current Date)" if date_is_current else "🔴 Date Mismatch (Update to Current Date)"
@@ -641,12 +659,6 @@ def render_paper_trade_module():
         strat_from = today_str
         strat_to = today_str
         date_is_current = True
-
-    # Render OI Pulse Live Strength Feed
-    from app.strategy.oipulse_resolver import get_live_oipulse_status
-    from scripts.schedule_oipulse_strength import is_paper_trade_auto_triggered, ActiveSchedulerConfig
-
-    oi_status = get_live_oipulse_status(underlying=inst_cfg.get("underlying") or "NIFTY")
 
     st.markdown("##### 📡 OI Pulse Live Strength Feed (1-Min Backend Triggers)")
     oi_c1, oi_c2, oi_c3, oi_c4, oi_c5, oi_c6 = st.columns(6)
@@ -706,10 +718,14 @@ def render_paper_trade_module():
 
     with exec_col2:
         if is_live_running:
+            if fo_mode == "OIPulse Mode":
+                inst_watching = f"**{underlying_name} Option Chain** (Constructed Active Instrument: `{oi_status.get('active_instrument') or 'Standby (Neutral Band)'}`)"
+            else:
+                inst_watching = f"**{active_instrument}**"
             st.success(
                 f"🟢 **Auto-Trigger Active (09:16 AM Market Window):** Execution engine auto-triggered and is continuously **watching for OI Strength** "
-                f"for **{active_instrument}**.\n\n"
-                f"📡 **OI Pulse Status:** Triggering every 1 min (:13s) &bull; Market Window: **Monday - Friday, 09:15 AM - 03:15 PM** &bull; "
+                f"for {inst_watching}.\n\n"
+                f"📡 **OI Pulse Status:** Triggering every 1 min (:14s) &bull; Market Window: **Monday - Friday, 09:15 AM - 03:15 PM** &bull; "
                 f"Trigger Active: **09:16:00 IST** &bull; Auto-Refresh: **2 seconds** &bull; Session Started: **{st.session_state.get('paper_live_start_time', '')}**"
             )
         elif user_paused:
@@ -717,6 +733,7 @@ def render_paper_trade_module():
                 "⏸️ **Paper Trade Session Paused by User:** Watching OI Strength is temporarily paused. "
                 "Click **'▶️ Resume Watching OI Strength'** on the left to re-engage continuous scanning."
             )
+
         else:
             if datetime.now().weekday() < 5 and now_curr_time < time(9, 16):
                 st.info(
@@ -739,8 +756,15 @@ def render_paper_trade_module():
             active_open_trade = open_rows.iloc[0].to_dict()
 
     gateway = get_gateway("KOTAK")
-    depth = gateway.get_live_market_depth(active_instrument, inst_cfg.get("instrument_key"))
-    live_ltp = float(depth.get("ltp") or 0.0)
+    # For spot index names like NIFTY, use live spot LTP from OI Pulse feed directly to prevent invalid Kotak scrip calls
+    if active_instrument in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTY 50") and oi_status.get("ltp"):
+        live_ltp = float(oi_status["ltp"])
+        depth = {"ltp": live_ltp, "buy_depth": [], "sell_depth": [], "total_buy_qty": 0, "total_sell_qty": 0}
+    else:
+        depth = gateway.get_live_market_depth(active_instrument, inst_cfg.get("instrument_key"))
+        live_ltp = float(depth.get("ltp") or 0.0)
+        if (not live_ltp or live_ltp <= 0.0) and oi_status.get("ltp"):
+            live_ltp = float(oi_status["ltp"])
 
     # Fetch today's intraday candles
     timeframe_m = int(inst_cfg.get("timeframe", 5))
@@ -871,11 +895,37 @@ def render_paper_trade_module():
                 except Exception:
                     pass
 
+        # Open trade current price for HUD & exit evaluation
+        hud_trade_ltp = live_ltp
+        if active_open_trade is not None:
+            open_sym = str(active_open_trade.get("symbol") or "")
+            open_ep = float(active_open_trade.get("entry_price", live_ltp))
+            opt_q = gateway.get_ltp(open_sym)
+            if opt_q and float(opt_q) > 0:
+                hud_trade_ltp = float(opt_q)
+            elif fo_mode == "OIPulse Mode":
+                from app.strategy.oipulse_resolver import parse_oipulse_contract_symbol, calculate_option_price, resolve_nearest_expiry_date
+                parsed_sym = parse_oipulse_contract_symbol(open_sym, underlying=underlying_name)
+                if parsed_sym:
+                    exp_dt, _ = resolve_nearest_expiry_date(datetime.now().date(), underlying=parsed_sym["underlying"])
+                    calc_p = calculate_option_price(
+                        underlying_price=live_ltp,
+                        strike_price=float(parsed_sym["strike"]),
+                        option_type=parsed_sym["option_type"],
+                        candle_dt=datetime.now(),
+                        expiry_dt=exp_dt,
+                    )
+                    hud_trade_ltp = round(max(calc_p, 1.0), 2)
+                else:
+                    hud_trade_ltp = open_ep
+            else:
+                hud_trade_ltp = open_ep
+
         # Render Hybrid Option 1 (HUD Ribbon) & Collapsible Option 2 (Trade Watchtower)
         render_paper_trade_hud_and_watchtower(
             is_live_running=is_live_running,
             active_open_trade=active_open_trade,
-            live_ltp=live_ltp,
+            live_ltp=hud_trade_ltp,
             candles_df=candles_df,
             timeframe_m=timeframe_m,
             strategy_sq_time=strategy_sq_time,
@@ -900,14 +950,14 @@ def render_paper_trade_module():
             st.session_state.paper_executing_live = False
             if active_open_trade is not None:
                 now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                e_p = float(active_open_trade.get("entry_price", live_ltp))
+                e_p = float(active_open_trade.get("entry_price", hud_trade_ltp))
                 e_side = active_open_trade.get("side", "LONG")
-                gross = (live_ltp - e_p) * int(active_open_trade.get("quantity", 65)) if e_side == "LONG" else (e_p - live_ltp) * int(active_open_trade.get("quantity", 65))
+                gross = (hud_trade_ltp - e_p) * int(active_open_trade.get("quantity", 65)) if e_side == "LONG" else (e_p - hud_trade_ltp) * int(active_open_trade.get("quantity", 65))
                 exit_reason = "SQUARE_OFF" if now_time >= strategy_sq_time else "MARKET_CLOSE_SQUARE_OFF"
                 paper_db.close_active_trade(
                     trade_id_or_row_id=active_open_trade.get("id"),
                     exit_time=now_ts,
-                    exit_price=live_ltp,
+                    exit_price=hud_trade_ltp,
                     exit_reason=exit_reason,
                     gross_pnl=round(gross, 2),
                     charges=20.0,
@@ -948,101 +998,180 @@ def render_paper_trade_module():
                 st.info(f"⏳ Current time ({now_time.strftime('%H:%M:%S')}) is past Strategy Entry End ({strategy_entry_end.strftime('%H:%M')}) / Square-off ({strategy_sq_time.strftime('%H:%M')}) from Risk Parameters. New entries are blocked.")
             elif not snooze_active:
                 # Check for new entry signal strictly within market hours & strategy entry window
-                trade_symbol = active_instrument
                 if fo_mode == "OIPulse Mode":
-                    from app.strategy.oipulse_resolver import resolve_oipulse_option
+                    from app.strategy.oipulse_resolver import (
+                        resolve_oipulse_option,
+                        calculate_option_price,
+                    )
                     oi_res = resolve_oipulse_option(
-                        underlying=inst_cfg.get("underlying") or "NIFTY",
+                        underlying=underlying_name,
                         candle_dt=datetime.now(),
                         live_ltp=live_ltp,
+                        live_strength=oi_status.get("strength_val"),
                     )
-                    if oi_res.get("has_signal"):
+
+                    # CRITICAL FIX: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
+                    # Trade must NEVER be executed using NIFTY instrument directly.
+                    if not oi_res.get("has_signal") or not oi_res.get("is_valid_symbol") or oi_res.get("option_type") not in ("CE", "PE"):
+                        st.info(
+                            f"📡 **OI Pulse Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
+                            f"(within neutral band -50% to +50%). Trade entry blocked: Waiting for momentum breakout (> +50% for CE, < -50% for PE) "
+                            f"before constructing active option contract from {underlying_name} Option Chain. "
+                            f"Underlying '{underlying_name}' will NOT be traded directly."
+                        )
+                    else:
+                        opt_type = oi_res["option_type"]  # "CE" or "PE"
                         trade_symbol = oi_res["resolved_symbol"]
 
-                if latest_score >= long_th and side_val in ("BOTH", "LONG"):
-                    entry_p = live_ltp
-                    tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
-                    sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
-                    next_tid = 5000 + len(real_trades) + 1
+                        # Prohibit trading underlying index directly
+                        if trade_symbol == underlying_name or trade_symbol in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+                            st.error(f"Cannot execute trade: Resolved symbol '{trade_symbol}' is underlying index, not option contract.")
+                        else:
+                            # Verify signal alignment:
+                            # CE requires Bullish confirmation (latest_score >= long_th)
+                            # PE requires Bearish confirmation (latest_score <= short_th)
+                            signal_matched = False
+                            if opt_type == "CE" and latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                                signal_matched = True
+                            elif opt_type == "PE" and latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                                signal_matched = True
 
-                    # Dynamic Position Sizing (Fix 2)
-                    from app.risk.position_sizing import calculate_quantity
-                    risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
-                    max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
-                    max_quantity = int(risk_cfg.get("max_quantity", 5000))
-                    room = capital * max_exp_pct
-                    calc_qty = calculate_quantity(
-                        capital=capital,
-                        risk_pct=risk_pct,
-                        entry=entry_p,
-                        stop=sl_p,
-                        lot_size=lot_size,
-                        max_exposure_value=room,
-                        max_quantity=max_quantity,
-                    )
-                    trade_qty = calc_qty if calc_qty > 0 else lot_size
+                            if signal_matched:
+                                # Resolve realistic option premium entry price
+                                opt_price = float(gateway.get_ltp(trade_symbol) or 0.0)
+                                if opt_price <= 0:
+                                    opt_price = calculate_option_price(
+                                        underlying_price=live_ltp,
+                                        strike_price=float(oi_res["strike"]),
+                                        option_type=opt_type,
+                                        candle_dt=datetime.now(),
+                                        expiry_dt=oi_res["expiry_date"],
+                                    )
+                                entry_p = round(max(opt_price, 10.0), 2)
+                                tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                                sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                                next_tid = 5000 + len(real_trades) + 1
 
-                    paper_db.save_active_trade(
-                        strategy_name=selected_strat,
-                        symbol=trade_symbol,
-                        session_date=today_str,
-                        trade_id=next_tid,
-                        side="LONG",
-                        quantity=trade_qty,
-                        entry_time=now_time_str,
-                        entry_price=entry_p,
-                        stop_loss=sl_p,
-                        target=tgt_p,
-                        score=latest_score,
-                        regime="TRENDING",
-                    )
-                    st.toast(f"🟢 Executed LONG Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🟢")
-                    st.rerun()
+                                # Dynamic Position Sizing (Fix 2)
+                                from app.risk.position_sizing import calculate_quantity
+                                risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
+                                max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
+                                max_quantity = int(risk_cfg.get("max_quantity", 5000))
+                                room = capital * max_exp_pct
+                                calc_qty = calculate_quantity(
+                                    capital=capital,
+                                    risk_pct=risk_pct,
+                                    entry=entry_p,
+                                    stop=sl_p,
+                                    lot_size=lot_size,
+                                    max_exposure_value=room,
+                                    max_quantity=max_quantity,
+                                )
+                                trade_qty = calc_qty if calc_qty > 0 else lot_size
 
-                elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
-                    entry_p = live_ltp
-                    tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
-                    sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
-                    next_tid = 5000 + len(real_trades) + 1
+                                # Option Buying: buying CE or buying PE is entered as LONG position on option contract
+                                paper_db.save_active_trade(
+                                    strategy_name=selected_strat,
+                                    symbol=trade_symbol,
+                                    session_date=today_str,
+                                    trade_id=next_tid,
+                                    side="LONG",
+                                    quantity=trade_qty,
+                                    entry_time=now_time_str,
+                                    entry_price=entry_p,
+                                    stop_loss=sl_p,
+                                    target=tgt_p,
+                                    score=latest_score,
+                                    regime="TRENDING",
+                                )
+                                st.toast(f"🟢 Executed LONG {opt_type} Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🟢")
+                                st.rerun()
 
-                    # Dynamic Position Sizing (Fix 2)
-                    from app.risk.position_sizing import calculate_quantity
-                    risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
-                    max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
-                    max_quantity = int(risk_cfg.get("max_quantity", 5000))
-                    room = capital * max_exp_pct
-                    calc_qty = calculate_quantity(
-                        capital=capital,
-                        risk_pct=risk_pct,
-                        entry=entry_p,
-                        stop=sl_p,
-                        lot_size=lot_size,
-                        max_exposure_value=room,
-                        max_quantity=max_quantity,
-                    )
-                    trade_qty = calc_qty if calc_qty > 0 else lot_size
+                else:
+                    # Normal Mode (fo_mode != "OIPulse Mode"):
+                    trade_symbol = active_instrument
+                    if latest_score >= long_th and side_val in ("BOTH", "LONG"):
+                        entry_p = live_ltp
+                        tgt_p = round(entry_p * (1.0 + tgt_val / 100.0), 2)
+                        sl_p = round(entry_p * (1.0 - sl_val / 100.0), 2)
+                        next_tid = 5000 + len(real_trades) + 1
 
-                    paper_db.save_active_trade(
-                        strategy_name=selected_strat,
-                        symbol=trade_symbol,
-                        session_date=today_str,
-                        trade_id=next_tid,
-                        side="SHORT",
-                        quantity=trade_qty,
-                        entry_time=now_time_str,
-                        entry_price=entry_p,
-                        stop_loss=sl_p,
-                        target=tgt_p,
-                        score=latest_score,
-                        regime="TRENDING",
-                    )
-                    st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🔴")
-                    st.rerun()
+                        from app.risk.position_sizing import calculate_quantity
+                        risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
+                        max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
+                        max_quantity = int(risk_cfg.get("max_quantity", 5000))
+                        room = capital * max_exp_pct
+                        calc_qty = calculate_quantity(
+                            capital=capital,
+                            risk_pct=risk_pct,
+                            entry=entry_p,
+                            stop=sl_p,
+                            lot_size=lot_size,
+                            max_exposure_value=room,
+                            max_quantity=max_quantity,
+                        )
+                        trade_qty = calc_qty if calc_qty > 0 else lot_size
+
+                        paper_db.save_active_trade(
+                            strategy_name=selected_strat,
+                            symbol=trade_symbol,
+                            session_date=today_str,
+                            trade_id=next_tid,
+                            side="LONG",
+                            quantity=trade_qty,
+                            entry_time=now_time_str,
+                            entry_price=entry_p,
+                            stop_loss=sl_p,
+                            target=tgt_p,
+                            score=latest_score,
+                            regime="TRENDING",
+                        )
+                        st.toast(f"🟢 Executed LONG Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🟢")
+                        st.rerun()
+
+                    elif latest_score <= short_th and side_val in ("BOTH", "SHORT"):
+                        entry_p = live_ltp
+                        tgt_p = round(entry_p * (1.0 - tgt_val / 100.0), 2)
+                        sl_p = round(entry_p * (1.0 + sl_val / 100.0), 2)
+                        next_tid = 5000 + len(real_trades) + 1
+
+                        from app.risk.position_sizing import calculate_quantity
+                        risk_pct = float(risk_cfg.get("risk_per_trade_pct", 0.01))
+                        max_exp_pct = float(risk_cfg.get("max_exposure_pct", 1.0))
+                        max_quantity = int(risk_cfg.get("max_quantity", 5000))
+                        room = capital * max_exp_pct
+                        calc_qty = calculate_quantity(
+                            capital=capital,
+                            risk_pct=risk_pct,
+                            entry=entry_p,
+                            stop=sl_p,
+                            lot_size=lot_size,
+                            max_exposure_value=room,
+                            max_quantity=max_quantity,
+                        )
+                        trade_qty = calc_qty if calc_qty > 0 else lot_size
+
+                        paper_db.save_active_trade(
+                            strategy_name=selected_strat,
+                            symbol=trade_symbol,
+                            session_date=today_str,
+                            trade_id=next_tid,
+                            side="SHORT",
+                            quantity=trade_qty,
+                            entry_time=now_time_str,
+                            entry_price=entry_p,
+                            stop_loss=sl_p,
+                            target=tgt_p,
+                            score=latest_score,
+                            regime="TRENDING",
+                        )
+                        st.toast(f"🔴 Executed SHORT Trade #{next_tid} on {trade_symbol} (Qty: {trade_qty}) @ ₹{entry_p:.2f}!", icon="🔴")
+                        st.rerun()
 
         elif active_open_trade is not None:
             # Active trade is running: check for Square-off time, Target, or Stop Loss trigger
             e_side = active_open_trade.get("side", "LONG")
-            e_p = float(active_open_trade.get("entry_price", live_ltp))
+            e_p = float(active_open_trade.get("entry_price", hud_trade_ltp))
             trade_qty = int(active_open_trade.get("quantity", lot_size))
             tgt = float(active_open_trade.get("target") or 0.0)
             sl = float(active_open_trade.get("stop_loss") or 0.0)
@@ -1053,25 +1182,25 @@ def render_paper_trade_module():
             if now_time >= strategy_sq_time or (not candles_df.empty and pd.to_datetime(candles_df.iloc[-1]["timestamp"]).time() >= strategy_sq_time):
                 exit_triggered = "SQUARE_OFF"
             elif e_side == "LONG":
-                if tgt > 0 and live_ltp >= tgt:
+                if tgt > 0 and hud_trade_ltp >= tgt:
                     exit_triggered = "TARGET"
-                elif sl > 0 and live_ltp <= sl:
+                elif sl > 0 and hud_trade_ltp <= sl:
                     exit_triggered = "STOP_LOSS"
             else:
-                if tgt > 0 and live_ltp <= tgt:
+                if tgt > 0 and hud_trade_ltp <= tgt:
                     exit_triggered = "TARGET"
-                elif sl > 0 and live_ltp >= sl:
+                elif sl > 0 and hud_trade_ltp >= sl:
                     exit_triggered = "STOP_LOSS"
 
             if exit_triggered:
                 # Realistic Stop Loss & Target execution bounds (Fix 3)
                 tick_size = float(risk_cfg.get("tick_size", 0.05))
                 if exit_triggered == "STOP_LOSS":
-                    fill_price = round(max(sl - tick_size, live_ltp), 2) if e_side == "LONG" else round(min(sl + tick_size, live_ltp), 2)
+                    fill_price = round(max(sl - tick_size, hud_trade_ltp), 2) if e_side == "LONG" else round(min(sl + tick_size, hud_trade_ltp), 2)
                 elif exit_triggered == "TARGET":
                     fill_price = round(tgt, 2)
                 else:
-                    fill_price = live_ltp
+                    fill_price = hud_trade_ltp
 
                 # Full Round-Trip Brokerage Accounting (Fix 4: Buy leg ₹20 + Sell leg ₹20 = ₹40)
                 round_trip_charges = float(cost_cfg.get("flat_cost_per_order", 20.0)) * 2

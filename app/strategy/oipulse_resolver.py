@@ -177,6 +177,53 @@ def validate_oipulse_contract_symbol(
     return True, f"Valid contract symbol: {sym}"
 
 
+def parse_oipulse_contract_symbol(
+    symbol: str, underlying: str = "NIFTY"
+) -> Optional[Dict[str, Any]]:
+    """
+    Parses a constructed contract symbol (e.g. 'NIFTY26OCT22400PE' or 'NIFTY26S0124000CE')
+    into its components: underlying, expiry_code, strike, and option_type (CE/PE).
+    """
+    if not symbol or not isinstance(symbol, str):
+        return None
+    und = underlying.strip().upper()
+    sym = symbol.strip().upper()
+    if not sym.startswith(und):
+        for idx in ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
+            if sym.startswith(idx):
+                und = idx
+                break
+        else:
+            return None
+    if not (sym.endswith("CE") or sym.endswith("PE")):
+        return None
+    opt_type = sym[-2:]
+    rem = sym[len(und):-2]
+    step = 100 if und == "BANKNIFTY" else (25 if und == "MIDCPNIFTY" else 50)
+
+    # Standard compact NSE expiry code is 5 characters (e.g. 26OCT, 26S01, 26O19)
+    if len(rem) > 5 and rem[:5].isalnum() and rem[5:].isdigit() and (int(rem[5:]) % step == 0):
+        strike = int(rem[5:])
+        expiry_code = rem[:5]
+    else:
+        match = re.search(r"(\d{4,6})$", rem)
+        if not match:
+            return None
+        strike_str = match.group(1)
+        strike = int(strike_str)
+        expiry_code = rem[:-len(strike_str)]
+
+    return {
+        "underlying": und,
+        "symbol": sym,
+        "expiry_code": expiry_code,
+        "strike": strike,
+        "option_type": opt_type,
+    }
+
+
+
+
 def calculate_option_price(
     underlying_price: float,
     strike_price: float,

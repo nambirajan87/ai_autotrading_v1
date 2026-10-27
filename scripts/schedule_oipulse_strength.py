@@ -290,7 +290,7 @@ def is_paper_trade_auto_triggered(now: Optional[datetime] = None) -> bool:
     end_t = dtime(MARKET_END_HOUR, MARKET_END_MIN, 0)
     return start_t <= t <= end_t
 
-def get_next_trigger(now: datetime, batch_minutes: int = 1, offset_seconds: int = 13, market_hours_only: bool = True) -> datetime:
+def get_next_trigger(now: datetime, batch_minutes: int = 1, offset_seconds: int = 14, market_hours_only: bool = True) -> datetime:
     """
     Calculates the exact next trigger datetime aligned to:
       minute % batch_minutes == 0 AND second == offset_seconds
@@ -433,7 +433,7 @@ class OIPulseDriver:
 
 class ActiveSchedulerConfig:
     batch_minutes = 1
-    offset_seconds = 13
+    offset_seconds = 14
     market_hours_only = True
     trigger_count = 0
     last_row = {}
@@ -693,7 +693,7 @@ def start_oipulse_scheduler_background(batch_minutes: Optional[int] = None, offs
 def main():
     parser = argparse.ArgumentParser(description="OI Pulse Live Strength Scheduler")
     parser.add_argument("-b", "--batch", type=int, default=1, help="Batch time in minutes (default: 1)")
-    parser.add_argument("-s", "--offset", type=int, default=13, help="Offset seconds in minute to trigger on (default: 13)")
+    parser.add_argument("-s", "--offset", type=int, default=14, help="Offset seconds in minute to trigger on (default: 14)")
     parser.add_argument("--db", type=str, default=str(DEFAULT_DB_PATH), help="Target SQLite DB path")
     parser.add_argument("--once", action="store_true", help="Fetch Row 1 once immediately, insert into DB, and exit")
     parser.add_argument("--anytime", action="store_true", help="Run 24x7 without restricting to Mon-Fri 09:15-15:15 market hours")
