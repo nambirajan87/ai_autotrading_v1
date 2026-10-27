@@ -181,3 +181,69 @@ class TestTask3HistoricalRawDataRemoved:
         content = backtest_file.read_text(encoding="utf-8")
         assert "Historical Raw Data (All Records)" not in content
         assert "Truncated Date Alert" not in content
+
+
+class TestCustomCESPEStrengthDropdowns:
+    """Verifies configurable CE/PE strength thresholds in UI and logic."""
+
+    def test_custom_ce_pe_strength_thresholds(self):
+        # Default thresholds (50 and -50): +35% is No Signal, -45% is No Signal
+        _, opt_def1 = calculate_oipulse_strike_and_type(22500, "Tuesday", 35)
+        assert opt_def1 == "No Signal"
+
+        _, opt_def2 = calculate_oipulse_strike_and_type(22500, "Tuesday", -45)
+        assert opt_def2 == "No Signal"
+
+        # Custom lower thresholds (ce_strength=30, pe_strength=-40):
+        # +35% is now CE, -45% is now PE
+        strike_ce, opt_ce = calculate_oipulse_strike_and_type(
+            22500, "Tuesday", 35, ce_strength=30, pe_strength=-40
+        )
+        assert opt_ce == "CE"
+        assert strike_ce is not None
+
+        strike_pe, opt_pe = calculate_oipulse_strike_and_type(
+            22500, "Tuesday", -45, ce_strength=30, pe_strength=-40
+        )
+        assert opt_pe == "PE"
+        assert strike_pe is not None
+
+        # Custom higher thresholds (ce_strength=70, pe_strength=-70):
+        # +60% is No Signal, -60% is No Signal
+        _, opt_high1 = calculate_oipulse_strike_and_type(
+            22500, "Tuesday", 60, ce_strength=70, pe_strength=-70
+        )
+        assert opt_high1 == "No Signal"
+
+        _, opt_high2 = calculate_oipulse_strike_and_type(
+            22500, "Tuesday", -60, ce_strength=70, pe_strength=-70
+        )
+        assert opt_high2 == "No Signal"
+
+    def test_oipulse_logic_find_value_custom_thresholds(self):
+        from oipulse_logic import find_value
+
+        # Default: 40 is No Signal
+        _, opt1 = find_value(22500, "Tuesday", 40)
+        assert opt1 == "No Signal"
+
+        # Custom: ce_strength=30 -> 40 is CE
+        _, opt2 = find_value(22500, "Tuesday", 40, ce_strength=30)
+        assert opt2 == "CE"
+
+        # Custom: pe_strength=-30 -> -40 is PE
+        _, opt3 = find_value(22500, "Tuesday", -40, pe_strength=-30)
+        assert opt3 == "PE"
+
+    def test_saved_strategy_contains_ce_and_pe_strength(self):
+        import json
+        strat_file = Path(__file__).resolve().parent.parent / "data" / "saved_strategies.json"
+        with open(strat_file, "r", encoding="utf-8") as f:
+            strats = json.load(f)
+
+        oi_v2 = strats.get("PAPERTRADE_TEST_OI_V2")
+        assert oi_v2 is not None
+        inst = oi_v2.get("instrument", {})
+        assert inst.get("ce_strength") == 50
+        assert inst.get("pe_strength") == -50
+

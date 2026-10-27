@@ -487,16 +487,18 @@ def render_paper_trade_module():
     # Resolve active instrument
     fo_mode = inst_cfg.get("fo_mode", "Normal Mode")
     underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
-    oi_status = get_live_oipulse_status(underlying=underlying_name)
+    ce_strength = float(inst_cfg.get("ce_strength", 50.0))
+    pe_strength = float(inst_cfg.get("pe_strength", -50.0))
+    oi_status = get_live_oipulse_status(underlying=underlying_name, ce_strength=ce_strength, pe_strength=pe_strength)
 
     # 10-Step Lifecycle:
     # If active open position exists (Step 7/8/9), Step 2 Strike Rotation is STOPPED!
     if active_open_trade is not None:
         active_instrument = str(active_open_trade.get("symbol"))
     elif fo_mode == "OIPulse Mode":
-        # Step 1: Check OI Strength breakout (>50 or <-50)
+        # Step 1: Check OI Strength breakout (>ce_strength or <pe_strength)
         strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
-        if strength_val > 50 or strength_val < -50:
+        if strength_val > ce_strength or strength_val < pe_strength:
             # Step 2: Construct Active Instrument
             cand = oi_status.get("active_instrument")
             # Step 3: Validate check
@@ -672,7 +674,7 @@ def render_paper_trade_module():
     from app.strategy.oipulse_resolver import get_live_oipulse_status
     from scripts.schedule_oipulse_strength import is_paper_trade_auto_triggered, ActiveSchedulerConfig
 
-    oi_status = get_live_oipulse_status(underlying=underlying_name)
+    oi_status = get_live_oipulse_status(underlying=underlying_name, ce_strength=ce_strength, pe_strength=pe_strength)
 
     pt_col1, pt_col2, pt_col3 = st.columns([3, 2, 2])
     with pt_col1:
@@ -680,7 +682,7 @@ def render_paper_trade_module():
             if oi_status.get("has_active_instrument") and oi_status.get("active_instrument"):
                 inst_badge = f"`{oi_status['active_instrument']}` ({oi_status.get('option_type')} Strike {oi_status.get('strike')})"
             else:
-                inst_badge = f"*Standby* (Neutral OI Strength: `{oi_status.get('strength_str', '0%')}` &bull; Waiting for >50% or <-50%)"
+                inst_badge = f"*Standby* (Neutral OI Strength: `{oi_status.get('strength_str', '0%')}` &bull; Waiting for >{ce_strength:.0f}% or <{pe_strength:.0f}%)"
             st.markdown(f"**Underlying:** `{underlying_name}` &nbsp;|&nbsp; **Constructed Active Instrument:** {inst_badge} &nbsp;|&nbsp; **Mode:** `OIPulse Mode`")
         else:
             st.markdown(f"**Active Instrument:** `{active_instrument}` &nbsp;|&nbsp; **Segment:** `{inst_cfg.get('market_segment', 'NSE F&O')}`")
@@ -1078,13 +1080,13 @@ def render_paper_trade_module():
                 if fo_mode == "OIPulse Mode":
                     strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
 
-                    # Step 1: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
+                    # Step 1: If OI strength is not crossed >ce_strength or <pe_strength (neutral band), BLOCK TRADE!
                     # Trade must NEVER be executed using NIFTY instrument directly.
-                    if not (strength_val > 50 or strength_val < -50):
+                    if not (strength_val > ce_strength or strength_val < pe_strength):
                         st.info(
                             f"📡 **Step 1: Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
-                            f"(within neutral band -50% to +50%). Trade entry blocked: Waiting for momentum breakout (> +50% for CE, < -50% for PE) "
-                            f"before constructing active option contract from {underlying_name} Option Chain. "
+                            f"(within neutral band {pe_strength:.0f}% to +{ce_strength:.0f}%). Trade entry blocked: Waiting for momentum breakout "
+                            f"(> +{ce_strength:.0f}% for CE, < {pe_strength:.0f}% for PE) before constructing active option contract from {underlying_name} Option Chain. "
                             f"Underlying '{underlying_name}' will NOT be traded directly."
                         )
                     elif not active_instrument or active_instrument in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):

@@ -2198,7 +2198,9 @@
       "timeframe": 1,
       "allow_short": true,
       "lot_size": 65,
-      "tick_size": 0.05
+      "tick_size": 0.05,
+      "ce_strength": 50,
+      "pe_strength": -50
     }
   }
 }

@@ -27,6 +27,8 @@ def calculate_oipulse_strike_and_type(
     current_day: str,
     oi_strength: float,
     underlying: str = "NIFTY",
+    ce_strength: float = 50.0,
+    pe_strength: float = -50.0,
 ) -> Tuple[Optional[int], str]:
     """
     Implements OIPulse Strike and Option Type Resolution:
@@ -37,8 +39,8 @@ def calculate_oipulse_strike_and_type(
     2. Adjust based on weekday:
        Wednesday: +350, Thursday: +250, Friday: +150, Monday: 0, Tuesday: -100
     3. Signal based on OIStrength:
-       > 50  -> CE: strike = previous_bound + adjustment - 1
-       < -50 -> PE: strike = previous_bound - adjustment - 1
+       > ce_strength  -> CE: strike = previous_bound + adjustment - 1
+       < pe_strength  -> PE: strike = previous_bound - adjustment - 1
        otherwise -> No Signal
     """
     if ltp is None or oi_strength is None:
@@ -55,9 +57,9 @@ def calculate_oipulse_strike_and_type(
     previous_bound = ((int(float(ltp)) - 1) // step) * step + 1
 
     # Step 2 & 3: Determine optionTypeResult
-    if oi_strength > 50:
+    if oi_strength > ce_strength:
         option_type = "CE"
-    elif oi_strength < -50:
+    elif oi_strength < pe_strength:
         option_type = "PE"
     else:
         option_type = "No Signal"
@@ -497,11 +499,13 @@ def resolve_oipulse_option(
     available_expiries: Optional[List[str]] = None,
     live_ltp: Optional[float] = None,
     live_strength: Optional[float] = None,
+    ce_strength: float = 50.0,
+    pe_strength: float = -50.0,
 ) -> Dict[str, Any]:
     """
     Comprehensive dynamic resolver for OIPulse Mode:
     - Fetches LTP and OI Strength (from DB or live parameters)
-    - Resolves optionTypeResult (CE/PE/No Signal) and strikePriceResult
+    - Resolves optionTypeResult (CE/PE/No Signal) and strikePriceResult using ce_strength / pe_strength thresholds
     - Resolves nearest Tuesday expiry and formatted NSE symbol code
     - Validates dynamically constructed contract symbol
     - Builds the active contract tradingsymbol (e.g. NIFTY26S0124000CE)
@@ -519,7 +523,9 @@ def resolve_oipulse_option(
             oi_strength = db_strength
 
     current_day = candle_dt.strftime("%A")
-    strike, option_type = calculate_oipulse_strike_and_type(ltp, current_day, oi_strength, underlying=und)
+    strike, option_type = calculate_oipulse_strike_and_type(
+        ltp, current_day, oi_strength, underlying=und, ce_strength=ce_strength, pe_strength=pe_strength
+    )
     expiry_date, (expiry_display, expiry_code) = resolve_nearest_expiry_date(
         candle_dt.date(), underlying=und, available_expiries=available_expiries
     )
@@ -549,6 +555,8 @@ def resolve_oipulse_option(
         "current_day": current_day,
         "ltp": ltp,
         "oi_strength": oi_strength,
+        "ce_strength": ce_strength,
+        "pe_strength": pe_strength,
         "strike": strike,
         "option_type": option_type,
         "expiry_date": expiry_date,
@@ -566,6 +574,8 @@ def resolve_oipulse_option(
 def get_live_oipulse_status(
     underlying: str = "NIFTY",
     db_path: str = "data/backtest.db",
+    ce_strength: float = 50.0,
+    pe_strength: float = -50.0,
 ) -> Dict[str, Any]:
     """
     Fetches the latest dynamic 1-minute OI Pulse trigger from the SQLite DB/scheduler,
@@ -590,6 +600,8 @@ def get_live_oipulse_status(
             "ltp": 22600.0,
             "strength_str": "0%",
             "strength_val": 0.0,
+            "ce_strength": ce_strength,
+            "pe_strength": pe_strength,
             "option_type": "No Signal",
             "strike": None,
             "expiry_display": "",
@@ -646,7 +658,9 @@ def get_live_oipulse_status(
         current_day = "Friday"
 
     und = underlying.strip().upper()
-    strike, option_type = calculate_oipulse_strike_and_type(ltp, current_day, strength_val, underlying=und)
+    strike, option_type = calculate_oipulse_strike_and_type(
+        ltp, current_day, strength_val, underlying=und, ce_strength=ce_strength, pe_strength=pe_strength
+    )
 
     expiry_date, (expiry_display, expiry_code) = resolve_nearest_expiry_date(
         candle_dt.date(), underlying=und
@@ -677,6 +691,8 @@ def get_live_oipulse_status(
         "ltp": ltp,
         "strength_str": strength_str,
         "strength_val": strength_val,
+        "ce_strength": ce_strength,
+        "pe_strength": pe_strength,
         "option_type": option_type,
         "strike": strike,
         "expiry_display": expiry_display,

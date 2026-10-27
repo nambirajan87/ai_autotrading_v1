@@ -27,6 +27,8 @@ class BacktestConfig:
     trail_beyond_target: bool = False  # If True, trade does not exit at target, keeps trailing
     execution_mode: str = "SIGNAL_BAR_CLOSE"  # "SIGNAL_BAR_CLOSE" (immediate fill at candle close) or "NEXT_BAR_OPEN"
     fo_mode: str = "Normal Mode"  # "Normal Mode" or "OIPulse Mode"
+    ce_strength: float = 50.0  # CE Strength threshold (e.g. 10 to 90)
+    pe_strength: float = -50.0 # PE Strength threshold (e.g. -10 to -90)
 
 
 @dataclass
@@ -213,13 +215,16 @@ class Backtester:
                 if ltp is None:
                     ltp = db_ltp
 
-            if strength is None or (-50 <= strength <= 50):
+            ce_strength = getattr(self.bt_cfg, "ce_strength", 50.0)
+            pe_strength = getattr(self.bt_cfg, "pe_strength", -50.0)
+            if strength is None or (pe_strength <= strength <= ce_strength):
                 self.signal_counts["HOLD"] += 1
-                self.rejections["OIPulse: Strength within neutral band (-50 to +50)"] += 1
+                self.rejections[f"OIPulse: Strength within neutral band ({pe_strength:.0f} to {ce_strength:.0f})"] += 1
                 return
 
             oi_res = resolve_oipulse_option(
-                self.symbol, dt_val, live_ltp=ltp, live_strength=strength
+                self.symbol, dt_val, live_ltp=ltp, live_strength=strength,
+                ce_strength=ce_strength, pe_strength=pe_strength
             )
             if not oi_res.get("has_signal") or not oi_res.get("is_valid_symbol"):
                 self.signal_counts["HOLD"] += 1

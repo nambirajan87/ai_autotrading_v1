@@ -1,5 +1,5 @@
 
-def find_value(LTP, current_day, OIStrength):
+def find_value(LTP, current_day, OIStrength, ce_strength=50, pe_strength=-50):
     # Step 1: Calculate the 50-point bounds
     previous_bound = ((LTP - 1) // 50) * 50 + 1
     next_bound = previous_bound + 49
@@ -21,9 +21,9 @@ def find_value(LTP, current_day, OIStrength):
         return None, None
 
     # Step 4: Determine optionTypeResult
-    if OIStrength > 50:
+    if OIStrength > ce_strength:
         optionTypeResult = "CE"
-    elif OIStrength < -50:
+    elif OIStrength < pe_strength:
         optionTypeResult = "PE"
     else:
         optionTypeResult = "No Signal"
@@ -47,9 +47,11 @@ def find_value(LTP, current_day, OIStrength):
     return strikePriceResult, optionTypeResult
 
 
-# Dynamic user inputs
-LTP = int(input("Enter LTP: "))
-current_day = input("Enter Current Day: ")
-OIStrength = int(input("Enter OIStrength: "))
+if __name__ == "__main__":
+    # Dynamic user inputs
+    LTP = int(input("Enter LTP: "))
+    current_day = input("Enter Current Day: ")
+    OIStrength = int(input("Enter OIStrength: "))
 
-find_value(LTP, current_day, OIStrength)
+    find_value(LTP, current_day, OIStrength)
+

@@ -256,6 +256,16 @@ def render_backtest_module():
                         st.session_state["backtest_fo_mode"] = inst_cfg["fo_mode"]
                     except Exception:
                         pass
+                if "ce_strength" in inst_cfg and inst_cfg["ce_strength"] is not None:
+                    try:
+                        st.session_state["backtest_ce_strength"] = int(inst_cfg["ce_strength"])
+                    except Exception:
+                        pass
+                if "pe_strength" in inst_cfg and inst_cfg["pe_strength"] is not None:
+                    try:
+                        st.session_state["backtest_pe_strength"] = int(inst_cfg["pe_strength"])
+                    except Exception:
+                        pass
 
             if inst_cfg.get("option_type"):
                 opt_str = "PE (Put)" if "PE" in str(inst_cfg["option_type"]).upper() else "CE (Call)"
@@ -317,6 +327,8 @@ def render_backtest_module():
         return {
             "market_segment": st.session_state.get("market_segment", "🎯 NSE F&O (Options & Futures) [Kotak Live Priority]"),
             "fo_mode": fo_mode,
+            "ce_strength": int(st.session_state.get("backtest_ce_strength", 50)),
+            "pe_strength": int(st.session_state.get("backtest_pe_strength", -50)),
             "symbol": st.session_state.get("symbol", "NIFTY"),
             "isin": st.session_state.get("isin", ""),
             "equity_name": st.session_state.get("equity_name", ""),
@@ -986,6 +998,8 @@ def render_backtest_module():
                 trailing_sl_enabled=bool(ind.get("trailing_sl_enabled", False)),
                 trail_beyond_target=bool(ind.get("trail_beyond_target", False)),
                 fo_mode=st.session_state.get("backtest_fo_mode", "Normal Mode"),
+                ce_strength=float(st.session_state.get("backtest_ce_strength", 50)),
+                pe_strength=float(st.session_state.get("backtest_pe_strength", -50)),
             )
 
             # Full run
@@ -1755,6 +1769,34 @@ def render_backtest_module():
                     key="backtest_underlying_choice",
                     help="In OIPulse Mode, select the Underlying Index. Expiry, Option Type, and Strike Price are determined dynamically based on oi_strength."
                 )
+
+                col_ce_str, col_pe_str = st.columns(2)
+                ce_options = [10, 20, 30, 40, 50, 60, 70, 80, 90]
+                pe_options = [-10, -20, -30, -40, -50, -60, -70, -80, -90]
+
+                curr_ce = int(st.session_state.get("backtest_ce_strength", 50))
+                ce_idx = ce_options.index(curr_ce) if curr_ce in ce_options else ce_options.index(50)
+
+                curr_pe = int(st.session_state.get("backtest_pe_strength", -50))
+                pe_idx = pe_options.index(curr_pe) if curr_pe in pe_options else pe_options.index(-50)
+
+                with col_ce_str:
+                    ce_strength_val = st.selectbox(
+                        "CE Strength",
+                        ce_options,
+                        index=ce_idx,
+                        key="backtest_ce_strength",
+                        help="Threshold for CE (Call) option resolution. When OI Strength > this value, optionTypeResult = CE."
+                    )
+                with col_pe_str:
+                    pe_strength_val = st.selectbox(
+                        "PE Strength",
+                        pe_options,
+                        index=pe_idx,
+                        key="backtest_pe_strength",
+                        help="Threshold for PE (Put) option resolution. When OI Strength < this value, optionTypeResult = PE."
+                    )
+
                 mkt_lot = int(INDEX_LOT_SIZES.get(underlying_choice, 65))
                 st.session_state.symbol = underlying_choice
                 st.session_state.isin = "INF204KB14I2" if underlying_choice == "NIFTY" else f"NSE_INDEX|{underlying_choice}"
@@ -1762,7 +1804,7 @@ def render_backtest_module():
                 st.session_state.equity_name = f"{underlying_choice} (OIPulse Mode)"
                 st.session_state.risk["lot_size"] = mkt_lot
 
-                st.caption(f"🎯 **Active Selection:** `{underlying_choice}` (Dynamic Expiry, Strike & Option Type via `oi_strength`)")
+                st.caption(f"🎯 **Active Selection:** `{underlying_choice}` (Dynamic Expiry, Strike & Option Type via `oi_strength` | CE > {ce_strength_val}%, PE < {pe_strength_val}%)")
 
             else:
                 col_und, col_exp = st.columns(2)

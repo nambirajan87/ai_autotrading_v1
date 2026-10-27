@@ -211,16 +211,18 @@ def render_live_trade_module():
     # Resolve active instrument
     fo_mode = inst_cfg.get("fo_mode", "Normal Mode")
     underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
-    oi_status = get_live_oipulse_status(underlying=underlying_name)
+    ce_strength = float(inst_cfg.get("ce_strength", 50.0))
+    pe_strength = float(inst_cfg.get("pe_strength", -50.0))
+    oi_status = get_live_oipulse_status(underlying=underlying_name, ce_strength=ce_strength, pe_strength=pe_strength)
 
     # 10-Step Lifecycle:
     # If active open position exists (Step 7/8/9), Step 2 Strike Rotation is STOPPED!
     if active_open_trade is not None:
         active_instrument = str(active_open_trade.get("symbol"))
     elif fo_mode == "OIPulse Mode":
-        # Step 1: Check OI Strength breakout (>50 or <-50)
+        # Step 1: Check OI Strength breakout (>ce_strength or <pe_strength)
         strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
-        if strength_val > 50 or strength_val < -50:
+        if strength_val > ce_strength or strength_val < pe_strength:
             # Step 2: Construct Active Instrument
             cand = oi_status.get("active_instrument")
             # Step 3: Validate check
@@ -711,13 +713,13 @@ def render_live_trade_module():
             if fo_mode == "OIPulse Mode":
                 strength_val = float(oi_status.get("strength_val", 0.0) or 0.0)
 
-                # Step 1: If OI strength is not crossed >50 or <-50 (neutral band), BLOCK TRADE!
+                # Step 1: If OI strength is not crossed >ce_strength or <pe_strength (neutral band), BLOCK TRADE!
                 # Trade must NEVER be executed using NIFTY instrument directly.
-                if not (strength_val > 50 or strength_val < -50):
+                if not (strength_val > ce_strength or strength_val < pe_strength):
                     st.info(
                         f"📡 **Step 1: Standby (Neutral Band):** Real-time OI Strength is **{oi_status.get('strength_str', '0%')}** "
-                        f"(within neutral band -50% to +50%). Trade entry blocked: Waiting for momentum breakout (> +50% for CE, < -50% for PE) "
-                        f"before constructing active option contract from {underlying_name} Option Chain. "
+                        f"(within neutral band {pe_strength:.0f}% to +{ce_strength:.0f}%). Trade entry blocked: Waiting for momentum breakout "
+                        f"(> +{ce_strength:.0f}% for CE, < {pe_strength:.0f}% for PE) before constructing active option contract from {underlying_name} Option Chain. "
                         f"Underlying '{underlying_name}' will NOT be traded directly."
                     )
                 elif not active_instrument or active_instrument in (underlying_name, "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"):
