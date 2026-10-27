@@ -984,7 +984,6 @@ def render_paper_trade_module():
             if opt_q and float(opt_q) > 0:
                 hud_trade_ltp = float(opt_q)
             elif fo_mode == "OIPulse Mode":
-                from app.strategy.oipulse_resolver import parse_oipulse_contract_symbol, calculate_option_price, resolve_nearest_expiry_date
                 parsed_sym = parse_oipulse_contract_symbol(open_sym, underlying=underlying_name)
                 if parsed_sym:
                     exp_dt, _ = resolve_nearest_expiry_date(datetime.now().date(), underlying=parsed_sym["underlying"])
