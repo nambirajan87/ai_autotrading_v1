@@ -80,6 +80,16 @@ def parse_time_param(val, default_time: time) -> time:
 
 
 
+def render_html_block(html_content: str):
+    """
+    Renders raw HTML safely in Streamlit without triggering Markdown's 4-space indented code block parser.
+    Strips leading/trailing whitespace from each line and eliminates empty lines.
+    """
+    cleaned_lines = [line.strip() for line in html_content.strip().splitlines() if line.strip()]
+    cleaned_html = "".join(cleaned_lines)
+    st.markdown(cleaned_html, unsafe_allow_html=True)
+
+
 def render_paper_trade_hud_and_watchtower(
     is_live_running: bool,
     active_open_trade: Optional[dict],
@@ -182,7 +192,7 @@ def render_paper_trade_hud_and_watchtower(
         phase_color = "#00e676" if gross_pnl > 0 else ("#ffd600" if abs(gross_pnl) < 1.0 else "#ff5252")
 
         # 1. Top HUD Ribbon
-        st.markdown(f"""
+        render_html_block(f"""
         <div style="background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.96)); border: 1px solid rgba(59, 130, 246, 0.45); border-radius: 10px; padding: 14px 18px; margin: 12px 0 16px 0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 12px;">
                 <div style="display: flex; align-items: center; gap: 10px;">
@@ -205,7 +215,6 @@ def render_paper_trade_hud_and_watchtower(
                     </span>
                 </div>
             </div>
-            
             <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 10px 14px;">
                 <div style="display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 6px;">
                     <span style="color: #ef4444; font-weight: 600;">🛑 SL: ₹{sl:.2f} <span style="color: #94a3b8; font-weight: normal;">({dist_sl_pts:.2f} pts away)</span></span>
@@ -222,13 +231,13 @@ def render_paper_trade_hud_and_watchtower(
                 </div>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
         # 2. Collapsible Watchtower Command Deck
         with st.expander("🔭 Trade Watchtower — In-Depth Lifecycle, Risk & Trajectory Deck", expanded=True):
             w_col1, w_col2, w_col3, w_col4 = st.columns(4)
             with w_col1:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">⏱️ Lifecycle Clock</div>
                     <div style="font-size: 1.35rem; font-weight: 700; color: #38bdf8; font-family: monospace; margin: 4px 0;">{elapsed_str}</div>
@@ -238,9 +247,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Sq-Off In:</b> <span style="color: #f87171; font-weight: 600;">{sq_rem_str}</span></div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col2:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🎯 Target / SL Proximity</div>
                     <div style="font-size: 1.15rem; font-weight: 700; color: #10b981; margin: 4px 0;">₹{tgt:.2f} <span style="font-size: 0.82rem; color: #94a3b8; font-weight: normal;">(+{dist_tgt_pts:.2f} pts)</span></div>
@@ -250,9 +259,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Risk/Reward Ratio:</b> 1 : {rr_ratio:.2f}</div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col3:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">📈 P&L & Trajectory</div>
                     <div style="font-size: 1.35rem; font-weight: 700; color: {pnl_color}; margin: 4px 0;">{pnl_sign}₹{net_pnl:,.2f}</div>
@@ -262,9 +271,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Phase:</b> <span style="color: {phase_color}; font-weight: 600;">{phase_badge}</span></div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col4:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🧭 Engine & Signal Radar</div>
                     <div style="font-size: 1.15rem; font-weight: 700; color: {sig_color}; margin: 4px 0;">{sig_disp} (Score: {latest_score})</div>
@@ -274,12 +283,12 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Strategy:</b> <span style="color: #38bdf8;">{selected_strat[:22]}</span></div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
 
     else:
         # Scanning / Standby mode
         cooldown_badge = f"""<span style="background: rgba(234, 179, 8, 0.2); color: #eab308; border: 1px solid #eab308; padding: 2px 8px; border-radius: 4px; font-weight: 600;">⏸️ Cooldown: {cooldown_str}</span>""" if cooldown_str else ""
-        st.markdown(f"""
+        render_html_block(f"""
         <div style="background: linear-gradient(135deg, rgba(15, 23, 42, 0.96), rgba(30, 41, 59, 0.96)); border: 1px solid rgba(59, 130, 246, 0.45); border-radius: 10px; padding: 14px 18px; margin: 12px 0 16px 0; box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                 <div style="display: flex; align-items: center; gap: 10px;">
@@ -301,12 +310,12 @@ def render_paper_trade_hud_and_watchtower(
                 <span>Continuous 2s Kotak Live LTP & Strategy Monitor Active</span>
             </div>
         </div>
-        """, unsafe_allow_html=True)
+        """)
 
         with st.expander("🔭 Trade Watchtower — Standby & Strategy Parameters Deck", expanded=False):
             w_col1, w_col2, w_col3, w_col4 = st.columns(4)
             with w_col1:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">⏱️ Execution Timing</div>
                     <div style="font-size: 1.15rem; font-weight: 700; color: #38bdf8; margin: 4px 0;">STANDBY / SCANNING</div>
@@ -316,9 +325,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Cooldown:</b> {cooldown_str or 'None (Ready)'}</div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col2:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🎯 Strategy & Target Rules</div>
                     <div style="font-size: 1.15rem; font-weight: 700; color: #10b981; margin: 4px 0;">{selected_strat[:20]}</div>
@@ -328,9 +337,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Next Bar Check:</b> {next_check_str} ({rem_seconds}s)</div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col3:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">📈 Price & Market Radar</div>
                     <div style="font-size: 1.35rem; font-weight: 700; color: #ffffff; margin: 4px 0;">₹{live_ltp:.2f}</div>
@@ -340,9 +349,9 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Broker API:</b> Kotak Neo Live Priority</div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
             with w_col4:
-                st.markdown(f"""
+                render_html_block(f"""
                 <div style="background: rgba(30, 41, 59, 0.75); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 12px; height: 100%;">
                     <div style="font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;">🧭 Consensus Signal Radar</div>
                     <div style="font-size: 1.15rem; font-weight: 700; color: {sig_color}; margin: 4px 0;">{sig_disp} (Score: {latest_score})</div>
@@ -352,7 +361,7 @@ def render_paper_trade_hud_and_watchtower(
                         <div><b>Engine Status:</b> 🟢 Active Continuous Scan</div>
                     </div>
                 </div>
-                """, unsafe_allow_html=True)
+                """)
 
 
 def render_paper_trade_module():
@@ -409,16 +418,22 @@ def render_paper_trade_module():
     db_strats = paper_db.get_all_strategy_names()
     all_strats = sorted(list(set(saved_strats + db_strats)))
     if not all_strats:
-        all_strats = ["ADX", "EMA_RSI_MACD_Balanced"]
+        all_strats = ["PAPERTRADE_TEST_OI_V2", "ADX", "EMA_RSI_MACD_Balanced"]
 
+    # Use PAPERTRADE_TEST_OI_V2 as default strategy for paper trade execution
+    default_paper_strat = "PAPERTRADE_TEST_OI_V2" if "PAPERTRADE_TEST_OI_V2" in all_strats else ("ADX" if "ADX" in all_strats else all_strats[0])
     if "paper_selected_strategy" not in st.session_state or st.session_state.paper_selected_strategy not in all_strats:
-        st.session_state.paper_selected_strategy = "ADX" if "ADX" in all_strats else all_strats[0]
+        st.session_state.paper_selected_strategy = default_paper_strat
+
+    def on_strategy_change():
+        st.session_state.paper_strategy_user_manually_selected = True
 
     selected_strat = st.sidebar.selectbox(
         "Strategy Name",
         all_strats,
         index=all_strats.index(st.session_state.paper_selected_strategy),
         key="paper_sidebar_strat_select",
+        on_change=on_strategy_change,
     )
     st.session_state.paper_selected_strategy = selected_strat
 
@@ -649,9 +664,12 @@ def render_paper_trade_module():
     user_paused = st.session_state.get("paper_user_paused", False)
     is_live_running = st.session_state.get("paper_executing_live", False)
 
-    # Auto-trigger "Execute Paper Trade" at 09:16 AM during market window (or mock live) without manual button
+    # Auto-trigger "Execute Paper Trade" at 09:16 AM during market window without manual button
     if auto_trigger_eligible and not user_paused and not is_live_running:
         if now_curr_time < strategy_sq_time:
+            # Default to PAPERTRADE_TEST_OI_V2 for auto-trigger paper scheduler unless manually overridden
+            if "PAPERTRADE_TEST_OI_V2" in all_strats and not st.session_state.get("paper_strategy_user_manually_selected", False):
+                st.session_state.paper_selected_strategy = "PAPERTRADE_TEST_OI_V2"
             st.session_state.paper_executing_live = True
             st.session_state.paper_live_start_time = datetime.now().strftime("%H:%M:%S")
             st.session_state.paper_auto_triggered = True
@@ -668,6 +686,8 @@ def render_paper_trade_module():
                 st.rerun()
         elif user_paused:
             if st.button("▶️ Resume Watching OI Strength", type="primary", use_container_width=True, key="btn_resume_paper_live"):
+                if "PAPERTRADE_TEST_OI_V2" in all_strats and not st.session_state.get("paper_strategy_user_manually_selected", False):
+                    st.session_state.paper_selected_strategy = "PAPERTRADE_TEST_OI_V2"
                 st.session_state.paper_user_paused = False
                 st.session_state.paper_executing_live = True
                 st.session_state.paper_live_start_time = datetime.now().strftime("%H:%M:%S")
@@ -1250,6 +1270,7 @@ def render_paper_trade_module():
                     c_ts_map[ts_key] = float(val)
 
         import re
+        underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
         def get_trade_instrument_and_opt_type(row):
             # 1. Resolve active constructed instrument name
             sym = str(row.get("symbol") or "").strip()

@@ -490,3 +490,72 @@ def test_execute_paper_trade_button_removed_and_watching_oi_strength_displayed()
     assert "09:16 AM" in code
     assert "OI Pulse Live Strength Feed" in code
 
+
+def test_render_html_block_eliminates_multiline_indent_codeblock_leak():
+    """Verifies that render_html_block strips empty lines and line indentation,
+    preventing Streamlit from misinterpreting indented HTML as a markdown code block."""
+    from unittest.mock import MagicMock, patch
+    from app.ui.paper_trade_app import render_html_block
+
+    raw_multiline_html = """
+    <div style="background: rgba(15, 23, 42, 0.85); border: 1px solid rgba(148, 163, 184, 0.2); border-radius: 8px; padding: 10px 14px;">
+        <div style="display: flex; justify-content: space-between; font-size: 0.82rem; margin-bottom: 6px;">
+            <span style="color: #ef4444; font-weight: 600;">🛑 SL: ₹285.00 <span style="color: #94a3b8; font-weight: normal;">(15.00 pts away)</span></span>
+            <span style="color: #38bdf8; font-weight: 600;">🔵 Entry: ₹300.00 &nbsp;|&nbsp; Current LTP: <b style="color: #ffffff;">₹300.00</b></span>
+            <span style="color: #10b981; font-weight: 600;">🎯 Target: ₹390.00 <span style="color: #94a3b8; font-weight: normal;">(90.00 pts away)</span></span>
+        </div>
+        <div style="height: 10px; width: 100%; background: #334155; border-radius: 5px; position: relative; overflow: hidden;">
+            <div style="position: absolute; left: 0; top: 0; bottom: 0; width: 14.3%; background: linear-gradient(90deg, #ef4444 0%, #3b82f6 50%, #10b981 100%); border-radius: 5px; transition: width 0.3s ease;"></div>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #94a3b8; margin-top: 5px;">
+            <span>Risk Cushion: <b style="color: #cbd5e1;">5.0%</b></span>
+            <span style="color: #ffd600; font-weight: 600;">🟡 AT BREAKEVEN</span>
+            <span>Distance to Target: <b style="color: #cbd5e1;">30.0%</b> remaining</span>
+        </div>
+    </div>
+    """
+
+    mock_st = MagicMock()
+    with patch("app.ui.paper_trade_app.st", mock_st):
+        render_html_block(raw_multiline_html)
+
+    mock_st.markdown.assert_called_once()
+    rendered_arg = mock_st.markdown.call_args[0][0]
+    kwargs = mock_st.markdown.call_args[1]
+
+    assert kwargs.get("unsafe_allow_html") is True
+    # Verify no newlines or leading 4+ spaces exist that would trigger markdown code blocks
+    assert "\n" not in rendered_arg
+    assert "    " not in rendered_arg
+    assert rendered_arg.startswith("<div")
+    assert rendered_arg.endswith("</div>")
+
+
+def test_papertrade_test_oi_v2_strategy_config_and_scheduler_default():
+    """Verifies that PAPERTRADE_TEST_OI_V2 is saved, configured for BOTH sides with entry_start 09:16,
+    and is configured as default in ActiveSchedulerConfig and paper_trade_app."""
+    import json
+    from pathlib import Path
+    from scripts.schedule_oipulse_strength import ActiveSchedulerConfig
+
+    strat_file = Path(__file__).resolve().parent.parent / "data" / "saved_strategies.json"
+    with open(strat_file, "r", encoding="utf-8") as f:
+        strats = json.load(f)
+
+    target_strat = strats.get("PAPERTRADE_TEST_OI_V2")
+    assert target_strat is not None, "PAPERTRADE_TEST_OI_V2 strategy must exist in saved_strategies.json"
+
+    # Trade side should be BOTH to allow matching conditions for both LONG and SHORT
+    indicators = target_strat.get("indicators", {})
+    risk = target_strat.get("risk", {})
+    assert indicators.get("trade_side") == "BOTH"
+    assert risk.get("trade_side") == "BOTH"
+
+    # Entry start should be 09:16 matching the scheduler auto-trigger
+    assert risk.get("entry_start") == "09:16"
+
+    # ActiveSchedulerConfig must specify PAPERTRADE_TEST_OI_V2 as default_strategy
+    assert ActiveSchedulerConfig.default_strategy == "PAPERTRADE_TEST_OI_V2"
+
+
+

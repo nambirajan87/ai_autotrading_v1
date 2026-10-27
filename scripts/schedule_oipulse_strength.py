@@ -239,6 +239,7 @@ def save_record_to_db(record: dict, db_path: Path = DEFAULT_DB_PATH) -> int:
         "ts": time.time(),
         "auto_paper_trade_active": auto_triggered,
         "auto_paper_trade_time": "09:16:00",
+        "default_strategy": getattr(ActiveSchedulerConfig, "default_strategy", "PAPERTRADE_TEST_OI_V2"),
         "market_window": "Monday - Friday, 09:15 AM - 03:15 PM",
         "status": "WATCHING_OI_STRENGTH" if auto_triggered else "STANDBY",
     }
@@ -440,6 +441,7 @@ class ActiveSchedulerConfig:
     last_thread_id = None
     auto_paper_trade_triggered = False
     auto_paper_trade_time = "09:16:00"
+    default_strategy = "PAPERTRADE_TEST_OI_V2"
     market_window_desc = "Monday - Friday, 09:15 AM - 03:15 PM"
 
 def set_scheduler_market_hours_mode(market_hours_only: bool):
@@ -541,7 +543,7 @@ def run_scheduler(batch_minutes: Optional[int] = None, offset_seconds: Optional[
         print(f"Batch Time     : {ActiveSchedulerConfig.batch_minutes} minute(s)")
         print(f"Trigger Target : Every {ActiveSchedulerConfig.batch_minutes}m at :{ActiveSchedulerConfig.offset_seconds:02d}s (hh:mm:{ActiveSchedulerConfig.offset_seconds:02d})")
         print(f"Market Window  : {'Monday - Friday, 09:15 AM - 03:15 PM' if ActiveSchedulerConfig.market_hours_only else '24x7 (Anytime)'}")
-        print(f"Paper Trigger  : Auto-trigger 'Execute Paper Trade' at 09:16 AM (Watching OI Strength)")
+        print(f"Paper Trigger  : Auto-trigger 'Execute Paper Trade' at 09:16 AM (Default Strategy: {getattr(ActiveSchedulerConfig, 'default_strategy', 'PAPERTRADE_TEST_OI_V2')})")
         print(f"Attached Port  : {DEBUG_PORT}")
         print(f"Target DB      : {db_path} -> table 'oi_strength'")
         print("=" * 65 + "\n")
@@ -586,7 +588,7 @@ def run_scheduler(batch_minutes: Optional[int] = None, offset_seconds: Optional[
         if auto_trig and not getattr(ActiveSchedulerConfig, "auto_paper_trade_triggered", False):
             ActiveSchedulerConfig.auto_paper_trade_triggered = True
             if verbose:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [AUTO-TRIGGER] 09:16 AM reached -> Auto-triggering 'Execute Paper Trade' (Watching OI Strength)...\n")
+                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] [AUTO-TRIGGER] 09:16 AM reached -> Auto-triggering 'Execute Paper Trade' with default strategy '{getattr(ActiveSchedulerConfig, 'default_strategy', 'PAPERTRADE_TEST_OI_V2')}' (Watching OI Strength)...\n")
         elif not auto_trig:
             ActiveSchedulerConfig.auto_paper_trade_triggered = False
 

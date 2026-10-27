@@ -974,6 +974,7 @@ def render_live_trade_module():
                     c_ts_map[ts_key] = float(val)
 
         import re
+        underlying_name = str(inst_cfg.get("underlying") or "NIFTY").strip()
         def get_trade_instrument_and_opt_type(row):
             # 1. Resolve active constructed instrument name
             sym = str(row.get("symbol") or "").strip()
